@@ -1,0 +1,31 @@
+FLIGHT MANAGEMENT SYSTEMS PROPRIETARY LICENCE
+ALL RIGHTS RESERVED
+
+Copyright © 2026 Sam Samadi. All rights reserved.
+
+1. Ownership
+
+The Flight Management Systems code, interface design, documentation, and original assets are proprietary works protected by applicable copyright and other laws. Third-party components and content remain the property of their respective owners and are subject to their own terms.
+
+2. No licence grant
+
+No permission is granted to copy, modify, adapt, redistribute, sublicense, sell, commercially exploit, publish derivative versions of, or create derivative works from this software or its protected original material without prior written permission from Sam Samadi.
+
+Public availability, including visibility in a public GitHub repository, does not make this software open source and does not grant an open-source licence. Public hosting may make files technically viewable or downloadable; these legal restrictions do not claim to provide technical copy prevention.
+
+3. Third-party material
+
+This licence does not grant rights in third-party libraries, APIs, photographs, aircraft images, liveries, logos, trademarks, map data, textures, icons, audio, fonts, or other external material. Anyone distributing the project is responsible for obtaining all necessary permissions and satisfying all applicable notices, attribution requirements, and service terms.
+
+4. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, RELIABILITY, NON-INFRINGEMENT, OR AVAILABILITY. TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER IS NOT LIABLE FOR ANY CLAIM, DAMAGE, LOSS, OR OTHER LIABILITY ARISING FROM OR RELATED TO THE SOFTWARE OR ITS USE.
+
+5. Aviation restriction and disclaimer
+
+This software is an educational and simulation project only. It is not certified, approved, validated, or suitable for operational aviation use. It must not be used for real-world flight planning, navigation, aircraft performance calculations, dispatch, flight operations, or any safety-critical aviation decision.
+
+6. Permission requests
+
+Any requested permission must be obtained in writing before the proposed use. No permission is implied by access to the repository or by silence in response to a request.
+

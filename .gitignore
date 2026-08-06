@@ -1,0 +1,91 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+*_credentials.json
+secrets*.json
+*_secrets.json
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Flet and application caches
+.flet/
+.cache/
+cache/
+*.cache
+/assets/generated/
+/assets/globe/*_cache*
+
+# Local application data (actual filenames used by the application)
+/calendar_flights.json
+/profile_data.json
+/app_settings.json
+/infinite_flight_config.json
+/flight_hibernation.json
+/exports/
+/calendar_export_*.json
+/profile_export_*.json
+/flight_export_*.json
+/*_export_*.json
+
+# User-selected global background files
+/assets/backgrounds/app_background.png
+/assets/backgrounds/app_background.jpg
+/assets/backgrounds/app_background.jpeg
+/assets/backgrounds/app_background.webp
+
+# Logs and process output
+*.log
+*.out
+*.err
+*_stdout.txt
+*_stderr.txt
+
+# Packaging and build outputs
+/build/
+/dist/
+/build_assets/
+*.spec
+*.exe
+*.msi
+*.whl
+*.egg-info/
+
+# Local tools, dependencies, and generated web caches
+/.tools/
+/saved_versions/
+node_modules/
+.vite/
+.pnpm-store/
+
+# Local snapshots and unused development prototypes
+/flightmanagementsystems_v*_reference_*.py
+/globe_gl_test_app.py
+/package-lock.json
+/web-map/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

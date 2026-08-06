@@ -1,0 +1,9 @@
+# Compatibility ranges based on versions recorded in the existing local build logs.
+flet>=0.85.2,<0.86
+flet-desktop>=0.85.2,<0.86
+flet-map>=0.84.0,<0.85
+flet-geolocator>=0.84.0,<0.85
+pywebview>=6.2.1,<7
+pystray>=0.19.5,<0.20
+Pillow>=12.2.0,<13
+
