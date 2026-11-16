@@ -37,7 +37,9 @@ cache/
 /calendar_flights.json
 /profile_data.json
 /app_settings.json
+/login_settings.json
 /infinite_flight_config.json
+**/infinite_flight_key.dpapi
 /flight_hibernation.json
 /exports/
 /calendar_export_*.json
@@ -89,3 +91,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+/FMS-V14-GitHub*/
+/login_settings.json
+/*.dpapi
