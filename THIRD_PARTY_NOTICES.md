@@ -1,6 +1,6 @@
 # Third-party notices
 
-This file records identifiable third-party components and content in Flight Management Systems. It is an inventory, not a grant of rights. The project's proprietary `LICENSE` applies only to material owned by Sam Samadi and does not relicense third-party work.
+This file lists third-party components and content used by Flight Management Systems. The project's MIT License covers the original source code. Third-party components and assets retain their own terms.
 
 Where this file says **“Licence/redistribution permission must be verified before public release,”** no adequate licence record was found in the inspected project files. Do not publish that material until the required rights and attribution have been confirmed.
 
