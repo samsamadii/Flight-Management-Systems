@@ -103,7 +103,7 @@ The app opens directly with the local display name `User`. On Windows, this edit
 ├── globe-gl-test-web/dist/             # Local Globe.gl bundle used by the app
 ├── requirements.txt                    # Python runtime dependencies
 ├── .env.example                        # Secret-free environment template
-├── LICENSE                             # Proprietary All Rights Reserved terms
+├── LICENSE                             # MIT License
 └── *.md                                # Security, copyright, contribution, and notices
 ```
 
