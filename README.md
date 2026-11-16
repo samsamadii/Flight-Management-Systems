@@ -1,6 +1,6 @@
 # Flight Management Systems — V14 Public Portfolio Edition
 
-Flight Management Systems is a Windows desktop application built with Python and Flet for aviation simulation, education, and personal workflow practice. This public portfolio version opens directly into the main application and does not display or require a login.
+Your flight simulator gives you the cockpit. FMS gives you the dispatch desk. Plan your route, estimate fuel and flight time, and brief both airports with weather and maps. Run your checklists, then give the captain’s welcome you’ve heard a hundred times: “Ladies and gentlemen, welcome aboard.” Once airborne, watch your aircraft move across the live Infinite Flight map. Running out of time before touchdown? Pause your flight in FMS, save your progress, and come back to finish the journey when you’re ready.
 
 > **Aviation safety warning:** This software is an educational and simulation project. It is not certified, approved, validated, or suitable for real-world flight planning, navigation, aircraft performance calculations, dispatch, or flight operations. Never use its calculations, weather data, maps, or outputs for an operational or safety-critical decision.
 
@@ -16,6 +16,38 @@ Flight Management Systems is a Windows desktop application built with Python and
 - A local pilot profile with activity and career statistics.
 - Optional Infinite Flight live tracker with traffic, routes, and airport context.
 - Display, performance, audio, unit, custom-airline, background, and data-management settings.
+
+## App walkthrough
+
+### Dashboard
+Choose your departure and arrival airports, airline, and aircraft. Enter your flight details and explore the departure airport on the map.
+
+![Dashboard](Dashboard.png)
+
+### Overview
+See your route, airport weather, estimated flight time, and progress in one view.
+
+![Overview](overview.png)
+
+### Payload
+Use the seat map to see where passengers are seated. Enter baggage and cargo weights to see how much load you’re adding.
+
+![Payload](payload.png)
+
+### Checklist
+Open the checklist for your current stage of flight and mark items complete as you go.
+
+![Checklist](checklist.png)
+
+### Takeoff
+Enter runway, weather, and aircraft weight to estimate takeoff speeds and runway distance. Use Fuel Planning to estimate how much fuel to carry.
+
+![Takeoff](takeoff.png)
+
+### Landing
+Enter arrival runway conditions and expected landing weight to estimate approach speed and landing distance.
+
+![Landing](landing.png)
 
 ## Requirements
 
