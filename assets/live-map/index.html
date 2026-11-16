@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FMS Live Flights</title>
+<link rel="stylesheet" href="maplibre-gl.css">
+<style>
+@font-face{font-family:FMS;src:url("../fonts/Jost.ttf")}
+@font-face{font-family:"Noto Sans Arabic";src:url("../fonts/NotoSansArabic.ttf")}
+*{box-sizing:border-box}
+body{margin:0;background:#101318;color:#edf2f8;font:14px FMS,"Noto Sans Arabic",system-ui,sans-serif}
+html,body{width:100%;height:100%;overflow:hidden}
+#map{position:fixed;inset:0;width:100%;height:100%}
+.panel{background:#101824f5;border:1px solid #2a394b;border-radius:10px;box-shadow:0 3px 12px #0005}
+.controls{position:absolute;top:12px;right:12px;width:245px;padding:11px;display:grid;gap:8px}
+select,input,button{font:inherit;color:inherit}
+select,input[type=search],button{background:#202b3b;border:1px solid #36475d;border-radius:6px;padding:7px 9px}
+button{cursor:pointer}
+button:hover{background:#30445d}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #38c5fc}
+.controls label{display:grid;gap:4px;color:#b8c8da;font-size:12px}
+#map-tooltip{position:absolute;pointer-events:none;z-index:3;background:#101824;padding:4px 7px;border:1px solid #36475d;border-radius:5px;font-size:12px}
+#results{display:grid;gap:4px}
+#results button{text-align:left}
+#status,#map-error{font-size:12px;color:#b8c8da;margin:0}
+#map-error{color:#ffb9ae}
+#flight{position:absolute;top:12px;bottom:12px;left:12px;width:min(320px,34vw);display:flex;flex-direction:column;overflow:hidden}
+[hidden]{display:none!important}
+.flight-head{display:flex;align-items:flex-start;justify-content:space-between;padding:10px 12px;gap:8px}
+h1{font-size:18px;color:#43cbff;margin:0;overflow-wrap:anywhere}
+#subtitle{font-size:12px;color:#b8c8da;margin:3px 0 0}
+#close{padding:1px 7px;font-size:18px}
+.flight-body{overflow:auto;scrollbar-width:thin;scrollbar-color:#36bdef #101824}
+#photo{display:block;width:100%;height:130px;object-fit:contain;background:#172334;padding:8px}
+.route,.times,.metrics{display:grid;grid-template-columns:1fr 1fr}
+.route>div,.times>div,.metrics>div{padding:9px 12px;border-bottom:1px solid #273547;min-width:0}
+.route>div+div,.times>div+div,.metrics>div:nth-child(even){border-left:1px solid #273547}
+.route strong{font-size:22px;display:block}
+small{display:block;color:#a9bbd0;font-size:11px}
+.route span{font-size:12px;display:block}
+details summary{cursor:pointer;background:#35b8e6;color:#0b1623;font-weight:700;padding:8px 12px}
+.metrics strong,.times strong{overflow-wrap:anywhere}
+.flight-actions{padding:8px 12px;border-top:1px solid #273547;margin-top:auto}
+.flight-actions button{width:100%}
+</style>
+<div id="map" aria-label="Live flight map"></div>
+<div id="map-tooltip" role="tooltip" dir="auto" hidden></div>
+<aside class="panel controls" aria-label="Map controls">
+  <label>Map style<select id="style"><option value="dark">Dark</option><option value="positron">Positron</option><option value="bright">Bright</option></select></label>
+  <p id="map-error" hidden>Map tiles could not load. Try another style or check your connection.</p>
+  <label>Server<select id="server"></select></label>
+  <input id="search" type="search" placeholder="Find aircraft" aria-label="Find aircraft">
+  <div id="results" hidden></div>
+  <p id="status" role="status">Connecting to Infinite Flight…</p>
+  <button id="refresh">Refresh traffic</button><button id="settings" hidden>Open Settings</button>
+</aside>
+<aside id="flight" class="panel" aria-label="Flight details" hidden>
+  <header class="flight-head"><div><h1 id="callsign" dir="auto"></h1><p id="subtitle" dir="auto"></p></div><button id="close" aria-label="Close flight details">×</button></header>
+  <div class="flight-body">
+    <img id="photo" alt="Aircraft profile" hidden>
+    <div class="route">
+      <div><small>Departure</small><strong id="dep-code"></strong><span id="dep-name" dir="auto"></span></div>
+      <div><small>Arrival</small><strong id="arr-code"></strong><span id="arr-name" dir="auto"></span></div>
+    </div>
+    <div class="times"><div><small>ETD</small><strong id="etd"></strong></div><div><small id="eta-label">ETA</small><strong id="eta"></strong></div><div><small id="ete-label">ETE</small><strong id="ete"></strong></div></div>
+    <details open><summary>Flight information</summary>
+      <div class="metrics">
+        <div><small>Aircraft type</small><strong id="model"></strong></div><div><small>Flight time</small><strong id="duration"></strong></div>
+        <div><small>Altitude</small><strong id="altitude"></strong></div><div><small>Ground speed</small><strong id="speed"></strong></div>
+        <div><small>Vertical speed</small><strong id="vertical"></strong></div><div><small>Heading</small><strong id="heading"></strong></div>
+      </div>
+    </details>
+  </div>
+  <footer class="flight-actions"><button id="follow">Follow</button></footer>
+</aside>
+<script src="maplibre-gl.js"></script>
+<script src="mapbox-gl-rtl-text.js"></script>
+<script src="shapes.js"></script>
+<script src="live-map.js"></script>
+</html>

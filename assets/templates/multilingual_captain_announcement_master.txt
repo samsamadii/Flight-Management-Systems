@@ -1,0 +1,215 @@
+# MULTILINGUAL CAPTAIN ANNOUNCEMENT MASTER TEMPLATE
+
+## PLACEHOLDERS
+
+[CAPTAIN NAME]
+[AIRLINE]
+[AIRCRAFT TYPE]
+[FLIGHT NUMBER]
+[ORIGIN]
+[DESTINATION]
+[FLIGHT TIME]
+[CRUISING ALTITUDE]
+[CURRENT ALTITUDE]
+[TIME TO ARRIVAL]
+[ORIGIN TEMPERATURE]
+[ORIGIN WEATHER CONDITION]
+[ORIGIN SKY CONDITION]
+[DESTINATION TEMPERATURE]
+[DESTINATION WEATHER CONDITION]
+[DESTINATION SKY CONDITION]
+[DESTINATION SKY / PRECIPITATION]
+
+# TAKEOFF / DEPARTURE ANNOUNCEMENT
+
+## English
+
+Ladies and gentlemen, this is your captain speaking. I'm Captain [CAPTAIN NAME].
+
+On behalf of my crew and [AIRLINE], I would like to welcome you on board this [AIRCRAFT TYPE], flight number [FLIGHT NUMBER], from [ORIGIN] to [DESTINATION].
+
+Flight time is estimated at around [FLIGHT TIME]. Our cruising altitude will be [CRUISING ALTITUDE] feet above sea level.
+
+The latest weather report for [ORIGIN] shows [ORIGIN SKY CONDITION]. The current temperature at departure is [ORIGIN TEMPERATURE] degrees Celsius.
+
+At the moment, the weather at our destination, [DESTINATION], has been reported at [DESTINATION TEMPERATURE] degrees, with [DESTINATION SKY CONDITION].
+
+During the flight, we are expecting a smooth journey. If we do encounter any turbulence along the way, we will switch the seatbelt signs back on.
+
+We hope you enjoy the flight. Thank you for joining us today.
+
+Sit back, relax, and enjoy your flight with [AIRLINE].
+
+## Deutsch
+
+Meine Damen und Herren, hier spricht Ihr Kapitän. Mein Name ist Kapitän [CAPTAIN NAME].
+
+Im Namen meiner Crew und von [AIRLINE] möchte ich Sie herzlich an Bord unseres [AIRCRAFT TYPE] auf Flug [FLIGHT NUMBER] von [ORIGIN] nach [DESTINATION] begrüßen.
+
+Unsere Flugzeit beträgt heute ungefähr [FLIGHT TIME]. Unsere geplante Reiseflughöhe liegt bei [CRUISING ALTITUDE] Fuß über dem Meeresspiegel.
+
+Das Wetter in [ORIGIN] wurde als [ORIGIN WEATHER CONDITION] gemeldet. Aktuell haben wir in [ORIGIN] [ORIGIN TEMPERATURE] Grad bei [ORIGIN SKY CONDITION].
+
+An unserem Zielort [DESTINATION] werden derzeit [DESTINATION TEMPERATURE] Grad bei [DESTINATION SKY CONDITION] gemeldet.
+
+Für den Flug erwarten wir überwiegend ruhige Bedingungen. Sollten wir unterwegs dennoch auf Turbulenzen treffen, werden wir die Anschnallzeichen selbstverständlich wieder einschalten.
+
+Wir hoffen, dass Sie Ihren Flug genießen. Vielen Dank, dass Sie heute mit uns reisen.
+
+Lehnen Sie sich zurück, machen Sie es sich bequem und genießen Sie Ihren Flug mit [AIRLINE].
+
+## العربية
+
+سيداتي وسادتي، طابت أوقاتكم. معكم قائد الرحلة، الكابتن [CAPTAIN NAME].
+
+بالنيابة عن طاقم الرحلة وشركة [AIRLINE]، أرحب بكم على متن طائرتنا من طراز [AIRCRAFT TYPE]. نسافر اليوم على الرحلة رقم [FLIGHT NUMBER] من [ORIGIN] إلى [DESTINATION].
+
+نتوقع أن تستغرق الرحلة نحو [FLIGHT TIME]. سنحلّق على ارتفاع يقارب [CRUISING ALTITUDE] قدمًا فوق مستوى سطح البحر.
+
+بحسب آخر تقرير، حالة الطقس في [ORIGIN]: [ORIGIN WEATHER CONDITION]. وتبلغ درجة الحرارة هناك الآن [ORIGIN TEMPERATURE] درجة مئوية.
+
+أما في وجهتنا، [DESTINATION]، فحالة الطقس هي [DESTINATION WEATHER CONDITION]. وتبلغ درجة الحرارة هناك نحو [DESTINATION TEMPERATURE] درجة مئوية.
+
+نتوقع رحلة هادئة ومريحة. وإذا واجهنا مطبّات هوائية، فسنضيء إشارة ربط أحزمة الأمان مرة أخرى.
+
+شكرًا لاختياركم السفر مع [AIRLINE]. نتمنى لكم رحلة ممتعة، ونرجو أن تسترخوا وتستمتعوا بوقتكم معنا.
+
+## Italiano
+
+Signore e signori, qui parla il comandante. Sono il comandante [CAPTAIN NAME].
+
+A nome del mio equipaggio e di [AIRLINE], desidero darvi il benvenuto a bordo di questo [AIRCRAFT TYPE], volo [FLIGHT NUMBER], da [ORIGIN] a [DESTINATION].
+
+La durata prevista del volo è di circa [FLIGHT TIME]. La nostra quota di crociera sarà di circa [CRUISING ALTITUDE] piedi sopra il livello del mare.
+
+Le condizioni meteorologiche a [ORIGIN] sono state riportate come [ORIGIN WEATHER CONDITION]. In questo momento a [ORIGIN] ci sono [ORIGIN TEMPERATURE] gradi, con [ORIGIN SKY CONDITION].
+
+A destinazione, a [DESTINATION], sono attualmente previsti [DESTINATION TEMPERATURE] gradi, con [DESTINATION SKY CONDITION].
+
+Durante il volo prevediamo condizioni tranquille. Se dovessimo incontrare delle turbolenze, riaccenderemo il segnale delle cinture di sicurezza.
+
+Speriamo che possiate godervi il volo. Grazie per essere con noi oggi.
+
+Mettetevi comodi, rilassatevi e godetevi il vostro volo con [AIRLINE].
+
+## Español
+
+Señoras y señores, les habla el capitán. Soy el capitán [CAPTAIN NAME].
+
+En nombre de mi tripulación y de [AIRLINE], me gustaría darles la bienvenida a bordo de este [AIRCRAFT TYPE], vuelo [FLIGHT NUMBER], desde [ORIGIN] hacia [DESTINATION].
+
+La duración estimada del vuelo será de aproximadamente [FLIGHT TIME]. Nuestra altitud de crucero será de unos [CRUISING ALTITUDE] pies sobre el nivel del mar.
+
+Las condiciones meteorológicas en [ORIGIN] han sido reportadas como [ORIGIN WEATHER CONDITION]. En este momento, la temperatura en [ORIGIN] es de [ORIGIN TEMPERATURE] grados, con [ORIGIN SKY CONDITION].
+
+En nuestro destino, [DESTINATION], se han reportado actualmente [DESTINATION TEMPERATURE] grados, con [DESTINATION SKY CONDITION].
+
+Esperamos tener un vuelo tranquilo. Si encontramos turbulencias durante el trayecto, volveremos a encender la señal de cinturones de seguridad.
+
+Esperamos que disfruten del vuelo. Muchas gracias por acompañarnos hoy.
+
+Siéntense, relájense y disfruten de su vuelo con [AIRLINE].
+
+## فارسی
+
+خانم‌ها و آقایان، وقت‌تان بخیر. کاپیتان [CAPTAIN NAME] هستم و از کابین خلبان با شما صحبت می‌کنم.
+
+از طرف خدمهٔ پرواز و شرکت هواپیمایی [AIRLINE]، به شما در پرواز امروز با هواپیمای [AIRCRAFT TYPE] خوشامد می‌گویم.
+
+شمارهٔ پرواز ما [FLIGHT NUMBER] است و از [ORIGIN] به [DESTINATION] پرواز می‌کنیم.
+
+مدت پرواز حدود [FLIGHT TIME] خواهد بود. در طول مسیر، در ارتفاع حدود [CRUISING ALTITUDE] پا از سطح دریا پرواز خواهیم کرد.
+
+انتظار داریم پرواز آرامی داشته باشیم. اگر در مسیر با تلاطم هوایی روبه‌رو شویم، چراغ بستن کمربند ایمنی را دوباره روشن می‌کنیم.
+
+بر اساس آخرین گزارش، وضعیت هوا در [ORIGIN] به این شرح است: [ORIGIN WEATHER CONDITION]. دمای هوا در آنجا هم‌اکنون [ORIGIN TEMPERATURE] درجهٔ سانتی‌گراد است.
+
+در مقصد، [DESTINATION]، وضعیت هوا [DESTINATION WEATHER CONDITION] گزارش شده است. دمای هوا در آنجا حدود [DESTINATION TEMPERATURE] درجهٔ سانتی‌گراد است.
+
+از اینکه برای سفر امروز [AIRLINE] را انتخاب کردید، سپاسگزارم. راحت باشید و از پرواز لذت ببرید. برایتان پروازی آرام و روزی خوش آرزو می‌کنم.
+
+# DESCENT / LANDING ANNOUNCEMENT
+
+## English
+
+Ladies and gentlemen, this is your captain speaking.
+
+We have now started our descent for landing in [DESTINATION].
+
+Our current altitude is approximately [CURRENT ALTITUDE] feet, and we are expecting to arrive in about [TIME TO ARRIVAL].
+
+The latest weather report for [DESTINATION] shows [DESTINATION SKY / PRECIPITATION]. We expect a temperature of around [DESTINATION TEMPERATURE] degrees Celsius on arrival.
+
+I hope you have enjoyed the flight. Sit back, relax, and enjoy the last few minutes on board.
+
+Thank you for flying with [AIRLINE] today. We hope you have a great day, and welcome to [DESTINATION].
+
+## Deutsch
+
+Meine Damen und Herren, hier spricht noch einmal Ihr Kapitän.
+
+Wir haben inzwischen mit unserem Sinkflug auf [DESTINATION] begonnen.
+
+Unsere aktuelle Flughöhe beträgt etwa [CURRENT ALTITUDE] Fuß, und wir erwarten unsere Ankunft in ungefähr [TIME TO ARRIVAL].
+
+Das Wetter in [DESTINATION] wurde als [DESTINATION WEATHER CONDITION] gemeldet. Wir erwarten dort etwa [DESTINATION TEMPERATURE] Grad bei [DESTINATION SKY / PRECIPITATION].
+
+Ich hoffe, Sie hatten einen angenehmen Flug. Lehnen Sie sich noch einmal zurück, entspannen Sie sich und genießen Sie die letzten Minuten an Bord.
+
+Vielen Dank, dass Sie heute mit [AIRLINE] geflogen sind. Wir wünschen Ihnen einen schönen Tag und heißen Sie herzlich willkommen in [DESTINATION].
+
+## العربية
+
+سيداتي وسادتي، معكم قائد الرحلة مرة أخرى.
+
+بدأنا الآن خفض الارتفاع استعدادًا للهبوط في [DESTINATION].
+
+نحلّق الآن على ارتفاع يقارب [CURRENT ALTITUDE] قدمًا. ونتوقع الوصول خلال نحو [TIME TO ARRIVAL].
+
+بحسب آخر تقرير، حالة الطقس في [DESTINATION]: [DESTINATION WEATHER CONDITION]. ونتوقع أن تكون درجة الحرارة عند الوصول نحو [DESTINATION TEMPERATURE] درجة مئوية.
+
+آمل أن تكونوا قد استمتعتم بالرحلة. تفضّلوا بالاسترخاء واستمتعوا بالدقائق الأخيرة على متن الطائرة.
+
+شكرًا لسفركم اليوم مع [AIRLINE]. نتمنى لكم يومًا سعيدًا، وأهلًا بكم في [DESTINATION].
+
+## Italiano
+
+Signore e signori, qui parla nuovamente il comandante.
+
+Abbiamo iniziato la nostra discesa verso [DESTINATION].
+
+La nostra quota attuale è di circa [CURRENT ALTITUDE] piedi e prevediamo di arrivare tra circa [TIME TO ARRIVAL].
+
+Le condizioni meteorologiche a [DESTINATION] sono state riportate come [DESTINATION WEATHER CONDITION]. La temperatura prevista è di circa [DESTINATION TEMPERATURE] gradi, con [DESTINATION SKY / PRECIPITATION].
+
+Spero che abbiate trascorso un piacevole volo. Mettetevi comodi, rilassatevi e godetevi gli ultimi minuti a bordo.
+
+Grazie per aver volato oggi con [AIRLINE]. Vi auguriamo una splendida giornata e benvenuti a [DESTINATION].
+
+## Español
+
+Señoras y señores, les habla nuevamente el capitán.
+
+Hemos comenzado nuestro descenso hacia [DESTINATION].
+
+Nuestra altitud actual es de aproximadamente [CURRENT ALTITUDE] pies y esperamos llegar en unos [TIME TO ARRIVAL].
+
+Las condiciones meteorológicas en [DESTINATION] han sido reportadas como [DESTINATION WEATHER CONDITION]. Esperamos una temperatura de aproximadamente [DESTINATION TEMPERATURE] grados, con [DESTINATION SKY / PRECIPITATION].
+
+Espero que hayan disfrutado del vuelo. Siéntense, relájense y disfruten de los últimos minutos a bordo.
+
+Gracias por volar hoy con [AIRLINE]. Les deseamos un excelente día y bienvenidos a [DESTINATION].
+
+## فارسی
+
+خانم‌ها و آقایان، دوباره از کابین خلبان با شما صحبت می‌کنم. کاپیتان [CAPTAIN NAME] هستم.
+
+برای فرود در [DESTINATION]، کاهش ارتفاع را آغاز کرده‌ایم.
+
+در حال حاضر در ارتفاع حدود [CURRENT ALTITUDE] پا هستیم. انتظار داریم تا حدود [TIME TO ARRIVAL] دیگر به مقصد برسیم.
+
+بر اساس آخرین گزارش، وضعیت هوا در [DESTINATION] به این شرح است: [DESTINATION WEATHER CONDITION]. انتظار داریم هنگام ورود، دمای هوا حدود [DESTINATION TEMPERATURE] درجهٔ سانتی‌گراد باشد.
+
+امیدوارم تا اینجا از پرواز لذت برده باشید. راحت باشید و از دقایق باقی‌ماندهٔ پرواز لذت ببرید.
+
+از اینکه امروز با [AIRLINE] سفر کردید، سپاسگزارم. روز خوبی برایتان آرزو می‌کنم. به [DESTINATION] خوش آمدید.
