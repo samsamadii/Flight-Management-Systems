@@ -123,13 +123,9 @@ This package contains third-party libraries and may contain third-party photogra
 
 Verify or replace every asset whose ownership, licence, attribution, trademark status, or redistribution permission has not been confirmed. See `THIRD_PARTY_NOTICES.md` for the detailed inventory.
 
-## Copyright and licence
+## License
 
-Copyright © 2026 Sam Samadi. All rights reserved.
-
-This is proprietary software. Public visibility does not make it open source or grant permission to copy, modify, redistribute, sublicense, sell, commercially exploit, or create derivative works. Public hosting can allow technical viewing and downloading; the licence provides legal terms, not technical copy prevention. See `LICENSE` and `COPYRIGHT.md`.
-
-Third-party material remains subject to its owners' terms and is not relicensed by the project's proprietary licence.
+The original source code for Flight Management Systems V14 is licensed under the [MIT License](LICENSE). Third-party components and assets retain their own terms. See [Third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## Author
 
