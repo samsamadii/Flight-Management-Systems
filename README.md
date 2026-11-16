@@ -2,6 +2,8 @@
 
 Your flight simulator gives you the cockpit. FMS gives you the dispatch desk. Plan your route, estimate fuel and flight time, and brief both airports with weather and maps. Run your checklists, then give the captain’s welcome you’ve heard a hundred times: “Ladies and gentlemen, welcome aboard.” Once airborne, watch your aircraft move across the live Infinite Flight map. Running out of time before touchdown? Pause your flight in FMS, save your progress, and come back to finish the journey when you’re ready.
 
+**[Download FMS V14 for Windows](https://github.com/samsamadii/Flight-Management-Systems/releases/tag/v14.0.0)** — Extract the portable ZIP and open `FMS V14 Public.exe`. Python is included.
+
 > **Aviation safety warning:** This software is an educational and simulation project. It is not certified, approved, validated, or suitable for real-world flight planning, navigation, aircraft performance calculations, dispatch, or flight operations. Never use its calculations, weather data, maps, or outputs for an operational or safety-critical decision.
 
 ## Features
