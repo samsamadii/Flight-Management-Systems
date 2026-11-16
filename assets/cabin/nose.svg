@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 456 448" width="456" height="448">
+  <defs>
+    <g id="wc" fill="#4e6274">
+      <circle cx="5" cy="4" r="1.5"/><path d="M3 7h4l1 5H6.5v4h-3v-4H2z"/>
+      <circle cx="13" cy="4" r="1.5"/><path d="M11 7h4l2 6h-2v3h-3v-3h-2z"/>
+      <path d="M9 3v13" fill="none" stroke="#4e6274" stroke-width="1"/>
+    </g>
+    <g id="galley" fill="none" stroke="#4e6274" stroke-width="1.6" stroke-linecap="round">
+      <path d="M3 3v5q2 3 4 0V3M5 3v13M12 3q-3 3-3 7h3v6M12 3v7"/>
+    </g>
+  </defs>
+  <path fill="#e8edf1" d="M18 448v-19c0-65 17-125 44-196C103 123 167 0 228 0s125 123 166 233c27 71 44 131 44 196v19z"/>
+  <path fill="#c9d4de" d="M26 448v-28c0-58 18-111 52-150 40-46 92-71 150-71s110 25 150 71c34 39 52 92 52 150v28z"/>
+  <path fill="#424e5a" d="M34 448v-28c0-55 17-105 50-143 36-43 86-69 144-69s108 26 144 69c33 38 50 88 50 143v28z"/>
+  <g fill="#4c5055">
+    <path d="m170 104 48-24q6-3 6 4v15q0 5-6 8l-43 21q-4 2-6-3l-5-14q-2-4 6-7z"/>
+    <path d="m286 104-48-24q-6-3-6 4v15q0 5 6 8l43 21q4 2 6-3l5-14q2-4-6-7z"/>
+    <path d="m158 116-26 25q-3 4 0 8l9 10q3 4 7 0l15-20q2-4 1-8z"/>
+    <path d="m298 116 26 25q3 4 0 8l-9 10q-3 4-7 0l-15-20q-2-4-1-8z"/>
+    <path d="m128 154-13 28q-2 6 3 6h7q3 0 6-4l10-16q2-3-1-6l-8-8q-2-2-4 0z"/>
+    <path d="m328 154 13 28q2 6-3 6h-7q-3 0-6-4l-10-16q-2-3 1-6l8-8q2-2 4 0z"/>
+  </g>
+  <path fill="#b8c6d3" d="M85 276c22-27 52-49 81-59v94q0 5-6 5H58q11-22 27-40zm105-66 25-5v30h-25zm46-4c61 2 105 32 135 69q17 20 27 41H241q-5 0-5-5z"/>
+  <path fill="#97aabc" d="M87 277c22-25 50-45 79-57v69H77zm149-66c56 2 102 29 134 66l10 12H236z"/>
+  <g fill="#adbdcb" stroke="#708698" stroke-width="1">
+    <rect x="131" y="269" width="22" height="21" rx="2"/>
+    <rect x="248" y="269" width="22" height="21" rx="2"/>
+    <rect x="271" y="269" width="21" height="21" rx="2"/>
+  </g>
+  <use href="#wc" x="133" y="270"/><use href="#wc" x="250" y="270"/><use href="#galley" x="274" y="270"/>
+  <path fill="#424e5a" d="M20 382q15-8 31-8l-8 54H18zm416 0q-15-8-31-8l8 54h25z"/>
+  <path fill="#b8c6d3" d="M34 420q27-9 67-10v23H34zm128-19h132v32H162zm193 9q40 1 67 10v13h-67z"/>
+  <path fill="#97aabc" d="M34 420q27-9 67-10v5q-40 3-67 10zm128-19h132v5H162zm193 9q40 1 67 10v5q-27-7-67-10z"/>
+</svg>
