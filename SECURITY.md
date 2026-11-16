@@ -18,7 +18,7 @@ Only the latest published source revision is intended to receive security fixes.
 
 - Store `MAPTILER_API_KEY` and `INFINITE_FLIGHT_API_KEY` in the process environment when possible.
 - Never commit `.env`, `infinite_flight_config.json`, credentials, tokens, private keys, profile data, calendar records, exports, or logs.
-- Be aware that the in-app Infinite Flight key save action writes the key in plaintext to `infinite_flight_config.json`.
+- Be aware that the in-app Infinite Flight key save action stores the key using Windows DPAPI in `infinite_flight_key.dpapi`.
 - Restrict access to the machine and local application-data directory. The application does not encrypt its JSON files.
 - Treat screenshots, exported JSON, profile-image paths, flight history, callsigns, and diagnostic output as potentially sensitive.
 

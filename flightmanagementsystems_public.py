@@ -1,6 +1,13 @@
 
 import flet as ft
 import sys
+from aviation_lookup import city_image, fetch_metar, metar_condition, search_catalog, search_key
+from fms_cabin import SEAT_BLUE, SEAT_RED, SEAT_YELLOW, cabin_diagram, seat_artwork
+from fms_live import flight_airports, flight_timing, read_api_key, write_api_key
+from fms_interface import (
+    CARD_RADIUS, CONTEXT_HEIGHT, CONTROL_RADIUS, DARK, GAP, LIGHT, NAV_HEIGHT, NAV_OPACITY, SHELL_HEIGHT, SURFACE_OPACITY,
+    UI_FONT, UI_FONT_ASSET, airline_background, button_style, prepare_controls, surface_fill, with_hover,
+)
 
 # FMS Flet compatibility patch
 # Keeps the app compatible across Flet desktop/web versions where helper APIs differ.
@@ -89,7 +96,8 @@ except ImportError:
     ftg = None
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import json
 import math
 import os
@@ -106,6 +114,15 @@ import asyncio
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
+from captain_announcements import (
+    LANGUAGE_DISPLAY_LABELS,
+    RTL_ANNOUNCEMENT_LANGUAGES,
+    missing_native_language_for_airline,
+    primary_languages_for_airline,
+    render_announcement,
+    supported_languages,
+)
+
 try:
     import pystray
     from PIL import Image as PILImage
@@ -114,8 +131,70 @@ except ImportError:
     PILImage = None
 
 
+def blend_hex_colors(base: str, tint: str, tint_weight: float) -> str:
+    """Blend two six-digit colors while keeping theme calculations deterministic."""
+    weight = max(0.0, min(float(tint_weight), 1.0))
+
+    def channels(value: str) -> tuple[int, int, int]:
+        clean = str(value or "").strip().lstrip("#")
+        if len(clean) != 6:
+            raise ValueError(f"Expected a six-digit hex color, got {value!r}")
+        return tuple(int(clean[index:index + 2], 16) for index in (0, 2, 4))
+
+    base_rgb = channels(base)
+    tint_rgb = channels(tint)
+    mixed = tuple(round(base_channel * (1.0 - weight) + tint_channel * weight) for base_channel, tint_channel in zip(base_rgb, tint_rgb))
+    return "#" + "".join(f"{channel:02X}" for channel in mixed)
+
+
+def relative_luminance(color: str) -> float:
+    """Return WCAG relative luminance for a six-digit color."""
+    clean = str(color or "").strip().lstrip("#")
+    if len(clean) != 6:
+        raise ValueError(f"Expected a six-digit hex color, got {color!r}")
+    values = [int(clean[index:index + 2], 16) / 255.0 for index in (0, 2, 4)]
+    linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in values]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def parse_landing_g(value) -> Optional[float]:
+    raw = str(value).strip().replace(",", ".")
+    if not re.fullmatch(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)", raw):
+        return None
+    number = float(raw)
+    return number if 0 < number <= 2.6 else None
+
+
+def landing_g_grade(value: float) -> tuple[str, str, str]:
+    # Start each band at the next grade's lower bound to cover decimal gaps.
+    if value < 1.1:
+        return "Very smooth", "#12643B", "#DDF5E5"
+    if value < 1.3:
+        return "Smooth / Good", "#2E5C0C", "#EAF4D7"
+    if value < 1.5:
+        return "Regular / Standard", "#6E5000", "#FFF1C5"
+    if value <= 1.8:
+        return "Firm / Hard", "#893F09", "#FFE6CE"
+    return "Very hard / Inspection limit", "#921F23", "#FDE1E0"
+
+
+def contrast_ratio(foreground: str, background: str) -> float:
+    lighter = max(relative_luminance(foreground), relative_luminance(background))
+    darker = min(relative_luminance(foreground), relative_luminance(background))
+    return (lighter + 0.05) / (darker + 0.05)
+
+
 _FMS_SINGLE_INSTANCE_MUTEX = None
 _FMS_SHOW_WINDOW_EVENT = None
+_INTERFACE_PREVIEW = False
+FMS_VERSION = "V14"
+_PREVIEW_INSTANCE_ID = f"{FMS_VERSION}LiveTrackerPreview"
+_PREVIEW_WINDOW_TITLE = f"FMS {FMS_VERSION} Live Tracker Preview"
+DASHBOARD_DATE_HEIGHT = 55
+DASHBOARD_ACTIONS_HEIGHT = 48
+DASHBOARD_MAP_INSET = 6
+DASHBOARD_MAP_WINDOW = "FMS Dashboard Airport Ground Map"
+LIVE_MAP_WINDOW = "FMS OpenFreeMap Traffic"
 
 
 def _acquire_fms_single_instance() -> bool:
@@ -124,8 +203,9 @@ def _acquire_fms_single_instance() -> bool:
         return True
 
     kernel32 = ctypes.windll.kernel32
-    mutex_name = "Local\\SamSamadi.FlightManagementSystems.V10.Instance"
-    event_name = "Local\\SamSamadi.FlightManagementSystems.V10.ShowWindow"
+    instance_id = _PREVIEW_INSTANCE_ID if _INTERFACE_PREVIEW else "V14Public"
+    mutex_name = f"Local\\SamSamadi.FlightManagementSystems.{instance_id}.Instance"
+    event_name = f"Local\\SamSamadi.FlightManagementSystems.{instance_id}.ShowWindow"
     mutex_handle = kernel32.CreateMutexW(None, False, mutex_name)
     already_running = kernel32.GetLastError() == 183
     show_event = kernel32.CreateEventW(None, False, False, event_name)
@@ -178,7 +258,7 @@ def _enum_windows_by_title(title_fragment: str) -> List[int]:
     return matches
 
 
-def _set_window_child_style(hwnd: int):
+def _set_window_child_style(hwnd: int, *, visible=True):
     user32 = ctypes.windll.user32
     gwl_style = -16
     ws_child = 0x40000000
@@ -195,7 +275,9 @@ def _set_window_child_style(hwnd: int):
         set_style = user32.SetWindowLongW
 
     style = int(get_style(hwnd, gwl_style))
-    style = (style & ~ws_popup & ~ws_caption & ~ws_thickframe) | ws_child | ws_visible
+    style = (style & ~(ws_popup | ws_caption | ws_thickframe | ws_visible)) | ws_child
+    if visible:
+        style |= ws_visible
     set_style(hwnd, gwl_style, style)
 
 
@@ -214,9 +296,21 @@ def _move_child_webview_to_content(parent_hwnd: int, child_hwnd: int, slot: str 
     user32.GetClientRect(parent_hwnd, ctypes.byref(rect))
     width = max(420, int(rect.right - rect.left))
     height = max(320, int(rect.bottom - rect.top))
-    nav_width = 78
-    top_bar_height = 66
-    if slot == "overview-globe":
+    nav_width = 0
+    dpi = user32.GetDpiForWindow(parent_hwnd)
+    top_bar_height = round(SHELL_HEIGHT * (dpi or 96) / 96)
+    if slot == "dashboard-airport":
+        scale = (dpi or 96) / 96
+        x = round((width + GAP * scale) / 2 + DASHBOARD_MAP_INSET * scale)
+        y = round((SHELL_HEIGHT + 2 * GAP + DASHBOARD_DATE_HEIGHT + DASHBOARD_MAP_INSET) * scale)
+        w = max(1, width - x - round((GAP + DASHBOARD_MAP_INSET) * scale))
+        h = max(1, height - y - round((2 * GAP + DASHBOARD_ACTIONS_HEIGHT + DASHBOARD_MAP_INSET) * scale))
+    elif slot == "live-map":
+        x = 0
+        y = top_bar_height
+        w = max(1, rect.right - rect.left)
+        h = max(1, rect.bottom - rect.top - y)
+    elif slot == "overview-globe":
         dpi_scale = 1.0
         try:
             get_dpi_for_window = user32.GetDpiForWindow
@@ -256,7 +350,13 @@ def run_globe_webview_host(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--parent-title", default="Flight Management Systems")
     parser.add_argument("--attach", action="store_true")
     parser.add_argument("--slot", default="content")
+    parser.add_argument("--storage-path")
+    parser.add_argument("--departure-file", type=Path)
+    parser.add_argument("--live-map-bridge", type=Path)
     args = parser.parse_args(argv)
+    dashboard_airport = args.slot == "dashboard-airport"
+    live_map = args.slot == "live-map"
+    embedded = dashboard_airport or live_map
 
     try:
         import webview
@@ -267,6 +367,16 @@ def run_globe_webview_host(argv: Optional[List[str]] = None) -> int:
     def attach_to_parent(window):
         if not args.attach:
             return
+        if embedded:
+            try:
+                ready = window.events.loaded.wait(8) and window.evaluate_js(
+                    "typeof window.updateLiveMap === 'function'" if live_map
+                    else "typeof window.setDashboardDeparture === 'function'"
+                )
+            except Exception:
+                ready = False
+            if not ready:
+                os._exit(2)
         user32 = ctypes.windll.user32
         parent_hwnd = 0
         for _ in range(80):
@@ -276,6 +386,8 @@ def run_globe_webview_host(argv: Optional[List[str]] = None) -> int:
                 break
             time.sleep(0.1)
         if not parent_hwnd:
+            if embedded:
+                os._exit(2)
             return
 
         child_hwnd = 0
@@ -294,37 +406,70 @@ def run_globe_webview_host(argv: Optional[List[str]] = None) -> int:
                 break
             time.sleep(0.1)
         if not child_hwnd:
+            if embedded:
+                os._exit(2)
             return
 
-        _set_window_child_style(child_hwnd)
+        _set_window_child_style(child_hwnd, visible=not embedded)
         user32.SetParent(child_hwnd, parent_hwnd)
         _move_child_webview_to_content(parent_hwnd, child_hwnd, args.slot)
 
         def keep_attached():
+            last_departure = None
+            last_snapshot = None
             while user32.IsWindow(parent_hwnd) and user32.IsWindow(child_hwnd):
                 _move_child_webview_to_content(parent_hwnd, child_hwnd, args.slot)
+                if dashboard_airport and args.departure_file:
+                    try:
+                        value = args.departure_file.read_bytes().decode("ascii")
+                        if value != last_departure and re.fullmatch(r"(?:[A-Z]{4}|-)\n", value):
+                            code = "" if value == "-\n" else value.strip()
+                            window.evaluate_js(f"window.setDashboardDeparture({json.dumps(code)})")
+                            last_departure = value
+                    except (OSError, UnicodeError, webview.errors.WebViewException):
+                        pass
+                if live_map and args.live_map_bridge:
+                    try:
+                        snapshot = (args.live_map_bridge / "snapshot.json").read_text(encoding="utf-8")
+                        if snapshot != last_snapshot:
+                            window.evaluate_js(f"window.updateLiveMap({snapshot})")
+                            last_snapshot = snapshot
+                        action_path = args.live_map_bridge / "actions.json"
+                        actions = window.evaluate_js("window.takeLiveMapActions()") if not action_path.exists() else []
+                        if actions:
+                            file = args.live_map_bridge / "actions.tmp"
+                            file.write_text(json.dumps(actions), encoding="utf-8")
+                            file.replace(action_path)
+                    except (OSError, UnicodeError, webview.errors.WebViewException):
+                        pass
                 time.sleep(0.18)
+            if embedded:
+                os._exit(0)
 
         threading.Thread(target=keep_attached, daemon=True).start()
 
     window_kwargs = dict(
-        title="FMS Globe.gl Route Globe",
+        title=LIVE_MAP_WINDOW if live_map else DASHBOARD_MAP_WINDOW if dashboard_airport else "FMS Globe.gl Route Globe",
         url=args.url,
         width=420 if args.slot == "overview-globe" else 1100,
         height=440 if args.slot == "overview-globe" else 720,
-        min_size=(320, 300) if args.slot == "overview-globe" else (640, 420),
+        min_size=(1, 1) if embedded else ((320, 300) if args.slot == "overview-globe" else (640, 420)),
+        hidden=embedded,
         frameless=bool(args.attach),
         easy_drag=False,
         background_color="#00000000" if args.slot == "overview-globe" else "#020617",
         text_select=False,
-        zoomable=True,
+        zoomable=not embedded,
     )
     try:
         window = webview.create_window(**window_kwargs)
     except Exception:
         window_kwargs["background_color"] = "#020617"
         window = webview.create_window(**window_kwargs)
-    webview.start(attach_to_parent, args=(window,), gui="edgechromium", debug=False, private_mode=False)
+    webview.start(
+        attach_to_parent, args=(window,), gui="edgechromium", debug=False,
+        private_mode=False, storage_path=args.storage_path,
+    )
     return 0
 
 
@@ -333,6 +478,7 @@ AIRLINES = ['Air France',
  'ANA',
  'British Airways',
  'Cathay Pacific',
+ 'Delta Air Lines',
  'Emirates',
  'Etihad Airways',
  'Generic',
@@ -354,6 +500,7 @@ AIRLINE_CALLSIGNS = {
     "ANA": "NH",
     "British Airways": "BA",
     "Cathay Pacific": "CX",
+    "Delta Air Lines": "DL",
     "Emirates": "EK",
     "Etihad Airways": "EY",
     "Generic": "GEN",
@@ -370,6 +517,17 @@ AIRLINE_CALLSIGNS = {
     "Virgin Atlantic": "VS",
 }
 
+AIRLINE_NAME_ALIASES = {
+    "delta": "Delta Air Lines",
+    "delta airlines": "Delta Air Lines",
+}
+
+
+def canonical_airline_name(name: Optional[str]) -> str:
+    clean_name = re.sub(r"\s+", " ", str(name or "").strip())
+    return AIRLINE_NAME_ALIASES.get(clean_name.lower(), clean_name)
+
+
 AIRLINE_FLEETS = {
     # Matched to the aircraft/livery screenshot provided by the user.
     "Air France": [
@@ -377,6 +535,7 @@ AIRLINE_FLEETS = {
         "Airbus A320-200",
         "Airbus A350-900",
         "Airbus A380-800",
+        "Boeing 777-200ER",
         "Boeing 777-300ER",
         "Boeing 787-9",
         "Boeing 787-10",
@@ -385,28 +544,48 @@ AIRLINE_FLEETS = {
         "Airbus A220-300",
         "Airbus A320-200",
         "Airbus A321-200",
+        "Airbus A321neo",
+        "Airbus A330-900neo",
     ],
     "American Airlines": [
         "Airbus A321-200",
+        "Airbus A321neo",
         "Boeing 737-8 MAX",
+        "Boeing 777-200ER",
     ],
     "ANA": [
+        "Airbus A321neo",
+        "Boeing 777-200ER",
         "Boeing 777-300ER",
         "Boeing 787-10",
     ],
     "British Airways": [
         "Airbus A320-200",
         "Airbus A321-200",
+        "Airbus A321neo",
         "Airbus A350-1000",
         "Airbus A380-800",
+        "Boeing 777-200ER",
         "Boeing 777-300ER",
         "Boeing 787-9",
         "Boeing 787-10",
     ],
     "Cathay Pacific": [
+        "Airbus A321neo",
         "Airbus A330-300",
         "Airbus A350-900",
+        "Airbus A350-1000",
         "Boeing 777-300ER",
+    ],
+    "Delta Air Lines": [
+        "Airbus A320-200",
+        "Airbus A321-200",
+        "Airbus A321neo",
+        "Airbus A330-300",
+        "Airbus A330-900neo",
+        "Airbus A350-900",
+        # Retired from Delta service in 2020; retained for the supplied simulator livery.
+        "Boeing 777-200ER",
     ],
     "Emirates": [
         "Airbus A350-900",
@@ -415,6 +594,7 @@ AIRLINE_FLEETS = {
     ],
     "Etihad Airways": [
         "Airbus A320-200",
+        "Airbus A321neo",
         "Airbus A350-1000",
         "Airbus A380-800",
         "Boeing 777-300ER",
@@ -425,7 +605,9 @@ AIRLINE_FLEETS = {
         "Airbus A220-300",
         "Airbus A320-200",
         "Airbus A321-200",
+        "Airbus A321neo",
         "Airbus A330-300",
+        "Airbus A330-900neo",
         "Airbus A340-600",
         "Airbus A350-900",
         "Airbus A350-1000",
@@ -434,6 +616,7 @@ AIRLINE_FLEETS = {
         "Boeing 747-200",
         "Boeing 747-8",
         "Boeing 757-200",
+        "Boeing 777-200ER",
         "Boeing 777-300ER",
         "Boeing 787-9",
         "Boeing 787-10",
@@ -444,9 +627,11 @@ AIRLINE_FLEETS = {
     "Lufthansa": [
         "Airbus A320-200",
         "Airbus A321-200",
+        "Airbus A321neo",
         "Airbus A330-300",
         "Airbus A340-600",
         "Airbus A350-900",
+        "Airbus A350-900 (100 Years)",
         "Airbus A380-800",
         "Boeing 747-8",
         "Boeing 787-9",
@@ -455,12 +640,14 @@ AIRLINE_FLEETS = {
         "Airbus A340-600",
     ],
     "Qantas": [
+        "Airbus A321neo",
         "Airbus A330-300",
         "Airbus A350-1000",
         "Airbus A380-800",
         "Boeing 787-9",
     ],
     "Qatar Airways": [
+        "Airbus A350-1000",
         "Boeing 777-300ER",
     ],
     "Singapore Airlines": [
@@ -477,19 +664,24 @@ AIRLINE_FLEETS = {
     "Turkish Airlines": [
         "Airbus A320-200",
         "Airbus A321-200",
+        "Airbus A321neo",
         "Airbus A330-300",
         "Airbus A350-900",
         "Boeing 777-300ER",
         "Boeing 787-9",
     ],
     "United Airlines": [
+        "Airbus A321neo",
         "Airbus A350-900",
         "Boeing 737-8 MAX",
+        "Boeing 777-200ER",
         "Boeing 777-300ER",
         "Boeing 787-9",
         "Boeing 787-10",
     ],
     "Virgin Atlantic": [
+        "Airbus A330-900neo",
+        "Airbus A350-1000",
         "Airbus A340-600",
     ],
 }
@@ -553,10 +745,14 @@ AIRCRAFT_LIBRARY = {'A220-300': {'name': 'Airbus A220-300',
              'mtow': 97000,
              'oew': 50700,
              'mlw': 79200,
-             'vr_speeds': {'1': 145, '2': 140, '3': 135},
-             'v2_speeds': {'1': 155, '2': 150, '3': 145},
-             'vref_speeds': {'FULL': 135, '3': 140},
-             'flap_options': ['1', '2', '3'],
+             'vr_speeds': {'1+F': 154, '2': 150, '3': 146},
+             'v2_speeds': {'1+F': 162, '2': 158, '3': 154},
+             'takeoff_speed_reference_weight_ratio': 1.0,
+             'takeoff_vr_floor_speeds': {'1+F': 128, '2': 126, '3': 124},
+             'takeoff_v2_floor_speeds': {'1+F': 136, '2': 134, '3': 132},
+             'takeoff_v1_max_gap_kt': 10,
+             'vref_speeds': {'FULL': 137, '3': 142},
+             'flap_options': ['1+F', '2', '3'],
              'land_flaps': ['FULL', '3'],
              'base_roll': 2200,
              'land_roll': 1600,
@@ -567,14 +763,42 @@ AIRCRAFT_LIBRARY = {'A220-300': {'name': 'Airbus A220-300',
              'approach_speed': 140,
              'derived_payload_plus_fuel_at_mtow_kg': 46300,
              'derived_payload_plus_remaining_fuel_at_mlw_kg': 28500,
-             'notes': 'Added as A321neo planning profile. Weight limits use Airbus published A321neo values; '
-                      'speeds/distances are planning approximations based on A321 family defaults.'},
+             'notes': 'Infinite Flight A321neo simulator planning profile. Weight limits follow the 97 t MTOW and '
+                      '79.2 t MLW variant; V-speeds scale by weight and configuration and are not for real-world operations.'},
+ 'A330-200': {'name': 'Airbus A330-200',
+              'mtow': 242000,
+              'oew': 120000,
+              'mlw': 182000,
+              'vr_speeds': {'1+F': 153, '2': 149, '3': 146},
+              'v2_speeds': {'1+F': 161, '2': 157, '3': 154},
+              'takeoff_speed_reference_weight_ratio': 1.0,
+              'takeoff_vr_floor_speeds': {'1+F': 130, '2': 128, '3': 126},
+              'takeoff_v2_floor_speeds': {'1+F': 138, '2': 136, '3': 134},
+              'takeoff_v1_max_gap_kt': 12,
+              'vref_speeds': {'FULL': 135, '3': 140, '2': 145},
+              'flap_options': ['1+F', '2', '3'],
+              'land_flaps': ['FULL', '3', '2'],
+              'base_roll': 2350,
+              'land_roll': 1680,
+              'engines': '2× GE CF6-80E1 / PW4000 / RR Trent 700',
+              'fuel_burn': 5600,
+              'max_alt': 41100,
+              'climb_fpm': 2500,
+              'approach_speed': 140,
+              'derived_payload_plus_fuel_at_mtow_kg': 122000,
+              'derived_payload_plus_remaining_fuel_at_mlw_kg': 62000,
+              'notes': 'Infinite Flight A330-200 simulator planning profile. Takeoff speeds vary with weight and '
+                       'configuration; not for real-world operations.'},
  'A330-300': {'name': 'Airbus A330-300',
               'mtow': 242000,
               'oew': 120000,
-              'mlw': 187000,
-              'vr_speeds': {'1+F': 150, '2': 145, '3': 140},
-              'v2_speeds': {'1+F': 160, '2': 155, '3': 150},
+              'mlw': 185000,
+              'vr_speeds': {'1+F': 154, '2': 150, '3': 147},
+              'v2_speeds': {'1+F': 162, '2': 158, '3': 155},
+              'takeoff_speed_reference_weight_ratio': 1.0,
+              'takeoff_vr_floor_speeds': {'1+F': 130, '2': 128, '3': 126},
+              'takeoff_v2_floor_speeds': {'1+F': 138, '2': 136, '3': 134},
+              'takeoff_v1_max_gap_kt': 12,
               'vref_speeds': {'FULL': 135, '3': 140, '2': 145},
               'flap_options': ['1+F', '2', '3'],
               'land_flaps': ['FULL', '3', '2'],
@@ -586,7 +810,57 @@ AIRCRAFT_LIBRARY = {'A220-300': {'name': 'Airbus A220-300',
               'climb_fpm': 2500,
               'approach_speed': 140,
               'derived_payload_plus_fuel_at_mtow_kg': 122000,
-              'derived_payload_plus_remaining_fuel_at_mlw_kg': 67000},
+              'derived_payload_plus_remaining_fuel_at_mlw_kg': 65000,
+              'notes': 'Infinite Flight A330-300 simulator planning profile. Approximately 150 kt VR at MTOW '
+                       'in configuration 2; not for real-world operations.'},
+ 'A330-800': {'name': 'Airbus A330-800neo',
+              'mtow': 251000,
+              'oew': 132000,
+              'mlw': 186000,
+              'vr_speeds': {'1+F': 153, '2': 149, '3': 146},
+              'v2_speeds': {'1+F': 161, '2': 157, '3': 154},
+              'takeoff_speed_reference_weight_ratio': 1.0,
+              'takeoff_vr_floor_speeds': {'1+F': 130, '2': 128, '3': 126},
+              'takeoff_v2_floor_speeds': {'1+F': 138, '2': 136, '3': 134},
+              'takeoff_v1_max_gap_kt': 12,
+              'vref_speeds': {'FULL': 135, '3': 140, '2': 145},
+              'flap_options': ['1+F', '2', '3'],
+              'land_flaps': ['FULL', '3', '2'],
+              'base_roll': 2350,
+              'land_roll': 1680,
+              'engines': '2× Rolls-Royce Trent 7000-72',
+              'fuel_burn': 5000,
+              'max_alt': 41000,
+              'climb_fpm': 2500,
+              'approach_speed': 140,
+              'derived_payload_plus_fuel_at_mtow_kg': 119000,
+              'derived_payload_plus_remaining_fuel_at_mlw_kg': 54000,
+              'notes': 'Infinite Flight A330-800neo simulator planning profile. Takeoff speeds vary with weight and '
+                       'configuration; not for real-world operations.'},
+ 'A330-900': {'name': 'Airbus A330-900neo',
+              'mtow': 251000,
+              'oew': 137000,
+              'mlw': 185000,
+              'vr_speeds': {'1+F': 154, '2': 150, '3': 147},
+              'v2_speeds': {'1+F': 162, '2': 158, '3': 155},
+              'takeoff_speed_reference_weight_ratio': 1.0,
+              'takeoff_vr_floor_speeds': {'1+F': 130, '2': 128, '3': 126},
+              'takeoff_v2_floor_speeds': {'1+F': 138, '2': 136, '3': 134},
+              'takeoff_v1_max_gap_kt': 12,
+              'vref_speeds': {'FULL': 135, '3': 140, '2': 145},
+              'flap_options': ['1+F', '2', '3'],
+              'land_flaps': ['FULL', '3', '2'],
+              'base_roll': 2400,
+              'land_roll': 1700,
+              'engines': '2× Rolls-Royce Trent 7000-72',
+              'fuel_burn': 5200,
+              'max_alt': 41500,
+              'climb_fpm': 2500,
+              'approach_speed': 140,
+              'derived_payload_plus_fuel_at_mtow_kg': 114000,
+              'derived_payload_plus_remaining_fuel_at_mlw_kg': 48000,
+              'notes': 'Infinite Flight A330-900neo simulator planning profile. Approximately 150 kt VR at MTOW '
+                       'in configuration 2; not for real-world operations.'},
  'A340-600': {'name': 'Airbus A340-600',
               'mtow': 380000,
               'oew': 174000,
@@ -742,6 +1016,27 @@ AIRCRAFT_LIBRARY = {'A220-300': {'name': 'Airbus A220-300',
               'notes': 'Planning default fuel flow updated from public ops references; engine fit refreshed.',
               'derived_payload_plus_fuel_at_mtow_kg': 37600,
               'derived_payload_plus_remaining_fuel_at_mlw_kg': 24900},
+ 'B777-200ER': {'name': 'Boeing 777-200ER',
+                 'mtow': 297550,
+                 'oew': 141880,
+                 'mlw': 213180,
+                 'vr_speeds': {'5': 155, '15': 150, '20': 145},
+                 'v2_speeds': {'5': 165, '15': 160, '20': 155},
+                 'takeoff_speed_reference_weight_ratio': 0.85,
+                 'vref_speeds': {'30': 139, '25': 144},
+                 'flap_options': ['5', '15', '20'],
+                 'land_flaps': ['30', '25'],
+                 'base_roll': 2800,
+                 'land_roll': 1615,
+                 'engines': '2× GE90-94B / PW4090 / Rolls-Royce Trent 895',
+                 'fuel_burn': 6800,
+                 'max_alt': 43100,
+                 'climb_fpm': 2500,
+                 'approach_speed': 139,
+                 'derived_payload_plus_fuel_at_mtow_kg': 155670,
+                 'derived_payload_plus_remaining_fuel_at_mlw_kg': 71300,
+                 'notes': 'Boeing 777-200ER simulator planning profile. Delta retired the type in 2020; '
+                          'retained as a historical livery option and not for real-world operations.'},
  'B777-300ER': {'name': 'Boeing 777-300ER',
                  'mtow': 351500,
                  'oew': 167800,
@@ -801,6 +1096,13 @@ AIRCRAFT_LIBRARY = {'A220-300': {'name': 'Airbus A220-300',
             'derived_payload_plus_fuel_at_mtow_kg': 183700,
             'derived_payload_plus_remaining_fuel_at_mlw_kg': 83200}}
 
+# Keep the anniversary aircraft operationally identical to the regular A350-900,
+# while exposing it as a distinct selectable livery in the Lufthansa fleet.
+AIRCRAFT_LIBRARY["A350-900-LH100"] = {
+    **AIRCRAFT_LIBRARY["A350-900"],
+    "name": "Airbus A350-900 (100 Years)",
+}
+
 AIRCRAFT_NAME_ALIASES = {'airbus a220-300': 'A220-300',
  'airbus a320-200': 'A320-200',
  'airbus a320': 'A320-200',
@@ -808,10 +1110,18 @@ AIRCRAFT_NAME_ALIASES = {'airbus a220-300': 'A220-300',
  'airbus a321-200': 'A321-200',
  'airbus a321': 'A321-200',
  'airbus a321neo': 'A321neo',
- 'airbus a330-200': 'A330-300',
+ 'airbus a330-200': 'A330-200',
  'airbus a330-300': 'A330-300',
+ 'airbus a330-800': 'A330-800',
+ 'airbus a330-800neo': 'A330-800',
+ 'airbus a330-800 neo': 'A330-800',
+ 'airbus a330-900': 'A330-900',
+ 'airbus a330-900neo': 'A330-900',
+ 'airbus a330-900 neo': 'A330-900',
  'airbus a340-300': 'A340-600',
  'airbus a350-900': 'A350-900',
+ 'airbus a350-900 (100 years)': 'A350-900-LH100',
+ 'a350-900-lh100': 'A350-900-LH100',
  'airbus a380-800': 'A380-800',
  'boeing 737-800': 'B737-8MAX',
  'boeing 737 max 8': 'B737-8MAX',
@@ -824,7 +1134,7 @@ AIRCRAFT_NAME_ALIASES = {'airbus a220-300': 'A220-300',
  'boeing 767-300er': 'B757-200',
  'boeing 777-300': 'B777-300ER',
  'boeing 777-300er': 'B777-300ER',
- 'boeing 777-200er': 'B777-300ER',
+ 'boeing 777-200er': 'B777-200ER',
  'boeing 787-8': 'B787-9',
  'boeing 787-9': 'B787-9',
  'boeing 787-10': 'B787-10',
@@ -880,7 +1190,10 @@ def aircraft_picker_sort_key(aircraft_key: str) -> tuple[int, int, str]:
         "A320-200": 20,
         "A321-200": 30,
         "A321neo": 31,
-        "A330-300": 40,
+        "A330-200": 40,
+        "A330-300": 41,
+        "A330-800": 42,
+        "A330-900": 43,
         "A340-600": 50,
         "A350-900": 60,
         "A350-1000": 61,
@@ -889,6 +1202,7 @@ def aircraft_picker_sort_key(aircraft_key: str) -> tuple[int, int, str]:
         "B747-8": 120,
         "B747-200": 121,
         "B757-200": 130,
+        "B777-200ER": 139,
         "B777-300ER": 140,
         "B787-9": 150,
         "B787-10": 151,
@@ -951,6 +1265,7 @@ AIRLINE_LOGO_FILES = {'ANA': 'airlines/logos/ana.png',
  'American Airlines': 'airlines/logos/american_airlines.png',
  'British Airways': 'airlines/logos/british_airways.png',
  'Cathay Pacific': 'airlines/logos/cathay_pacific.png',
+ 'Delta Air Lines': 'airlines/logos/delta_air_lines.png',
  'Emirates': 'airlines/logos/emirates.png',
  'Etihad Airways': 'airlines/logos/etihad_airways.webp',
  'Generic': 'airlines/logos/generic.png',
@@ -969,6 +1284,7 @@ AIRLINE_LOGO_FILES = {'ANA': 'airlines/logos/ana.png',
 AIRLINE_LOGO_ALTERNATE_FILES = {
     'American Airlines': ['american_airlines.png', 'american.png', 'aa.png'],
     'British Airways': ['british_airways.png', 'british.png', 'ba.png'],
+    'Delta Air Lines': ['delta_air_lines.png', 'delta.png', 'dl.png'],
     'Etihad Airways': ['etihad_airways.webp', 'etihad_airways.png', 'etihad.png', 'ey.png'],
     'ITA Airways': ['ita_airways.png', 'ita.png'],
     'Singapore Airlines': ['singapore_airlines.png', 'singapore.png', 'sia.png'],
@@ -1024,6 +1340,125 @@ WEATHER_CODE_LABELS = {
 }
 
 
+CHECKLIST_SECTIONS = [
+    {
+        "key": "turn_on_aircraft",
+        "title": "Turn On Aircraft",
+        "items": [
+            ("Batteries 1 & 2", "ON"),
+            ("External Power", "ON (if available)"),
+            ("ADIRS Switches", "NAV"),
+            ("APU Master", "ON"),
+            ("APU Start", "ON"),
+            ("APU Bleed", "ON"),
+            ("NAV Lights", "ON"),
+            ("No portable devices sign", "ON"),
+            ("Seatbelts", "ON"),
+        ],
+    },
+    {
+        "key": "start_engines",
+        "title": "Start Engines",
+        "items": [
+            ("Beacon Light", "ON"),
+            ("Fuel Pumps", "ON"),
+            ("Engine Mode Selector", "IGN / START"),
+            ("Engine 1 Master", "ON"),
+            ("Engine 1", "STABLE"),
+            ("Engine 2 Master", "ON"),
+            ("Engine 2", "STABLE"),
+            ("Engine Mode Selector", "NORM"),
+            ("APU Bleed", "OFF"),
+            ("APU Master", "OFF"),
+            ("Taxi Light", "ON"),
+        ],
+    },
+    {
+        "key": "before_takeoff",
+        "title": "Before Takeoff",
+        "items": [
+            ("Flight Controls", "CHECK"),
+            ("Flight Instruments", "CHECK"),
+            ("Trim", "AS REQUIRED"),
+            ("Autobrake", "MAX"),
+            ("Spoilers", "ARM"),
+            ("Flaps", "SET"),
+            ("Strobe Lights", "ON"),
+            ("Landing Lights", "ON"),
+        ],
+    },
+    {
+        "key": "after_takeoff",
+        "title": "After Takeoff",
+        "items": [
+            ("Gear", "UP"),
+            ("Flaps", "RETRACTED"),
+            ("Spoilers", "DISARM"),
+            ("Taxi Light", "OFF"),
+        ],
+    },
+    {
+        "key": "climb_out",
+        "title": "Climb-out",
+        "items": [
+            ("Autopilot", "AS REQUIRED"),
+            ("Landing Lights", "OFF (10,000 ft)"),
+            ("Seatbelts", "OFF (above 10,000 ft)"),
+        ],
+    },
+    {
+        "key": "landing",
+        "title": "Landing",
+        "items": [
+            ("Seatbelts", "ON"),
+            ("Landing Lights", "ON (10,000 ft)"),
+            ("Autobrake", "SET"),
+            ("Flaps", "SET"),
+            ("Landing Gear", "DOWN"),
+            ("Spoilers", "ARM"),
+        ],
+    },
+    {
+        "key": "after_landing",
+        "title": "After Landing",
+        "items": [
+            ("Spoilers", "DISARM"),
+            ("Flaps", "RETRACT"),
+            ("Landing Lights", "OFF"),
+            ("Strobe Lights", "OFF"),
+            ("Taxi Light", "ON"),
+            ("APU Master", "ON"),
+            ("Brake Temp", "CHECK"),
+            ("Brake Fans", "AS REQUIRED"),
+            ("APU Start", "ON"),
+            ("APU Bleed", "ON"),
+        ],
+    },
+    {
+        "key": "shutdown_aircraft",
+        "title": "Shutdown Aircraft",
+        "items": [
+            ("Taxi Light", "OFF"),
+            ("Parking Brake", "SET"),
+            ("Thrust Levers", "IDLE"),
+            ("Engine 1 Master", "OFF"),
+            ("Engine 2 Master", "OFF"),
+            ("Beacon Light", "OFF"),
+            ("Seatbelts", "OFF"),
+            ("Fuel Pumps", "OFF"),
+            ("External Power", "ON (if available)"),
+            ("ADIRS", "OFF"),
+            ("Brake Fans", "OFF"),
+            ("APU Bleed", "OFF"),
+            ("APU Master", "OFF"),
+            ("NAV Lights", "OFF"),
+            ("External Power", "OFF"),
+            ("Battery 1 & 2", "OFF"),
+        ],
+    },
+]
+
+
 @dataclass
 class WeatherState:
     temperature_c: Optional[float] = None
@@ -1033,17 +1468,18 @@ class WeatherState:
 
 @dataclass
 class AppState:
-    is_logged_in: bool = False
+    is_logged_in: bool = True
     pilot_name: str = "Pilot"
     profile_member_since: str = ""
     location_label: str = "Unknown"
     weather: WeatherState = field(default_factory=WeatherState)
     airline: str = ""
     selected_tab_index: int = 1
-    display_mode: str = "dark"
+    display_mode: str = "daylight"
     display_brightness: float = 1.0
     display_contrast: float = 1.0
     airline_overlay_opacity: float = 0.50
+    payload_view: str = "seats"
     custom_airlines: List[str] = field(default_factory=list)
     default_fuel_unit: str = "kg"
     default_distance_unit: str = "NM"
@@ -1053,11 +1489,13 @@ class AppState:
     professional_info_enabled: bool = False
     app_volume: float = 0.85
     app_muted: bool = False
-    login_intro_started: bool = False
-    login_transition_active: bool = False
-    login_transition_progress: float = 0.0
     aircraft: str = ""
+    airline_record: dict = field(default_factory=dict)
+    aircraft_record: dict = field(default_factory=dict)
     flight_number: str = ""
+    dashboard_flight_plan: Dict[str, str] = field(default_factory=dict)
+    tutorial_seen: set[str] = field(default_factory=set)
+    tutorial_skipped: bool = False
     departure: str = ""
     arrival: str = ""
     departure_gate: str = ""
@@ -1069,13 +1507,31 @@ class AppState:
     catering_status: str = "Not started"
     flight_status: str = "Select an airline"
     overview_flight_status_index: int = 0
-    overview_flight_time_minutes: int = 120
+    overview_flight_time_minutes: int = 0  # Flight Plan override in minutes.
     overview_takeoff_start_timestamp: Optional[float] = None
     overview_locked_eta_timestamp: Optional[float] = None
     overview_progress_running: bool = False
+    overview_paused_elapsed_seconds: Optional[float] = None
     overview_calendar_completion_key: str = ""
-    flight_hibernation_menu_open: bool = False
     flight_hibernation_prompt_seen: bool = False
+    captain_announcement_language: str = "English"
+    captain_announcement_phase: str = "departure"
+    captain_announcement_text: str = ""
+    captain_departure_announcement_text: str = ""
+    captain_descent_announcement_text: str = ""
+    captain_announcement_cruise_altitude_ft: str = ""
+    captain_announcement_current_altitude_ft: str = ""
+    captain_announcement_generating: bool = False
+    takeoff_announcement_expanded: bool = False
+    descent_announcement_expanded: bool = False
+    takeoff_operations_view: str = "menu"
+    landing_operations_view: str = "menu"
+    checklist_section: str = "turn_on_aircraft"
+    checklist_completed: Dict[str, List[int]] = field(default_factory=dict)
+    takeoff_clock_source: str = "route"
+    landing_clock_source: str = "route"
+    takeoff_clock_menu_open: bool = False
+    landing_clock_menu_open: bool = False
     route_distance_override_nm: Optional[float] = None
     route_distance_override_key: str = ""
     ramp_status_phase: str = "departure"
@@ -1090,10 +1546,7 @@ class AppState:
     calendar_editing_id: Optional[str] = None
     calendar_selected_date: str = ""
     log_expanded_id: Optional[str] = None
-    log_editing_detail_id: Optional[str] = None
-    log_editing_detail_field: Optional[str] = None
     profile_image_path: str = ""
-    if_connection_status: str = "Not connected"
     if_selected_session_id: str = ""
     if_selected_session_name: str = ""
     if_sessions: List[dict] = field(default_factory=list)
@@ -1101,29 +1554,26 @@ class AppState:
     if_selected_flight_plan: Dict[str, object] = field(default_factory=dict)
     if_live_flights: List[dict] = field(default_factory=list)
     if_selected_route_points: List[tuple] = field(default_factory=list)
-    if_selected_route_label: str = ""
     if_selected_route_start_label: str = ""
     if_selected_route_end_label: str = ""
     if_last_traffic_refresh: str = "Never"
-    if_live_refresh_enabled: bool = False
+    overview_live: bool = False
+    if_followed_flight_id: str = ""
     if_last_live_refresh_attempt: float = 0.0
-    if_active_atc: List[dict] = field(default_factory=list)
-    if_user_stats: Dict[str, object] = field(default_factory=dict)
-    if_recent_activity: List[dict] = field(default_factory=list)
+    if_traffic_retry_at: float = 0.0
+    if_atc_session: str = ""
+    if_atc_checked_at: float = 0.0
+    if_atc_markers: list = field(default_factory=list)
+    if_traffic_session: str = ""
     if_cache: Dict[str, dict] = field(default_factory=dict)
-    if_last_request_status: str = "No request yet"
-    if_last_response_ms: str = "—"
     if_last_error: str = ""
-    if_cache_status: str = "Empty"
     if_last_activity_timestamp: float = 0.0
     if_polling_paused: bool = False
     page_backgrounds: Dict[str, Optional[str]] = field(default_factory=lambda: {
-        "LOGIN": "login_bg.jpg",
         "OVERVIEW": "backgrounds/map_bg.jpg",
         "HOME": "backgrounds/home_bg.jpg",
         "TAKEOFF": "backgrounds/takeoff_bg.jpg",
         "LANDING": "backgrounds/landing_bg.jpg",
-        "MAP": "backgrounds/map_bg.jpg",
         "SEATS": "backgrounds/seats_bg.jpg",
         "CALENDAR": "backgrounds/calendar_bg.jpg",
         "LOG": "backgrounds/log_bg.jpg",
@@ -1200,306 +1650,16 @@ FT_TO_M = 0.3048
 G = 9.81
 
 
-AIRPORT_LIBRARY = {'CYYC': {'elevation_ft': 3606,
-          'iata': 'YYC',
-          'lat': 51.1215,
-          'lon': -114.0076,
-          'name': 'Calgary International Airport'},
- 'CYUL': {'elevation_ft': 118,
-          'iata': 'YUL',
-          'lat': 45.4706,
-          'lon': -73.7408,
-          'name': 'Montreal-Trudeau International Airport'},
- 'CYVR': {'elevation_ft': 14,
-          'iata': 'YVR',
-          'lat': 49.1967,
-          'lon': -123.1815,
-          'name': 'Vancouver International Airport'},
- 'CYYZ': {'elevation_ft': 569,
-          'iata': 'YYZ',
-          'lat': 43.6777,
-          'lon': -79.6248,
-          'name': 'Toronto Pearson International Airport'},
- 'EDDB': {'elevation_ft': 157, 'iata': 'BER', 'lat': 52.3667, 'lon': 13.5033, 'name': 'Berlin Brandenburg Airport'},
- 'EDDF': {'elevation_ft': 364, 'iata': 'FRA', 'lat': 50.0379, 'lon': 8.5622, 'name': 'Frankfurt Airport'},
- 'EDDH': {'elevation_ft': 53, 'iata': 'HAM', 'lat': 53.6304, 'lon': 9.9882, 'name': 'Hamburg Airport'},
- 'EDDK': {'elevation_ft': 302, 'iata': 'CGN', 'lat': 50.8659, 'lon': 7.1427, 'name': 'Cologne Bonn Airport'},
- 'EDDM': {'elevation_ft': 1487, 'iata': 'MUC', 'lat': 48.3538, 'lon': 11.7861, 'name': 'Munich Airport'},
- 'EFHK': {'elevation_ft': 179, 'iata': 'HEL', 'lat': 60.3172, 'lon': 24.9633, 'name': 'Helsinki Airport'},
- 'EGKK': {'elevation_ft': 202, 'iata': 'LGW', 'lat': 51.1537, 'lon': -0.1821, 'name': 'London Gatwick Airport'},
- 'EGLL': {'elevation_ft': 83, 'iata': 'LHR', 'lat': 51.47, 'lon': -0.4543, 'name': 'London Heathrow Airport'},
- 'EHAM': {'elevation_ft': -11, 'iata': 'AMS', 'lat': 52.3105, 'lon': 4.7683, 'name': 'Amsterdam Schiphol Airport'},
- 'EIDW': {'elevation_ft': 242, 'iata': 'DUB', 'lat': 53.4213, 'lon': -6.2701, 'name': 'Dublin Airport'},
- 'EKCH': {'elevation_ft': 17, 'iata': 'CPH', 'lat': 55.6181, 'lon': 12.656, 'name': 'Copenhagen Airport'},
- 'ENGM': {'elevation_ft': 681, 'iata': 'OSL', 'lat': 60.1939, 'lon': 11.1004, 'name': 'Oslo Airport'},
- 'EPKK': {'elevation_ft': 791, 'iata': 'KRK', 'lat': 50.0777, 'lon': 19.7848, 'name': 'Krakow John Paul II Airport'},
- 'EPWA': {'elevation_ft': 362, 'iata': 'WAW', 'lat': 52.1657, 'lon': 20.9671, 'name': 'Warsaw Chopin Airport'},
- 'ESSA': {'elevation_ft': 134, 'iata': 'ARN', 'lat': 59.6519, 'lon': 17.9186, 'name': 'Stockholm Arlanda Airport'},
- 'FIMP': {'elevation_ft': 186,
-          'iata': 'MRU',
-          'lat': -20.4302,
-          'lon': 57.6836,
-          'name': 'Sir Seewoosagur Ramgoolam International Airport'},
- 'HECA': {'elevation_ft': 382, 'iata': 'CAI', 'lat': 30.1219, 'lon': 31.4056, 'name': 'Cairo International Airport'},
- 'KATL': {'elevation_ft': 1026,
-          'iata': 'ATL',
-          'lat': 33.6407,
-          'lon': -84.4277,
-          'name': 'Hartsfield-Jackson Atlanta International Airport'},
- 'KBOS': {'elevation_ft': 20,
-          'iata': 'BOS',
-          'lat': 42.3656,
-          'lon': -71.0096,
-          'name': 'Boston Logan International Airport'},
- 'KDCA': {'elevation_ft': 15,
-          'iata': 'DCA',
-          'lat': 38.8512,
-          'lon': -77.0402,
-          'name': 'Ronald Reagan Washington National Airport'},
- 'KDEN': {'elevation_ft': 5431,
-          'iata': 'DEN',
-          'lat': 39.8561,
-          'lon': -104.6737,
-          'name': 'Denver International Airport'},
- 'KDFW': {'elevation_ft': 607,
-          'iata': 'DFW',
-          'lat': 32.8998,
-          'lon': -97.0403,
-          'name': 'Dallas Fort Worth International Airport'},
- 'KEWR': {'elevation_ft': 18,
-          'iata': 'EWR',
-          'lat': 40.6895,
-          'lon': -74.1745,
-          'name': 'Newark Liberty International Airport'},
- 'KIAD': {'elevation_ft': 312,
-          'iata': 'IAD',
-          'lat': 38.9531,
-          'lon': -77.4565,
-          'name': 'Washington Dulles International Airport'},
- 'KIAH': {'elevation_ft': 97,
-          'iata': 'IAH',
-          'lat': 29.9902,
-          'lon': -95.3368,
-          'name': 'George Bush Intercontinental Airport'},
- 'KJFK': {'elevation_ft': 13,
-          'iata': 'JFK',
-          'lat': 40.6413,
-          'lon': -73.7781,
-          'name': 'John F. Kennedy International Airport'},
- 'KLAS': {'elevation_ft': 2181,
-          'iata': 'LAS',
-          'lat': 36.084,
-          'lon': -115.1537,
-          'name': 'Harry Reid International Airport'},
- 'KLAX': {'elevation_ft': 128,
-          'iata': 'LAX',
-          'lat': 33.9416,
-          'lon': -118.4085,
-          'name': 'Los Angeles International Airport'},
- 'KLGA': {'elevation_ft': 21, 'iata': 'LGA', 'lat': 40.7769, 'lon': -73.874, 'name': 'LaGuardia Airport'},
- 'KMCO': {'elevation_ft': 96, 'iata': 'MCO', 'lat': 28.4312, 'lon': -81.3081, 'name': 'Orlando International Airport'},
- 'KMDW': {'elevation_ft': 620,
-          'iata': 'MDW',
-          'lat': 41.7868,
-          'lon': -87.7522,
-          'name': 'Chicago Midway International Airport'},
- 'KMIA': {'elevation_ft': 8, 'iata': 'MIA', 'lat': 25.7959, 'lon': -80.287, 'name': 'Miami International Airport'},
- 'KORD': {'elevation_ft': 672,
-          'iata': 'ORD',
-          'lat': 41.9742,
-          'lon': -87.9073,
-          'name': "Chicago O'Hare International Airport"},
- 'KPHL': {'elevation_ft': 36,
-          'iata': 'PHL',
-          'lat': 39.8744,
-          'lon': -75.2424,
-          'name': 'Philadelphia International Airport'},
- 'KPHX': {'elevation_ft': 1135,
-          'iata': 'PHX',
-          'lat': 33.4342,
-          'lon': -112.0116,
-          'name': 'Phoenix Sky Harbor International Airport'},
- 'KSEA': {'elevation_ft': 433,
-          'iata': 'SEA',
-          'lat': 47.4502,
-          'lon': -122.3088,
-          'name': 'Seattle-Tacoma International Airport'},
- 'KSFO': {'elevation_ft': 13,
-          'iata': 'SFO',
-          'lat': 37.6213,
-          'lon': -122.379,
-          'name': 'San Francisco International Airport'},
- 'LEBL': {'elevation_ft': 12, 'iata': 'BCN', 'lat': 41.2974, 'lon': 2.0833, 'name': 'Barcelona El Prat Airport'},
- 'LEMD': {'elevation_ft': 2000,
-          'iata': 'MAD',
-          'lat': 40.4722,
-          'lon': -3.5608,
-          'name': 'Adolfo Suarez Madrid-Barajas Airport'},
- 'LFPG': {'elevation_ft': 392, 'iata': 'CDG', 'lat': 49.0097, 'lon': 2.5479, 'name': 'Paris Charles de Gaulle Airport'},
- 'LGAV': {'elevation_ft': 308, 'iata': 'ATH', 'lat': 37.9364, 'lon': 23.9445, 'name': 'Athens International Airport'},
- 'LGSR': {'elevation_ft': 127,
-          'iata': 'JTR',
-          'lat': 36.3992,
-          'lon': 25.4793,
-          'name': 'Santorini International Airport'},
- 'LIRF': {'elevation_ft': 13, 'iata': 'FCO', 'lat': 41.8003, 'lon': 12.2389, 'name': 'Rome Fiumicino Airport'},
- 'LLBG': {'elevation_ft': 135, 'iata': 'TLV', 'lat': 32.0114, 'lon': 34.8867, 'name': 'Ben Gurion Airport'},
- 'LOWW': {'elevation_ft': 600, 'iata': 'VIE', 'lat': 48.1103, 'lon': 16.5697, 'name': 'Vienna International Airport'},
- 'LPPT': {'elevation_ft': 374, 'iata': 'LIS', 'lat': 38.7742, 'lon': -9.1342, 'name': 'Lisbon Airport'},
- 'LSZH': {'elevation_ft': 1416, 'iata': 'ZRH', 'lat': 47.4582, 'lon': 8.5555, 'name': 'Zurich Airport'},
- 'LTBA': {'elevation_ft': 163, 'iata': 'ISL', 'lat': 40.9769, 'lon': 28.8146, 'name': 'Istanbul Ataturk Airport'},
- 'LTFM': {'elevation_ft': 325, 'iata': 'IST', 'lat': 41.2753, 'lon': 28.7519, 'name': 'Istanbul Airport'},
- 'MMMX': {'elevation_ft': 7316,
-          'iata': 'MEX',
-          'lat': 19.4361,
-          'lon': -99.0719,
-          'name': 'Mexico City International Airport'},
- 'MMUN': {'elevation_ft': 22, 'iata': 'CUN', 'lat': 21.0365, 'lon': -86.8771, 'name': 'Cancun International Airport'},
- 'OBBI': {'elevation_ft': 6, 'iata': 'BAH', 'lat': 26.2708, 'lon': 50.6336, 'name': 'Bahrain International Airport'},
- 'OEJN': {'elevation_ft': 48,
-          'iata': 'JED',
-          'lat': 21.6702,
-          'lon': 39.1525,
-          'name': 'King Abdulaziz International Airport'},
- 'OEKK': {'elevation_ft': 76, 'iata': 'EAM', 'lat': 28.3352, 'lon': 35.4608, 'name': 'Neom Bay Airport'},
- 'OERK': {'elevation_ft': 2049,
-          'iata': 'RUH',
-          'lat': 24.9576,
-          'lon': 46.6988,
-          'name': 'King Khalid International Airport'},
- 'OIIE': {'elevation_ft': 3305,
-          'iata': 'IKA',
-          'lat': 35.4161,
-          'lon': 51.1522,
-          'name': 'Tehran Imam Khomeini International Airport'},
- 'OIII': {'elevation_ft': 3962, 'iata': 'THR', 'lat': 35.6892, 'lon': 51.3134, 'name': 'Tehran Mehrabad Airport'},
- 'OJAI': {'elevation_ft': 2395,
-          'iata': 'AMM',
-          'lat': 31.7226,
-          'lon': 35.9932,
-          'name': 'Queen Alia International Airport'},
- 'OKBK': {'elevation_ft': 206, 'iata': 'KWI', 'lat': 29.2266, 'lon': 47.9689, 'name': 'Kuwait International Airport'},
- 'OMAA': {'elevation_ft': 88, 'iata': 'AUH', 'lat': 24.433, 'lon': 54.6511, 'name': 'Zayed International Airport'},
- 'OMDB': {'elevation_ft': 62, 'iata': 'DXB', 'lat': 25.2532, 'lon': 55.3657, 'name': 'Dubai International Airport'},
- 'OMSJ': {'elevation_ft': 111, 'iata': 'SHJ', 'lat': 25.3286, 'lon': 55.5172, 'name': 'Sharjah International Airport'},
- 'OOMS': {'elevation_ft': 48, 'iata': 'MCT', 'lat': 23.5933, 'lon': 58.2844, 'name': 'Muscat International Airport'},
- 'OTHH': {'elevation_ft': 13, 'iata': 'DOH', 'lat': 25.2731, 'lon': 51.6081, 'name': 'Hamad International Airport'},
- 'RCSS': {'elevation_ft': 18, 'iata': 'TSA', 'lat': 25.0697, 'lon': 121.5525, 'name': 'Taipei Songshan Airport'},
- 'RCTP': {'elevation_ft': 108,
-          'iata': 'TPE',
-          'lat': 25.0797,
-          'lon': 121.2342,
-          'name': 'Taiwan Taoyuan International Airport'},
- 'RJAA': {'elevation_ft': 141, 'iata': 'NRT', 'lat': 35.7719, 'lon': 140.3929, 'name': 'Narita International Airport'},
- 'RJBB': {'elevation_ft': 26, 'iata': 'KIX', 'lat': 34.4347, 'lon': 135.244, 'name': 'Kansai International Airport'},
- 'RJTT': {'elevation_ft': 21, 'iata': 'HND', 'lat': 35.5494, 'lon': 139.7798, 'name': 'Tokyo Haneda Airport'},
- 'RKSI': {'elevation_ft': 23, 'iata': 'ICN', 'lat': 37.4602, 'lon': 126.4407, 'name': 'Incheon International Airport'},
- 'RPLL': {'elevation_ft': 75,
-          'iata': 'MNL',
-          'lat': 14.5086,
-          'lon': 121.0198,
-          'name': 'Ninoy Aquino International Airport'},
- 'SAEZ': {'elevation_ft': 67, 'iata': 'EZE', 'lat': -34.8222, 'lon': -58.5358, 'name': 'Ezeiza International Airport'},
- 'SBGR': {'elevation_ft': 2459,
-          'iata': 'GRU',
-          'lat': -23.4356,
-          'lon': -46.4731,
-          'name': 'Sao Paulo Guarulhos International Airport'},
- 'SCEL': {'elevation_ft': 1555,
-          'iata': 'SCL',
-          'lat': -33.3929,
-          'lon': -70.7858,
-          'name': 'Santiago International Airport'},
- 'SKBO': {'elevation_ft': 8361,
-          'iata': 'BOG',
-          'lat': 4.7016,
-          'lon': -74.1469,
-          'name': 'El Dorado International Airport'},
- 'SPJC': {'elevation_ft': 113,
-          'iata': 'LIM',
-          'lat': -12.0219,
-          'lon': -77.1143,
-          'name': 'Jorge Chavez International Airport'},
- 'UUEE': {'elevation_ft': 622,
-          'iata': 'SVO',
-          'lat': 55.9726,
-          'lon': 37.4146,
-          'name': 'Sheremetyevo International Airport'},
- 'VABB': {'elevation_ft': 39,
-          'iata': 'BOM',
-          'lat': 19.0896,
-          'lon': 72.8656,
-          'name': 'Mumbai Chhatrapati Shivaji Maharaj Airport'},
- 'VHHH': {'elevation_ft': 28, 'iata': 'HKG', 'lat': 22.308, 'lon': 113.9185, 'name': 'Hong Kong International Airport'},
- 'VIDP': {'elevation_ft': 777,
-          'iata': 'DEL',
-          'lat': 28.5562,
-          'lon': 77.1,
-          'name': 'Indira Gandhi International Airport'},
- 'VOBL': {'elevation_ft': 3000,
-          'iata': 'BLR',
-          'lat': 13.1986,
-          'lon': 77.7066,
-          'name': 'Kempegowda International Airport'},
- 'VOMM': {'elevation_ft': 52, 'iata': 'MAA', 'lat': 12.9941, 'lon': 80.1709, 'name': 'Chennai International Airport'},
- 'VTBS': {'elevation_ft': 5, 'iata': 'BKK', 'lat': 13.69, 'lon': 100.7501, 'name': 'Suvarnabhumi Airport'},
- 'WIII': {'elevation_ft': 34,
-          'iata': 'CGK',
-          'lat': -6.1256,
-          'lon': 106.6559,
-          'name': 'Soekarno-Hatta International Airport'},
- 'WMKK': {'elevation_ft': 69,
-          'iata': 'KUL',
-          'lat': 2.7456,
-          'lon': 101.7072,
-          'name': 'Kuala Lumpur International Airport'},
- 'WSSS': {'elevation_ft': 22, 'iata': 'SIN', 'lat': 1.3644, 'lon': 103.9915, 'name': 'Singapore Changi Airport'},
- 'YSSY': {'elevation_ft': 21,
-          'iata': 'SYD',
-          'lat': -33.9399,
-          'lon': 151.1753,
-          'name': 'Sydney Kingsford Smith Airport'},
- 'ZBAA': {'elevation_ft': 116,
-          'iata': 'PEK',
-          'lat': 40.0801,
-          'lon': 116.5846,
-          'name': 'Beijing Capital International Airport'},
- 'ZBAD': {'elevation_ft': 98,
-          'iata': 'PKX',
-          'lat': 39.5099,
-          'lon': 116.4105,
-          'name': 'Beijing Daxing International Airport'},
- 'ZGGG': {'elevation_ft': 49,
-          'iata': 'CAN',
-          'lat': 23.3924,
-          'lon': 113.2988,
-          'name': 'Guangzhou Baiyun International Airport'},
- 'ZSPD': {'elevation_ft': 13,
-          'iata': 'PVG',
-          'lat': 31.1443,
-          'lon': 121.8083,
-          'name': 'Shanghai Pudong International Airport'},
- 'ZSSS': {'elevation_ft': 10,
-          'iata': 'SHA',
-          'lat': 31.1979,
-          'lon': 121.3363,
-          'name': 'Shanghai Hongqiao International Airport'}}
+# Populated only by selected airports, restored flights and legacy route lookups.
+AIRPORT_LIBRARY: dict[str, dict] = {}
+AIRPORT_CODE_ALIASES = {"IKH": "OIIE"}
 
 
-AIRPORT_CODE_ALIASES = {icao: icao for icao in AIRPORT_LIBRARY}
-for icao, airport in AIRPORT_LIBRARY.items():
-    iata = str(airport.get("iata", "")).strip().upper()
-    if iata:
-        AIRPORT_CODE_ALIASES[iata] = icao
-
-# Compatibility aliases for common user inputs and legacy shorthand.
-AIRPORT_CODE_ALIASES.update({
-    "IKH": "OIIE",
-})
-
-AIRPORT_ELEVATIONS_FT = {icao: int(data["elevation_ft"]) for icao, data in AIRPORT_LIBRARY.items()}
-AIRPORT_COORDINATES = {icao: (float(data["lat"]), float(data["lon"])) for icao, data in AIRPORT_LIBRARY.items()}
-AIRPORT_COORDS = {icao: (float(data["lat"]), float(data["lon"])) for icao, data in AIRPORT_LIBRARY.items()}
+def remember_airport(record: dict):
+    code = record["code"]
+    AIRPORT_LIBRARY[code] = record
+    if record.get("iata"):
+        AIRPORT_CODE_ALIASES[record["iata"]] = code
 
 
 def normalize_airport_code(code: Optional[str]) -> Optional[str]:
@@ -1632,6 +1792,19 @@ TAKEOFF_CONFIGS = {
         total_static_thrust_n=280000,
         engine_count=2,
     ),
+    "A321_NEO": TakeoffAircraftConfig(
+        name="Airbus A321neo",
+        mtow_kg=97000,
+        climb_fpm=2850,
+        flap_options=["1+F", "2", "3"],
+        wing_area_m2=122.6,
+        clmax_by_flap={"1+F": 1.95, "2": 2.15, "3": 2.35},
+        cd0=0.022,
+        oswald_e=0.82,
+        aspect_ratio=9.5,
+        total_static_thrust_n=294000,
+        engine_count=2,
+    ),
     "A220": TakeoffAircraftConfig(
         name="Airbus A220-300",
         mtow_kg=70400,
@@ -1651,11 +1824,24 @@ TAKEOFF_CONFIGS = {
         climb_fpm=2400,
         flap_options=["1+F", "2", "3"],
         wing_area_m2=361.6,
-        clmax_by_flap={"1+F": 1.85, "2": 2.05, "3": 2.25},
+        clmax_by_flap={"1+F": 2.20, "2": 2.40, "3": 2.60},
         cd0=0.022,
         oswald_e=0.82,
         aspect_ratio=10.1,
         total_static_thrust_n=640000,
+        engine_count=2,
+    ),
+    "A330_NEO": TakeoffAircraftConfig(
+        name="Airbus A330neo",
+        mtow_kg=251000,
+        climb_fpm=2500,
+        flap_options=["1+F", "2", "3"],
+        wing_area_m2=361.6,
+        clmax_by_flap={"1+F": 2.24, "2": 2.44, "3": 2.64},
+        cd0=0.021,
+        oswald_e=0.84,
+        aspect_ratio=11.3,
+        total_static_thrust_n=646000,
         engine_count=2,
     ),
     "A350": TakeoffAircraftConfig(
@@ -1913,6 +2099,7 @@ class TakeoffMetarData:
     wind_dir_deg: int
     wind_speed_kt: int
     wind_gust_kt: int = 0
+    observation: Optional[dict] = None
 
 
 @dataclass
@@ -1964,12 +2151,16 @@ class TakeoffResultData:
 
 def resolve_takeoff_aircraft_config(aircraft_name: str) -> TakeoffAircraftConfig:
     name = (aircraft_name or "").lower()
-    if "a321" in name:
+    if "a321neo" in name or "a321 neo" in name:
+        base = TAKEOFF_CONFIGS["A321_NEO"]
+    elif "a321" in name:
         base = TAKEOFF_CONFIGS["A321_FAMILY"]
     elif "a320" in name or "a319" in name:
         base = TAKEOFF_CONFIGS["A320_FAMILY"]
     elif "a220" in name:
         base = TAKEOFF_CONFIGS["A220"]
+    elif "a330-800" in name or "a330-900" in name:
+        base = TAKEOFF_CONFIGS["A330_NEO"]
     elif "a330" in name or "a340" in name:
         base = TAKEOFF_CONFIGS["A330"]
     elif "a350" in name:
@@ -2037,11 +2228,12 @@ def fetch_takeoff_metar(icao: str) -> Optional[TakeoffMetarData]:
         gust = m.get("wgst", 0) or 0
         return TakeoffMetarData(
             raw=m.get("rawOb", "N/A"),
-            temperature_c=float(m.get("temp", 15) or 15),
+            temperature_c=float(m["temp"]) if m.get("temp") is not None else 15.0,
             qnh_hpa=round(float(qnh), 1),
             wind_dir_deg=int(wind_dir),
             wind_speed_kt=int(m.get("wspd", 0) or 0),
             wind_gust_kt=int(gust),
+            observation=m,
         )
     except Exception:
         return None
@@ -2202,12 +2394,14 @@ def compute_takeoff_performance(inputs: TakeoffInputs) -> TakeoffResultData:
     lib_vr = lib.get("vr_speeds", {}).get(flap_setting) if lib else None
     lib_v2 = lib.get("v2_speeds", {}).get(flap_setting) if lib else None
     speed_reference_ratio = float((lib or {}).get("takeoff_speed_reference_weight_ratio", 0.0) or 0.0)
+    vr_floor = float((lib or {}).get("takeoff_vr_floor_speeds", {}).get(flap_setting, 0.0) or 0.0)
+    v2_floor = float((lib or {}).get("takeoff_v2_floor_speeds", {}).get(flap_setting, 0.0) or 0.0)
 
     if lib_vr is not None and speed_reference_ratio > 0:
         vr_kt = scale_takeoff_reference_speed_kt(
             float(lib_vr), mass_kg, ac.mtow_kg, speed_reference_ratio
         )
-        vr_kt = max(vr_kt, vs_kt * 1.05, vs_kt + 5.0)
+        vr_kt = max(vr_kt, vr_floor, vs_kt * 1.05, vs_kt + 5.0)
     elif lib_vr is not None:
         vr_kt = float(lib_vr)
     else:
@@ -2218,7 +2412,7 @@ def compute_takeoff_performance(inputs: TakeoffInputs) -> TakeoffResultData:
         v2_kt = scale_takeoff_reference_speed_kt(
             float(lib_v2), mass_kg, ac.mtow_kg, speed_reference_ratio
         )
-        v2_kt = max(v2_kt, vs_kt * 1.13, vr_kt + 8.0)
+        v2_kt = max(v2_kt, v2_floor, vs_kt * 1.13, vr_kt + 8.0)
     elif lib_v2 is not None:
         v2_kt = float(lib_v2)
     else:
@@ -2313,6 +2507,10 @@ def compute_takeoff_performance(inputs: TakeoffInputs) -> TakeoffResultData:
     v1_tas_mps = 0.5 * (v1_low + v1_high)
     v1_kt = min(max(v1_tas_mps * MPS_TO_KTS / tas_per_ias, vs_kt * 1.05), vr_kt)
     v1_kt, vr_kt, v2_kt = validate_takeoff_vspeeds(vs_kt, v1_kt, vr_kt, v2_kt)
+    v1_max_gap_kt = float((lib or {}).get("takeoff_v1_max_gap_kt", 0.0) or 0.0)
+    if v1_max_gap_kt > 0.0:
+        v1_kt = max(v1_kt, vr_kt - v1_max_gap_kt)
+        v1_kt, vr_kt, v2_kt = validate_takeoff_vspeeds(vs_kt, v1_kt, vr_kt, v2_kt)
     vr_mps = vr_kt * KTS_TO_MPS * tas_per_ias
     v1_tas_mps = v1_kt * KTS_TO_MPS * tas_per_ias
     accelerate_go_m = int(round(accelerate_go_distance(v1_tas_mps)))
@@ -2797,7 +2995,10 @@ ROUTE_FUEL_DATABASE: Dict[str, RouteFuelAircraft] = {
     "A320-200": RouteFuelAircraft("A320-200", 3347.7, 27200.0, 17000.0),
     "A321-200": RouteFuelAircraft("A321-200", 3212.7, 30030.0, 21000.0),
     "A321neo": RouteFuelAircraft("A321neo", 4000.0, 32940.0, 21500.0),
-    "A330-300": RouteFuelAircraft("A330-300", 6350.0, 139090.0, 40000.0),
+    "A330-200": RouteFuelAircraft("A330-200", 7262.0, 139090.0, 39000.0),
+    "A330-300": RouteFuelAircraft("A330-300", 7262.0, 139090.0, 40000.0),
+    "A330-800": RouteFuelAircraft("A330-800", 8099.0, 139090.0, 40000.0),
+    "A330-900": RouteFuelAircraft("A330-900", 7200.0, 139090.0, 45000.0),
     "A340-600": RouteFuelAircraft("A340-600", 7900.0, 195880.0, 54000.0),
     "A350-900": RouteFuelAircraft("A350-900", 8500.0, 166488.0, 45000.0),
     "A350-1000": RouteFuelAircraft("A350-1000", 8700.0, 164000.0, 52000.0),
@@ -2806,6 +3007,7 @@ ROUTE_FUEL_DATABASE: Dict[str, RouteFuelAircraft] = {
     "B747-8": RouteFuelAircraft("B747-8", 7730.0, 238610.0, 76000.0),
     "B747-200": RouteFuelAircraft("B747-200", 6100.0, 157560.0, 68000.0),
     "B757-200": RouteFuelAircraft("B757-200", 3915.0, 43490.0, 29000.0),
+    "B777-200ER": RouteFuelAircraft("B777-200ER", 7500.0, 171170.0, 42000.0),
     "B777-300ER": RouteFuelAircraft("B777-300ER", 7370.0, 181280.0, 44000.0),
     "B787-9": RouteFuelAircraft("B787-9", 7565.0, 126356.0, 36000.0),
     "B787-10": RouteFuelAircraft("B787-10", 6430.0, 126356.0, 43000.0),
@@ -2849,7 +3051,10 @@ ROUTE_FUEL_FALLBACK_RANGE_NM = {
     "A320-200": 3348.0,
     "A321-200": 3213.0,
     "A321neo": 4000.0,
-    "A330-300": 6350.0,
+    "A330-200": 7262.0,
+    "A330-300": 7262.0,
+    "A330-800": 8099.0,
+    "A330-900": 7200.0,
     "A340-600": 7900.0,
     "A350-900": 8500.0,
     "A350-1000": 8700.0,
@@ -2858,6 +3063,7 @@ ROUTE_FUEL_FALLBACK_RANGE_NM = {
     "B747-8": 7730.0,
     "B747-200": 6100.0,
     "B757-200": 3915.0,
+    "B777-200ER": 7500.0,
     "B777-300ER": 7370.0,
     "B787-9": 7565.0,
     "B787-10": 6430.0,
@@ -2932,6 +3138,7 @@ def resolve_route_fuel_aircraft(aircraft_name: str) -> Optional[RouteFuelAircraf
         return exact
 
     compatibility_aliases = {
+        "A350-900-LH100": "A350-900",
         "A340-600": "A340-300",
         "B737-8MAX": "B737-800",
         "B787-10": "B787-9",
@@ -2973,6 +3180,11 @@ def route_long_haul_efficiency_factor(distance_nm: float) -> float:
     span = max(LONG_HAUL_EFFICIENCY_FULL_NMI - LONG_HAUL_EFFICIENCY_START_NMI, 1.0)
     progress = clamp((distance_nm - LONG_HAUL_EFFICIENCY_START_NMI) / span, 0.0, 1.0)
     return 1.0 - (LONG_HAUL_MAX_EFFICIENCY_DISCOUNT * progress)
+
+
+def route_fuel_ete_hours(aircraft_name: str, distance_nm: float) -> float:
+    speed = resolve_takeoff_fuel_config(aircraft_name).cruise_gs_kt_default if aircraft_name else 450.0
+    return distance_nm * (1.0 + DEFAULT_ROUTE_WIND_FACTOR) / max(float(speed or 450.0), 1.0)
 
 
 def compute_route_fuel_plan(
@@ -3018,8 +3230,7 @@ def compute_route_fuel_plan(
     fuel_capacity_kg = aircraft.fuel_capacity_l * JET_FUEL_DENSITY_KG_PER_L
     remaining_capacity_l = aircraft.fuel_capacity_l - planned_fuel_l
 
-    gs_default = resolve_takeoff_fuel_config(aircraft_name).cruise_gs_kt_default
-    ete_hours = effective_distance_nmi / max(float(gs_default or 450.0), 1.0)
+    ete_hours = route_fuel_ete_hours(aircraft_name, distance_nm)
 
     return RouteFuelPlanResult(
         route_distance_nmi=distance_nm,
@@ -3085,6 +3296,16 @@ LANDING_CONFIGS = {
         landing_distance_ref_m=1600,
         reference_weight_kg=77800,
         vref_reference_by_flap={"FULL": 135, "3": 140, "2": 145},
+    ),
+    "A321_NEO": LandingAircraftConfig(
+        name="Airbus A321neo",
+        mlw_kg=79200,
+        flap_options=["3", "FULL"],
+        wing_area_m2=122.6,
+        clmax_by_flap={"3": 2.35, "FULL": 2.55},
+        landing_distance_ref_m=1600,
+        reference_weight_kg=79200,
+        vref_reference_by_flap={"FULL": 137, "3": 142},
     ),
     "A220": LandingAircraftConfig(
         name="Airbus A220-300",
@@ -3264,7 +3485,9 @@ class LandingResultData:
 
 def resolve_landing_aircraft_config(aircraft_name: str) -> LandingAircraftConfig:
     name = (aircraft_name or "").lower()
-    if "a321" in name:
+    if "a321neo" in name or "a321 neo" in name:
+        base = LANDING_CONFIGS["A321_NEO"]
+    elif "a321" in name:
         base = LANDING_CONFIGS["A321_FAMILY"]
     elif "a320" in name or "a319" in name:
         base = LANDING_CONFIGS["A320_FAMILY"]
@@ -3474,27 +3697,78 @@ def compute_landing_performance(inputs: LandingInputs) -> LandingResultData:
     )
 
 
+def mark_calendar_entry_completed(
+    entries: List[dict],
+    entry_id: str,
+    completed_at: Optional[datetime] = None,
+) -> bool:
+    """Mark one planned calendar entry complete without altering its flight details."""
+    if not entry_id:
+        return False
+    timestamp = (completed_at or datetime.now()).isoformat(timespec="seconds")
+    for entry in entries:
+        if str(entry.get("id") or "") != str(entry_id):
+            continue
+        if bool(entry.get("completed")):
+            return False
+        entry["completed"] = True
+        entry["completed_at"] = timestamp
+        entry["updated_at"] = timestamp
+        entry["completion_source"] = "calendar_agenda"
+        return True
+    return False
+
+
+def index_calendar_entries_by_date(entries: List[dict]) -> Dict[str, List[dict]]:
+    """Group calendar entries once so month cells do not repeatedly scan the full log."""
+    indexed: Dict[str, List[dict]] = {}
+    for entry in entries:
+        date_key = str(entry.get("date") or "").strip()
+        if date_key:
+            indexed.setdefault(date_key, []).append(entry)
+    return indexed
+
+
 def main(page: ft.Page):
     state = AppState()
+    live_map_process = None
+    live_map_child = None
+    live_map_visible = False
+    live_map_unavailable = False
+    dashboard_airport_process = None
+    dashboard_airport_unavailable = False
+    dashboard_remarks_dialog = None
+    tutorial_dialog = None
+    page_guides = {
+        1: ("Dashboard", "Choose your departure, arrival, airline, and aircraft to start planning. Set gates and terminals and review the estimated flight time in the Flight Plan."),
+        0: ("Overview", "Review your route, estimated arrival, and flight progress. Switch to Live Flights to browse and follow aircraft on Infinite Flight."),
+        2: ("Payload", "Set cabin capacity and occupancy, then enter baggage and cargo weights. The seat map shows occupied and available seats."),
+        13: ("Checklist", "Work through the preflight and in-flight checklists. Select an item to mark it complete."),
+        4: ("Takeoff", "Review departure weather, calculate takeoff speeds, and use Fuel Planning to estimate fuel and flight time."),
+        5: ("Landing", "Review arrival weather, calculate approach speeds, and use the descent calculator to plan your approach."),
+        7: ("Calendar", "Schedule flights, review saved plans, and mark flights complete to add them to the log."),
+        8: ("Log", "Open a completed flight to review its boarding pass and record landing G. Sort your log by date or landing G."),
+        9: ("Profile", "Review your pilot information, flight hours, and career statistics."),
+        10: ("Settings", "Manage display, sound, planning units, and your Infinite Flight API key. You can also import or export your data here."),
+        11: ("About", "Find the FMS version, data folder, image credits, and simulator-use disclaimer."),
+    }
     base_dir = Path(__file__).resolve().parent
-    if bool(getattr(sys, "frozen", False)):
-        local_app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-        storage_dir = local_app_data / "Flight Management Systems"
-        try:
-            storage_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            storage_dir = base_dir
+    if _INTERFACE_PREVIEW:
+        preview_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else base_dir / "dist" / "Interface Preview"
+        storage_dir = preview_dir / "Preview Data"
+        storage_dir.mkdir(parents=True, exist_ok=True)
     else:
-        storage_dir = base_dir
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+        storage_dir = local_app_data / "Flight Management Systems Public"
+        storage_dir.mkdir(parents=True, exist_ok=True)
 
     storage_file_names = (
         "calendar_flights.json",
         "profile_data.json",
         "app_settings.json",
-        "infinite_flight_config.json",
         "flight_hibernation.json",
     )
-    if storage_dir != base_dir:
+    if storage_dir != base_dir and not _INTERFACE_PREVIEW:
         for storage_file_name in storage_file_names:
             legacy_path = base_dir / storage_file_name
             current_path = storage_dir / storage_file_name
@@ -3507,7 +3781,10 @@ def main(page: ft.Page):
     calendar_storage_path = storage_dir / "calendar_flights.json"
     profile_storage_path = storage_dir / "profile_data.json"
     settings_storage_path = storage_dir / "app_settings.json"
-    infinite_flight_config_path = storage_dir / "infinite_flight_config.json"
+    infinite_flight_key_path = storage_dir / "infinite_flight_key.dpapi"
+    live_request_lock = asyncio.Lock()
+    live_render_callback = None
+    overview_cameras = {}
     flight_hibernation_storage_path = storage_dir / "flight_hibernation.json"
     runtime_icon = base_dir / "assets" / "app_icon.ico"
     tray_icon = None
@@ -3515,7 +3792,8 @@ def main(page: ft.Page):
     hidden_to_tray_notice_shown = False
     if os.name == "nt":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SamSamadi.FlightManagementSystems.V10")
+            instance_id = _PREVIEW_INSTANCE_ID if _INTERFACE_PREVIEW else "V14Public"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"SamSamadi.FlightManagementSystems.{instance_id}")
         except Exception:
             pass
     if runtime_icon.exists():
@@ -3524,12 +3802,14 @@ def main(page: ft.Page):
         except Exception:
             pass
 
-    page.title = "Flight Management Systems"
-    page.window_width = 1180
-    page.window_height = 820
-    page.window_min_width = 1000
-    page.window_min_height = 760
-    page.theme_mode = ft.ThemeMode.DARK
+    page.title = _PREVIEW_WINDOW_TITLE if _INTERFACE_PREVIEW else "Flight Management Systems"
+    page.window.width = 1360
+    page.window.height = 860
+    page.window.min_width = 1000
+    page.window.min_height = 720
+    page.theme_mode = ft.ThemeMode.LIGHT
+    rtl_announcement_font = "Noto Sans Arabic"
+    page.fonts = {UI_FONT: UI_FONT_ASSET, rtl_announcement_font: "fonts/NotoSansArabic.ttf"}
     page.padding = 0
     page.spacing = 0
 
@@ -3538,16 +3818,17 @@ def main(page: ft.Page):
      'American Airlines': '#6B7280',
      'British Airways': '#2E5C99',
      'Cathay Pacific': '#006564',
-     'Emirates': '#C8102E',
-     'Etihad Airways': '#B99A55',
-     'Generic': '#64748B',
+     'Delta Air Lines': '#C8102E',
+     'Emirates': '#D71A21',
+     'Etihad Airways': '#715A28',
+     'Generic': '#52606D',
      'ITA Airways': '#005DAA',
      'Iran Air': '#1F2C51',
-     'Lufthansa': '#F9BA00',
-     'Mahan Air': '#007A6E',
+     'Lufthansa': '#7A5B00',
+     'Mahan Air': '#00685E',
      'Qantas': '#E4002B',
      'Qatar Airways': '#660033',
-     'Singapore Airlines': '#F0B323',
+     'Singapore Airlines': '#765600',
      'Southwest Airlines': '#304CB2',
      'Turkish Airlines': '#C70A0C',
      'United Airlines': '#005DAA',
@@ -3558,6 +3839,7 @@ def main(page: ft.Page):
      'American Airlines': '#171B22',
      'British Airways': '#081426',
      'Cathay Pacific': '#062624',
+     'Delta Air Lines': '#12162A',
      'Emirates': '#2A0B12',
      'Etihad Airways': '#241E14',
      'Generic': '#111827',
@@ -3573,8 +3855,33 @@ def main(page: ft.Page):
      'United Airlines': '#071D33',
      'Virgin Atlantic': '#2B0811'}
 
-    CARD_FILL = "#141519"
-    SHELL_WARM_BG = "#1B1714"
+    # Light neumorphic surfaces are intentionally muted versions of each brand.
+    # They preserve airline identity without turning large backgrounds into saturated color fields.
+    AIRLINE_NEUMORPHIC_LIGHT = {
+        'ANA': '#E7EDF6',
+        'Air France': '#E8EDF4',
+        'American Airlines': '#ECEFF2',
+        'British Airways': '#E7ECF4',
+        'Cathay Pacific': '#E5EFED',
+        'Delta Air Lines': '#F1E7EA',
+        'Emirates': '#F2E7E9',
+        'Etihad Airways': '#F1ECE2',
+        'Generic': '#ECF0F3',
+        'ITA Airways': '#E5EEF5',
+        'Iran Air': '#E8EBF2',
+        'Lufthansa': '#F3EEDF',
+        'Mahan Air': '#E5EFEC',
+        'Qantas': '#F3E6E9',
+        'Qatar Airways': '#EFE5EA',
+        'Singapore Airlines': '#F3EEDF',
+        'Southwest Airlines': '#E7EAF5',
+        'Turkish Airlines': '#F2E7E8',
+        'United Airlines': '#E5EEF5',
+        'Virgin Atlantic': '#F2E6EA',
+    }
+
+    CARD_FILL = "#20242B"
+    SHELL_WARM_BG = "#1B1E24"
     DAYLIGHT_CARD_FILL = "#B2D5E5"
     DAYLIGHT_SUBPANEL_FILL = "#B2D5E5"
     DAYLIGHT_INPUT_FILL = "#FFFFFF"
@@ -3607,6 +3914,9 @@ def main(page: ft.Page):
         "shell_nav_idle_border_opacity": 0.10,
         "shell_nav_selected_opacity": 0.38,
         "shell_nav_selected_border_opacity": 0.46,
+        "shadow_dark": ft.Colors.with_opacity(0.52, ft.Colors.BLACK),
+        "shadow_light": ft.Colors.with_opacity(0.08, ft.Colors.WHITE),
+        "pressed": "#181B20",
     }
 
     # Performance cache: avoid repeated filesystem scans for image assets during
@@ -3616,7 +3926,11 @@ def main(page: ft.Page):
     manufacturer_logo_cache: Dict[str, Optional[str]] = {}
     aircraft_livery_cache: Dict[tuple[str, str], Optional[str]] = {}
     airport_weather_cache: Dict[str, dict] = {}
-    airport_environment_cache: Dict[str, dict] = {}
+    performance_metar_requests = {}
+    pending_airport_media: set[str] = set()
+    airport_images: dict[str, str] = {}
+    planner_records: dict[str, dict] = {}
+    close_suggestions = None
 
     def clear_asset_lookup_caches():
         asset_rel_cache.clear()
@@ -3638,7 +3952,7 @@ def main(page: ft.Page):
         return raw or "airline"
 
     def register_custom_airline(airline_name: str) -> Optional[str]:
-        clean_name = re.sub(r"\s+", " ", (airline_name or "").strip())
+        clean_name = canonical_airline_name(airline_name)
         if not clean_name:
             return None
         existing = next((name for name in AIRLINES if name.lower() == clean_name.lower()), None)
@@ -3652,9 +3966,10 @@ def main(page: ft.Page):
         AIRLINE_LOGO_FILES.setdefault(clean_name, f"airlines/logos/{slug}.png")
         AIRLINE_ACCENT.setdefault(clean_name, AIRLINE_ACCENT.get("Generic", "#64748B"))
         AIRLINE_BACKGROUND.setdefault(clean_name, AIRLINE_BACKGROUND.get("Generic", "#111827"))
+        AIRLINE_NEUMORPHIC_LIGHT.setdefault(clean_name, AIRLINE_NEUMORPHIC_LIGHT.get("Generic", "#ECF0F3"))
         AIRLINE_FLEETS.setdefault(clean_name, list(AIRLINE_FLEETS.get("Generic", [])))
         if clean_name not in state.custom_airlines and clean_name not in {
-            'Air France', 'American Airlines', 'ANA', 'British Airways', 'Cathay Pacific',
+                'Air France', 'American Airlines', 'ANA', 'British Airways', 'Cathay Pacific', 'Delta Air Lines',
             'Emirates', 'Etihad Airways', 'Generic', 'Iran Air', 'ITA Airways', 'Lufthansa',
             'Mahan Air', 'Qantas', 'Qatar Airways', 'Singapore Airlines', 'Southwest Airlines',
             'Turkish Airlines', 'United Airlines', 'Virgin Atlantic'
@@ -3671,68 +3986,69 @@ def main(page: ft.Page):
         state.airline_overlay_opacity = clamp_setting(state.airline_overlay_opacity, 0.0, 0.80, 0.50)
 
         daylight_mode = str(getattr(state, "display_mode", "dark") or "dark").lower() == "daylight"
-        # Keep Flet controls in dark theme so custom app surfaces own the
-        # day/night palette instead of inheriting mixed platform defaults.
-        page.theme_mode = ft.ThemeMode.DARK
-        tokens["accent"] = AIRLINE_ACCENT.get(state.airline, "#0A84FF")
-        daylight_cards = daylight_mode and int(getattr(state, "selected_tab_index", 0) or 0) != 0
-
-        if daylight_mode:
-            # Daytime shell mode shifts the chrome and non-overview cards toward
-            # a softer candy-blue daylight palette.
-            tokens["bg"] = "#DCEEFF"
-            tokens["text"] = DAYLIGHT_TEXT if daylight_cards else PANEL_TEXT
-            tokens["muted"] = DAYLIGHT_MUTED if daylight_cards else PANEL_MUTED
-            tokens["topbar"] = "#101113"
-            tokens["panel"] = DAYLIGHT_CARD_FILL if daylight_cards else CARD_FILL
-            tokens["subpanel"] = DAYLIGHT_SUBPANEL_FILL if daylight_cards else CARD_FILL
-            tokens["card_border"] = ft.Colors.with_opacity(0.54 * contrast, DAYLIGHT_BORDER) if daylight_cards else ft.Colors.with_opacity(0.14 * contrast, ft.Colors.WHITE)
-            tokens["input_bg"] = ft.Colors.with_opacity(0.86, DAYLIGHT_INPUT_FILL) if daylight_cards else "#202126"
-            tokens["success_overlay"] = ft.Colors.with_opacity(0.18, ft.Colors.GREEN)
-            tokens["shell_topbar"] = "#092235"
-            tokens["shell_topbar_opacity"] = 0.50
-            tokens["shell_rail"] = "#061A28"
-            tokens["shell_rail_opacity"] = 0.46
-            tokens["shell_text"] = "#F8FCFF"
-            tokens["shell_muted"] = "#D7E9F6"
-            tokens["shell_border"] = ft.Colors.with_opacity(0.18 * contrast, "#B9E7FF")
-            tokens["shell_nav_idle"] = "#DDF5FF"
-            tokens["shell_nav_idle_opacity"] = 0.08
-            tokens["shell_nav_idle_border_opacity"] = 0.14
-            tokens["shell_nav_selected_opacity"] = 0.34
-            tokens["shell_nav_selected_border_opacity"] = 0.54
-            return
-
-        # Global command-center palette. All cards use #141519 and all normal
-        # text stays white for readability. Airline selection still controls
-        # accents and, when selected, the app-shell background tint.
-        tokens["bg"] = AIRLINE_BACKGROUND.get(state.airline, SHELL_WARM_BG) if state.airline else SHELL_WARM_BG
-        tokens["text"] = PANEL_TEXT
-        tokens["muted"] = PANEL_MUTED
-        tokens["topbar"] = "#101113"
-        tokens["panel"] = CARD_FILL
-        tokens["subpanel"] = CARD_FILL
-        tokens["card_border"] = ft.Colors.with_opacity(0.14 * contrast, ft.Colors.WHITE)
-        tokens["input_bg"] = "#202126"
-        tokens["success_overlay"] = ft.Colors.with_opacity(0.18, ft.Colors.GREEN)
-        tokens["shell_topbar"] = "#101113"
-        tokens["shell_topbar_opacity"] = 0.58
-        tokens["shell_rail"] = ft.Colors.BLACK
-        tokens["shell_rail_opacity"] = 0.32
-        tokens["shell_text"] = PANEL_TEXT
-        tokens["shell_muted"] = PANEL_MUTED
+        page.theme_mode = ft.ThemeMode.LIGHT if daylight_mode else ft.ThemeMode.DARK
+        palette = LIGHT if daylight_mode else DARK
+        tokens.update(palette)
+        for key in ("bg", "panel", "subpanel", "input_bg", "shell_topbar"):
+            tint = "#FFFFFF" if brightness >= 1 else "#000000"
+            tokens[key] = blend_hex_colors(palette[key], tint, abs(brightness - 1) * 0.25)
+        brand = AIRLINE_ACCENT.get(state.airline)
+        if brand:
+            tokens["subpanel"] = blend_hex_colors(tokens["subpanel"], brand, state.airline_overlay_opacity * 0.08)
+        contrast_target = palette["text"] if contrast >= 1 else tokens["panel"]
+        tokens["muted"] = blend_hex_colors(palette["muted"], contrast_target, abs(contrast - 1) * 0.25)
+        tokens["card_border"] = blend_hex_colors(palette["card_border"], palette["text"], max(0, contrast - 1) * 0.18)
+        tokens["shell_text"] = tokens["text"]
+        tokens["shell_muted"] = tokens["muted"]
         tokens["shell_border"] = tokens["card_border"]
-        tokens["shell_nav_idle"] = ft.Colors.BLACK
-        tokens["shell_nav_idle_opacity"] = 0.12
-        tokens["shell_nav_idle_border_opacity"] = 0.10
-        tokens["shell_nav_selected_opacity"] = 0.38
-        tokens["shell_nav_selected_border_opacity"] = 0.46
+        tokens["topbar"] = tokens["shell_topbar"]
+        tokens["success_overlay"] = ft.Colors.with_opacity(0.18, ft.Colors.GREEN)
+        secondary = button_style(tokens)
+        primary = button_style(tokens, primary=True)
+        theme = ft.Theme(
+            use_material3=True,
+            font_family=UI_FONT,
+            scaffold_bgcolor=tokens["bg"],
+            canvas_color=tokens["bg"],
+            card_bgcolor=surface_fill(tokens["panel"]),
+            divider_color=tokens["card_border"],
+            color_scheme=ft.ColorScheme(
+                primary=tokens["primary"],
+                on_primary=tokens["on_primary"],
+                secondary=tokens["accent"],
+                surface=tokens["panel"],
+                on_surface=tokens["text"],
+                on_surface_variant=tokens["muted"],
+                outline=tokens["card_border"],
+            ),
+            button_theme=ft.ButtonTheme(style=primary),
+            outlined_button_theme=ft.OutlinedButtonTheme(style=secondary),
+            filled_button_theme=ft.FilledButtonTheme(style=primary),
+            text_button_theme=ft.TextButtonTheme(style=secondary),
+            icon_button_theme=ft.IconButtonTheme(style=button_style(tokens, circular=True)),
+            card_theme=ft.CardTheme(
+                color=surface_fill(tokens["panel"]), elevation=0, shape=ft.RoundedRectangleBorder(radius=CARD_RADIUS)
+            ),
+        )
+        if daylight_mode:
+            page.theme = theme
+        else:
+            page.dark_theme = theme
+
+    def surface_shadow(depth: float = 1.0, pressed: bool = False) -> Optional[ft.BoxShadow]:
+        if pressed:
+            return None
+        return ft.BoxShadow(
+            blur_radius=4 + 3 * depth,
+            color=ft.Colors.with_opacity(0.08, ft.Colors.BLACK),
+            offset=ft.Offset(0, 1 + depth),
+        )
 
     def current_airline_label() -> str:
         return state.airline or "Pick an airline"
 
     def current_aircraft_label() -> str:
-        return state.aircraft or "Select an aircraft"
+        return state.aircraft_record.get("name") or state.aircraft or "Select an aircraft"
 
     def current_route_label() -> str:
         if state.departure or state.arrival:
@@ -3740,8 +4056,8 @@ def main(page: ft.Page):
         return "—"
 
     def header_banner_route_label() -> str:
-        origin = (state.departure or "ORIGIN").strip().upper()
-        destination = (state.arrival or "DESTINATION").strip().upper()
+        origin = (state.departure or "DEPARTURE").strip().upper()
+        destination = (state.arrival or "ARRIVAL").strip().upper()
         return f"{origin} → {destination}"
 
     def header_banner_aircraft_label() -> str:
@@ -3750,18 +4066,47 @@ def main(page: ft.Page):
     def header_banner_flight_number_label() -> str:
         return (state.flight_number or "FLIGHT —").strip().upper()
 
+    def fuel_plan_flight_minutes() -> int:
+        if not state.departure or not state.arrival:
+            return 0
+        route_key = active_route_distance_key()
+        if not route_key:
+            return 0
+        distance = state.route_distance_override_nm if state.route_distance_override_key == route_key else None
+        if distance is None:
+            departure, arrival = route_key.split("->", 1)
+            distance = route_distance_nm(departure, arrival)
+        aircraft = canonical_aircraft_name(state.aircraft)
+        if distance is not None and math.isfinite(distance):
+            return max(1, round(route_fuel_ete_hours(aircraft, distance) * 60)) if distance > 0 else 0
+        plan = state.takeoff_last_result.get("fuel_plan") or {}
+        if plan.get("route_key") == route_key and plan.get("aircraft") == aircraft:
+            minutes = plan.get("ete_minutes")
+            return minutes if isinstance(minutes, int) and minutes > 0 else 0
+        return 0
+
+    def clear_dashboard_time_override():
+        state.overview_flight_time_minutes = 0
+        state.dashboard_flight_plan.pop("flight_time", None)
+
+    def planned_overview_minutes() -> int:
+        return state.overview_flight_time_minutes or fuel_plan_flight_minutes()
+
+    def overview_elapsed_seconds() -> float:
+        if state.overview_progress_running and state.overview_takeoff_start_timestamp is not None:
+            return max(0.0, time.time() - state.overview_takeoff_start_timestamp)
+        return state.overview_paused_elapsed_seconds or 0.0
+
     def header_banner_remaining_time_label() -> str:
-        try:
-            duration_minutes = max(1, int(float(state.overview_flight_time_minutes or 120)))
-        except Exception:
-            duration_minutes = 120
+        duration_minutes = planned_overview_minutes()
+        if not duration_minutes:
+            return "—"
 
         remaining_minutes = duration_minutes
         if int(state.overview_flight_status_index or 0) >= 5:
             remaining_minutes = 0
-        elif state.overview_progress_running and isinstance(state.overview_takeoff_start_timestamp, (int, float)):
-            elapsed_minutes = int(max(0.0, time.time() - float(state.overview_takeoff_start_timestamp)) / 60.0)
-            remaining_minutes = max(0, duration_minutes - elapsed_minutes)
+        else:
+            remaining_minutes = max(0, duration_minutes - int(overview_elapsed_seconds() / 60.0))
 
         return format_hours_to_hm(remaining_minutes / 60.0)
 
@@ -3774,23 +4119,17 @@ def main(page: ft.Page):
         short_message = f"{route}    •    {aircraft}"
         return long_message, short_message
 
-    def header_progress_duration_minutes() -> int:
-        try:
-            return max(1, int(float(state.overview_flight_time_minutes or 120)))
-        except Exception:
-            return 120
-
     def header_progress_percent() -> float:
         status_index = int(getattr(state, "overview_flight_status_index", 0) or 0)
         if status_index < 2:
             return 0.0
         if status_index >= 5:
             return 100.0
-        start_ts = getattr(state, "overview_takeoff_start_timestamp", None)
-        if not bool(getattr(state, "overview_progress_running", False)) or not isinstance(start_ts, (int, float)):
+        duration_minutes = planned_overview_minutes()
+        if not duration_minutes:
             return 0.0
-        elapsed_min = max(0.0, (time.time() - float(start_ts)) / 60.0)
-        return clamp((elapsed_min / header_progress_duration_minutes()) * 100.0, 0.0, 100.0)
+        elapsed_min = overview_elapsed_seconds() / 60.0
+        return clamp((elapsed_min / duration_minutes) * 100.0, 0.0, 100.0)
 
     def header_progress_icon() -> ft.Control:
         rel = asset_rel_path_if_exists("icons/nav/aircraft_progress.png")
@@ -3862,22 +4201,16 @@ def main(page: ft.Page):
         return ft.Container(
             content=ft.Column(
                 controls=[
-                    ft.Text(title, size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                    ft.Divider(height=10, opacity=0.15),
+                    ft.Text(title, size=15, weight=ft.FontWeight.W_700, color=tokens["text"]),
                     content,
                 ],
                 spacing=10,
             ),
-            padding=16,
-            border_radius=20,
-            bgcolor=bgcolor_override or tokens["panel"],
+            padding=14,
+            border_radius=CARD_RADIUS,
+            bgcolor=surface_fill(bgcolor_override or tokens["panel"]),
             border=ft.border.all(1, tokens["card_border"]),
-            shadow=ft.BoxShadow(
-                blur_radius=18,
-                spread_radius=1,
-                color=ft.Colors.with_opacity(0.10, ft.Colors.BLACK),
-                offset=ft.Offset(0, 6),
-            ),
+            shadow=surface_shadow(),
             width=width,
             height=height,
             expand=expand,
@@ -3908,6 +4241,10 @@ def main(page: ft.Page):
         key = re.sub(r"[^A-Za-z0-9_\\-]+", "_", key).strip("_").lower()
         if not key:
             return None
+        # V12 uses a single neumorphic surface language. Flight Recorder keeps
+        # its purpose-built artwork; boarding passes use their own renderer.
+        if key not in {"flight_recorder", "boarding_pass_header"}:
+            return None
         for ext in ("png", "jpg", "jpeg", "webp"):
             found = asset_rel_path_if_exists(f"backgrounds/cards/{key}.{ext}")
             if found:
@@ -3926,13 +4263,13 @@ def main(page: ft.Page):
         src = card_background_src(key_or_title)
         if src:
             return [
-                ft.Container(expand=True, bgcolor=base_bg or tokens["panel"] if use_daylight_cards() else ft.Colors.TRANSPARENT),
+                ft.Container(expand=True, bgcolor=surface_fill(base_bg or tokens["panel"]) if use_daylight_cards() else ft.Colors.TRANSPARENT),
                 ft.Container(
                     expand=True,
                     image=ft.DecorationImage(src=src, fit=ft.BoxFit.COVER, opacity=0.32),
                 ),
             ]
-        return [ft.Container(expand=True, bgcolor=base_bg or tokens["panel"])]
+        return [ft.Container(expand=True, bgcolor=surface_fill(base_bg or tokens["panel"]))]
 
     def glass_card_with_background(
         title: str,
@@ -3948,24 +4285,18 @@ def main(page: ft.Page):
         return ft.Container(
             content=ft.Column(
                 controls=[
-                    ft.Text(title, size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                    ft.Divider(height=10, opacity=0.15),
+                    ft.Text(title, size=15, weight=ft.FontWeight.W_700, color=tokens["text"]),
                     content,
                 ],
                 spacing=10,
             ),
-            padding=16,
-            border_radius=20,
+            padding=14,
+            border_radius=CARD_RADIUS,
             clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=card_base_bg,
+            bgcolor=surface_fill(card_base_bg),
             image=ft.DecorationImage(src=bg_src, fit=ft.BoxFit.COVER, opacity=0.32) if bg_src else None,
             border=ft.border.all(1, tokens["card_border"]),
-            shadow=ft.BoxShadow(
-                blur_radius=18,
-                spread_radius=1,
-                color=ft.Colors.with_opacity(0.10, ft.Colors.BLACK),
-                offset=ft.Offset(0, 6),
-            ),
+            shadow=surface_shadow(),
             width=width,
             height=height,
             expand=expand,
@@ -3981,14 +4312,15 @@ def main(page: ft.Page):
         return ft.Container(
             padding=16,
             border_radius=18,
-            bgcolor=tokens["subpanel"],
+            bgcolor=surface_fill(tokens["subpanel"]),
             border=ft.border.all(1, tokens["card_border"]),
+            shadow=surface_shadow(0.52),
             content=ft.Column(
                 spacing=6,
                 controls=[
-                    ft.Text(label, size=12, opacity=0.8, color=tokens["muted"]),
+                    ft.Text(label, size=12, color=tokens["muted"]),
                     value_control,
-                    ft.Text(subtitle, size=11, opacity=0.8, color=tokens["muted"]),
+                    *([ft.Text(subtitle, size=11, color=tokens["muted"])] if subtitle else []),
                 ],
             ),
             expand=expand,
@@ -4001,8 +4333,23 @@ def main(page: ft.Page):
                 data = json.loads(calendar_storage_path.read_text(encoding="utf-8"))
                 if isinstance(data, list):
                     state.calendar_entries = data
+                    for entry in data:
+                        for record in (entry.get("aviation_records") or {}).values():
+                            if isinstance(record, dict) and record.get("lat") is not None and record.get("code"):
+                                remember_airport(record)
             except Exception:
                 state.calendar_entries = []
+
+    def active_flight_records(origin, destination):
+        records = {
+            key: record for key, code in (("origin", origin), ("destination", destination))
+            if (record := lookup_airport_record(code))
+        }
+        if state.airline_record:
+            records["airline"] = state.airline_record
+        if state.aircraft_record:
+            records["aircraft"] = state.aircraft_record
+        return records
 
     def save_calendar_entries():
         try:
@@ -4100,7 +4447,7 @@ def main(page: ft.Page):
             pass
 
     def load_settings_data():
-        state.display_mode = "dark"
+        state.display_mode = "daylight"
         state.display_brightness = 1.0
         state.display_contrast = 1.0
         state.airline_overlay_opacity = 0.50
@@ -4113,11 +4460,13 @@ def main(page: ft.Page):
         state.professional_info_enabled = False
         state.app_volume = 0.85
         state.app_muted = False
+        state.takeoff_clock_source = "route"
+        state.landing_clock_source = "route"
         if settings_storage_path.exists():
             try:
                 data = json.loads(settings_storage_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    state.display_mode = "daylight" if str(data.get("display_mode", "dark")).lower() == "daylight" else "dark"
+                    state.display_mode = "daylight" if str(data.get("display_mode", "daylight")).lower() == "daylight" else "dark"
                     state.display_brightness = clamp_setting(data.get("display_brightness", 1.0), 0.70, 1.30, 1.0)
                     state.display_contrast = clamp_setting(data.get("display_contrast", 1.0), 0.70, 1.35, 1.0)
                     state.airline_overlay_opacity = clamp_setting(data.get("airline_overlay_opacity", 0.50), 0.0, 0.80, 0.50)
@@ -4128,9 +4477,17 @@ def main(page: ft.Page):
                     state.default_distance_unit = distance_unit if distance_unit in ("NM", "km") else "NM"
                     state.default_temperature_unit = temperature_unit if temperature_unit in ("°C", "°F") else "°C"
                     state.low_performance_mode = bool(data.get("low_performance_mode", False))
+                    state.tutorial_skipped = data.get("tutorial_skipped") is True
+                    seen = data.get("tutorial_seen", [])
+                    if isinstance(seen, list):
+                        state.tutorial_seen = {name for name in seen if isinstance(name, str)}
                     state.professional_info_enabled = bool(data.get("professional_info_enabled", False))
                     state.app_volume = clamp_setting(data.get("app_volume", 0.85), 0.0, 1.0, 0.85)
                     state.app_muted = bool(data.get("app_muted", False))
+                    takeoff_source = str(data.get("takeoff_clock_source", "route"))
+                    landing_source = str(data.get("landing_clock_source", "route"))
+                    state.takeoff_clock_source = takeoff_source if takeoff_source in ("route", "device", "simulation") else "route"
+                    state.landing_clock_source = landing_source if landing_source in ("route", "device", "simulation") else "route"
                     custom_airlines = data.get("custom_airlines", [])
                     if isinstance(custom_airlines, list):
                         for airline_name in custom_airlines:
@@ -4150,9 +4507,13 @@ def main(page: ft.Page):
                 "default_distance_unit": state.default_distance_unit,
                 "default_temperature_unit": state.default_temperature_unit,
                 "low_performance_mode": bool(state.low_performance_mode),
+                "tutorial_skipped": state.tutorial_skipped,
+                "tutorial_seen": sorted(state.tutorial_seen),
                 "professional_info_enabled": bool(getattr(state, "professional_info_enabled", False)),
                 "app_volume": round(float(getattr(state, "app_volume", 0.85) or 0.0), 2),
                 "app_muted": bool(getattr(state, "app_muted", False)),
+                "takeoff_clock_source": getattr(state, "takeoff_clock_source", "route"),
+                "landing_clock_source": getattr(state, "landing_clock_source", "route"),
             }
             settings_storage_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:
@@ -4221,56 +4582,29 @@ def main(page: ft.Page):
     apply_theme()
     load_calendar_entries()
     load_profile_data()
+    state.pilot_name = "User"
     if sync_profile_from_calendar_completion():
         save_calendar_entries()
 
-    # Authentication is intentionally bypassed in this public portfolio version.
-    state.is_logged_in = True
-    state.pilot_name = "User"
-    state.selected_tab_index = 1
-
     root_host = ft.Container(expand=True)
-    airport_background_preload_host = ft.Container(
-        width=1,
-        height=1,
-        opacity=0.01,
-        content=ft.Row(spacing=0, controls=[]),
-    )
-    login_background_preload_host = ft.Container(
-        width=1,
-        height=1,
-        opacity=0.01,
-        content=ft.Stack(
-            controls=[
-                ft.Image(src=state.page_backgrounds.get("LOGIN", "login_bg.jpg"), width=1, height=1, fit=ft.BoxFit.COVER),
-                ft.Container(
-                    width=1,
-                    height=1,
-                    image=ft.DecorationImage(
-                        src=state.page_backgrounds.get("LOGIN", "login_bg.jpg"),
-                        fit=ft.BoxFit.COVER,
-                        opacity=1.0,
-                    ),
-                ),
-            ],
-        ),
-    )
-
-    login_transition_audio = None
+    active_page_host = ft.Container(expand=True, bgcolor=ft.Colors.TRANSPARENT, alignment=ft.Alignment(-1, -1))
+    active_navigation_glyph = None
+    log_entry_control_registry: Dict[str, tuple[ft.Container, dict, int]] = {}
+    login_audio = None
     audio_class = getattr(ft, "Audio", None)
     if audio_class is not None:
         try:
-            login_transition_audio = audio_class(
-                src="audio/login_transition.mp3",
+            login_audio = audio_class(
+                src="audio/login.mp3",
                 autoplay=False,
             )
         except TypeError:
             try:
-                login_transition_audio = audio_class(src="audio/login_transition.mp3")
+                login_audio = audio_class(src="audio/login.mp3")
             except Exception:
-                login_transition_audio = None
+                login_audio = None
         except Exception:
-            login_transition_audio = None
+            login_audio = None
 
     ui_refresh_in_progress = False
     last_header_second = ""
@@ -4285,7 +4619,6 @@ def main(page: ft.Page):
         size=16,
         weight=ft.FontWeight.W_800,
         color=tokens["accent"],
-        font_family="Consolas",
         max_lines=1,
         no_wrap=True,
     )
@@ -4296,28 +4629,129 @@ def main(page: ft.Page):
     txt_location = ft.Text("", size=12, opacity=0.9)
     txt_weather = ft.Text("", size=12, opacity=0.9)
     overview_date_text = ft.Text("", size=13, color=tokens["muted"])
+    dashboard_weekday_text = ft.Text("", size=17, font_family="Georgia")
+    dashboard_date_text = ft.Text("", size=36, font_family="Georgia", max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+    dashboard_year_text = ft.Text("", size=16, font_family="Georgia")
     overview_time_text = ft.Text("", size=26, weight=ft.FontWeight.W_800, color=tokens["text"])
     overview_location_text = ft.Text("", size=12, color=tokens["muted"])
     overview_weather_text = ft.Text("", size=12, color=tokens["muted"])
     overview_route_line_host = ft.Container()
-    overview_ete_value_text = ft.Text("", size=18, weight=ft.FontWeight.W_800, color=tokens["text"], text_align=ft.TextAlign.CENTER)
-    overview_eta_value_text = ft.Text("", size=18, weight=ft.FontWeight.W_800, color=tokens["text"], text_align=ft.TextAlign.CENTER)
-    overview_progress_percent_text = ft.Text("", size=20, weight=ft.FontWeight.W_900, color=tokens["accent"])
+    overview_ete_value_text = ft.Text("", size=18, weight=ft.FontWeight.W_800, color=tokens["text"], text_align=ft.TextAlign.CENTER, no_wrap=True)
+    overview_eta_value_text = ft.Text("", size=18, weight=ft.FontWeight.W_800, color=tokens["text"], text_align=ft.TextAlign.CENTER, no_wrap=True)
+
     overview_progress_refresh_callback = None
     ramp_status_card_host = ft.Container(width=500, height=440)
     ramp_status_refresh_callback = None
-    takeoff_date_text = ft.Text("", size=14, color=tokens["muted"])
-    takeoff_time_text = ft.Text("", size=34, weight=ft.FontWeight.W_800, color=ft.Colors.WHITE)
+    takeoff_date_text = ft.Text("", size=13, color=tokens["muted"], text_align=ft.TextAlign.CENTER)
+    takeoff_route_time_text = ft.Text("", size=16, weight=ft.FontWeight.W_800, color=tokens["text"])
+    takeoff_time_text = ft.Text("", size=13, weight=ft.FontWeight.W_700, color=tokens["muted"])
+    takeoff_clock_source_text = ft.Text("", size=10, weight=ft.FontWeight.W_700, color=tokens["accent"])
     takeoff_location_text = ft.Text("", size=12, color=tokens["muted"])
     takeoff_weather_text = ft.Text("", size=12, color=tokens["muted"])
-    landing_date_text = ft.Text("", size=14, color=tokens["muted"])
-    landing_time_text = ft.Text("", size=34, weight=ft.FontWeight.W_800, color=ft.Colors.WHITE)
+    landing_date_text = ft.Text("", size=13, color=tokens["muted"], text_align=ft.TextAlign.CENTER)
+    landing_route_time_text = ft.Text("", size=16, weight=ft.FontWeight.W_800, color=tokens["text"])
+    landing_time_text = ft.Text("", size=13, weight=ft.FontWeight.W_700, color=tokens["muted"])
+    landing_clock_source_text = ft.Text("", size=10, weight=ft.FontWeight.W_700, color=tokens["accent"])
     home_airline_logo_host = ft.Container()
+
+    def build_analog_clock_face(moment: datetime, size: int = 240) -> ft.Control:
+        center = size / 2.0
+        scale = size / 62.0
+        hub_diameter = max(8.0, 2.5 * scale)
+
+        def hand(length: float, width: float, angle: float, color: str) -> ft.Control:
+            return ft.Container(
+                left=center - width / 2.0,
+                top=center - length,
+                width=width,
+                height=length,
+                bgcolor=color,
+                border_radius=999,
+                rotate=ft.Rotate(angle=angle, alignment=ft.Alignment(0, 1)),
+            )
+
+        second_angle = (moment.second / 60.0) * math.tau
+        minute_angle = ((moment.minute + moment.second / 60.0) / 60.0) * math.tau
+        hour_angle = (((moment.hour % 12) + moment.minute / 60.0) / 12.0) * math.tau
+        tick_color = ft.Colors.with_opacity(0.64, tokens["muted"])
+        ticks: List[ft.Control] = []
+        for index in range(12):
+            angle = index * math.tau / 12.0
+            tick_height = (6 if index % 3 == 0 else 3) * scale
+            tick_width = max(2.0, 1.25 * scale)
+            radius = center - 9 * scale
+            ticks.append(
+                ft.Container(
+                    left=center - tick_width / 2.0 + math.sin(angle) * radius,
+                    top=center - tick_height / 2.0 - math.cos(angle) * radius,
+                    width=tick_width,
+                    height=tick_height,
+                    bgcolor=tick_color,
+                    border_radius=999,
+                    rotate=ft.Rotate(angle=angle),
+                )
+            )
+
+        return ft.Container(
+            width=size,
+            height=size,
+            border_radius=999,
+            bgcolor=surface_fill(tokens["panel"]),
+            border=ft.border.all(1, tokens["card_border"]),
+            shadow=surface_shadow(0.58),
+            content=ft.Stack(
+                width=size,
+                height=size,
+                controls=[
+                    *ticks,
+                    hand(size * 0.23, 5.5, hour_angle, tokens["text"]),
+                    hand(size * 0.31, 3.5, minute_angle, tokens["text"]),
+                    hand(size * 0.34, 1.5, second_angle, tokens["accent"]),
+                    ft.Container(
+                        left=center - hub_diameter / 2.0,
+                        top=center - hub_diameter / 2.0,
+                        width=hub_diameter,
+                        height=hub_diameter,
+                        border_radius=999,
+                        bgcolor=tokens["accent"],
+                    ),
+                ],
+            ),
+        )
+
+    takeoff_analog_clock_host = ft.Container(width=240, height=240)
+    landing_analog_clock_host = ft.Container(width=240, height=240)
+
+    def airport_local_datetime(code: Optional[str]) -> datetime:
+        canonical = normalize_airport_code(code) or (code or "").strip().upper()
+        record = lookup_airport_record(canonical)
+        if record:
+            # Estimate the local offset from the airport longitude.
+            longitude = float(record.get("lon", 0.0) or 0.0)
+            offset_minutes = int(round((longitude / 15.0) * 2.0) * 30)
+            offset_minutes = max(-720, min(840, offset_minutes))
+            return datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=offset_minutes)))
+        return datetime.now().astimezone()
+
+    def phase_clock_moment(phase: str) -> tuple[datetime, str]:
+        is_departure = phase == "departure"
+        source = getattr(state, "takeoff_clock_source" if is_departure else "landing_clock_source", "route")
+        if source == "device":
+            return datetime.now().astimezone(), "Device local"
+        if source == "simulation":
+            return datetime.now().astimezone(), "Simulation local"
+        code = (state.departure or takeoff_departure_icao_tf.value) if is_departure else (state.arrival or landing_arrival_icao_tf.value)
+        label = "Departure local" if is_departure else "Arrival local"
+        return airport_local_datetime(code), label
 
     def now_local_str():
         return datetime.now().strftime("%a %d %b • %H:%M:%S")
 
     def refresh_header_texts():
+        local_today = datetime.now().date()
+        dashboard_weekday_text.value = local_today.strftime("%A")
+        dashboard_date_text.value = f"{local_today.day} {local_today:%B}"
+        dashboard_year_text.value = str(local_today.year)
         txt_welcome.value = f"Hello, {state.pilot_name}"
         txt_time.value = f"Local time: {now_local_str()}"
         if state.location_permission_enabled:
@@ -4338,18 +4772,31 @@ def main(page: ft.Page):
         overview_weather_text.color = tokens["muted"]
         overview_location_text.value = txt_location.value
         overview_weather_text.value = txt_weather.value
-        takeoff_date_text.value = overview_date_text.value
-        takeoff_time_text.value = overview_time_text.value
-        takeoff_time_text.color = ft.Colors.WHITE if state.airline else tokens["text"]
+        takeoff_moment, takeoff_source_label = phase_clock_moment("departure")
+        landing_moment, landing_source_label = phase_clock_moment("descent")
+        takeoff_date_text.value = takeoff_moment.strftime("%A, %d %B %Y")
+        utc_label = datetime.utcnow().strftime("UTC %H:%M:%S")
+        takeoff_route_time_text.value = f"Local {takeoff_moment.strftime('%H:%M:%S')}"
+        takeoff_time_text.value = utc_label
+        takeoff_clock_source_text.value = takeoff_source_label
+        takeoff_route_time_text.color = tokens["text"]
+        takeoff_clock_source_text.color = tokens["accent"]
+        takeoff_time_text.color = tokens["muted"]
         takeoff_date_text.color = tokens["muted"]
         takeoff_location_text.color = tokens["muted"]
         takeoff_weather_text.color = tokens["muted"]
         takeoff_location_text.value = txt_location.value
         takeoff_weather_text.value = txt_weather.value
-        landing_date_text.value = overview_date_text.value
-        landing_time_text.value = overview_time_text.value
-        landing_time_text.color = ft.Colors.WHITE if state.airline else tokens["text"]
+        takeoff_analog_clock_host.content = build_analog_clock_face(takeoff_moment, int(takeoff_analog_clock_host.width))
+        landing_date_text.value = landing_moment.strftime("%A, %d %B %Y")
+        landing_route_time_text.value = f"Local {landing_moment.strftime('%H:%M:%S')}"
+        landing_time_text.value = utc_label
+        landing_clock_source_text.value = landing_source_label
+        landing_route_time_text.color = tokens["text"]
+        landing_clock_source_text.color = tokens["accent"]
+        landing_time_text.color = tokens["muted"]
         landing_date_text.color = tokens["muted"]
+        landing_analog_clock_host.content = build_analog_clock_face(landing_moment, int(landing_analog_clock_host.width))
 
 
     def airline_logo_rel_path(airline_name: Optional[str]) -> Optional[str]:
@@ -4384,6 +4831,16 @@ def main(page: ft.Page):
         airline_logo_cache[airline_name] = None
         return None
 
+    def airline_logo_source(airline_name, iata=None):
+        name = canonical_airline_name(airline_name)
+        local = airline_logo_rel_path(name)
+        if local:
+            return local
+        code = str(iata or "").strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{2}", code):
+            return f"https://img.wway.io/pics/root/{code}@png?exar=1&rs=fit:340:120"
+        return None
+
     def airline_logo_image(
         airline_name: Optional[str],
         width: int = 140,
@@ -4393,20 +4850,27 @@ def main(page: ft.Page):
         fallback_text: bool = True,
         key_prefix: str = "logo",
     ) -> ft.Control:
-        rel = airline_logo_rel_path(airline_name)
-        current_airline = (airline_name or "").strip()
-        if rel:
-            return ft.Image(
-                src=rel,
-                width=width,
-                height=height,
-                fit=fit,
-                opacity=opacity,
-                key=f"{key_prefix}-{current_airline}-{state.logo_refresh_nonce}",
+        current_airline = canonical_airline_name(airline_name)
+        selected_name = canonical_airline_name(state.airline_record.get("name"))
+        iata = state.airline_record.get("iata") if current_airline == selected_name else None
+        src = airline_logo_source(current_airline, iata)
+        fallback = (
+            ft.Text(current_airline.upper(), size=12, weight=ft.FontWeight.W_700, color=tokens["muted"])
+            if fallback_text else ft.Icon(ft.Icons.FLIGHT, size=20, color=tokens["muted"])
+        )
+        if not src:
+            return fallback
+        image = ft.Image(
+            src=src, width=width, height=height, fit=fit, opacity=opacity,
+            key=f"{key_prefix}-{current_airline}-{state.logo_refresh_nonce}",
+            error_content=fallback,
+        )
+        if src.startswith("https://"):
+            return ft.Container(
+                width=width, height=height, padding=3, bgcolor="#F0F3F6", border_radius=6,
+                alignment=ft.Alignment(0, 0), content=image,
             )
-        if fallback_text:
-            return ft.Text(current_airline.upper(), size=12, weight=ft.FontWeight.W_700, color=tokens["muted"])
-        return ft.Container(width=width, height=height)
+        return image
 
     def aircraft_manufacturer_name(aircraft_name: Optional[str]) -> Optional[str]:
         key = canonical_aircraft_name(aircraft_name) or (aircraft_name or "")
@@ -4507,6 +4971,7 @@ def main(page: ft.Page):
         "ANA": "ana",
         "British Airways": "british_airways",
         "Cathay Pacific": "cathay_pacific",
+        "Delta Air Lines": "delta_air_lines",
         "Emirates": "emirates",
         "Etihad Airways": "etihad_airways",
         "Generic": "generic",
@@ -4528,15 +4993,20 @@ def main(page: ft.Page):
         "A320-200": "a320_200",
         "A321-200": "a321_200",
         "A321neo": "a321neo",
+        "A330-200": "a330_200",
         "A330-300": "a330_300",
+        "A330-800": "a330_800",
+        "A330-900": "a330_900",
         "A340-600": "a340_600",
         "A350-900": "a350_900",
+        "A350-900-LH100": "a350_900_100_years",
         "A350-1000": "a350_1000",
         "A380-800": "a380_800",
         "B737-8MAX": "b737_8_max",
         "B747-8": "b747_8",
         "B747-200": "b747_200",
         "B757-200": "b757_200",
+        "B777-200ER": "b777_200er",
         "B777-300ER": "b777_300er",
         "B787-9": "b787_9",
         "B787-10": "b787_10",
@@ -4545,16 +5015,21 @@ def main(page: ft.Page):
     GENERIC_AIRCRAFT_FILE_STEMS = {
         "A320-200": ["a320-200", "generic_a320_200"],
         "A321-200": ["a321-200", "generic_a321_200"],
-        "A321neo": ["a321-200", "generic_a321_200"],
+        "A321neo": ["a321neo", "generic_a321neo", "a321-200", "generic_a321_200"],
+        "A330-200": ["a330-200", "generic_a330_200", "a330-300", "generic_a330_300"],
         "A330-300": ["a330-300", "generic_a330_300"],
+        "A330-800": ["a330-800", "a330-800neo", "generic_a330_800", "a330-300", "generic_a330_300"],
+        "A330-900": ["a330-900", "a330-900neo", "generic_a330_900", "a330-300", "generic_a330_300"],
         "A340-600": ["a340-600", "generic_a340_600"],
         "A350-900": ["a350-900", "generic_a350_900"],
+        "A350-900-LH100": ["a350-900", "generic_a350_900"],
         "A350-1000": ["a350-1000", "generic_a350_1000", "a350-900", "generic_a350_900"],
         "A380-800": ["a380-800", "generic_a380_800"],
         "B737-8MAX": ["737-8-max", "b737-8-max", "generic_b737_8_max"],
         "B747-8": ["747-8", "b747-8", "generic_b747_8"],
         "B747-200": ["747-200", "b747-200", "generic_b747_200"],
         "B757-200": ["757-200", "b757-200", "generic_b757_200"],
+        "B777-200ER": ["777-200er", "b777-200er", "generic_b777_200er"],
         "B777-200LR": ["777-200lr", "b777-200lr", "generic_b777_200lr"],
         "B777-300ER": ["777-300er", "b777-300er", "generic_b777_300er"],
         "B787-8": ["787-8", "b787-8", "generic_b787_8"],
@@ -4574,6 +5049,7 @@ def main(page: ft.Page):
     AIRCRAFT_LIVERY_EXACT_FILES = {
         ("Lufthansa", "B747-8"): "lufthansa_b747_8.jpeg",
         ("Iran Air", "B747-200"): "iran_air_b747_200.jpeg",
+        ("Lufthansa", "A350-900-LH100"): "lufthansa_a350_900_100_years.jpg",
     }
 
     def aircraft_livery_rel_path(airline_name: Optional[str], aircraft_name: Optional[str]) -> Optional[str]:
@@ -4613,6 +5089,14 @@ def main(page: ft.Page):
             for ext in ("webp", "png", "jpeg", "jpg"):
                 filename_candidates.append(f"aircraft/liveries/generic_{slug}.{ext}")
 
+        # Airline-specific artwork wins; otherwise use the shared transparent
+        # aircraft profile so every supported fleet entry remains visual.
+        if airline_label != "Generic":
+            for stem in GENERIC_AIRCRAFT_FILE_STEMS.get(aircraft_key, []):
+                for ext in ("webp", "png", "jpeg", "jpg"):
+                    filename_candidates.append(f"aircraft/generic/{stem}.{ext}")
+                    filename_candidates.append(f"aircraft/liveries/{stem}.{ext}")
+
         for filename in filename_candidates:
             rel = asset_rel_path_if_exists(filename)
             if rel:
@@ -4628,7 +5112,10 @@ def main(page: ft.Page):
         height: int = 150,
     ) -> ft.Control:
         aircraft_key = canonical_aircraft_name(aircraft_name) or (aircraft_name or "").strip()
-        rel = aircraft_livery_rel_path(airline_name, aircraft_key)
+        rel = (
+            aircraft_profile_path(aircraft_key) if airline_name == "Generic"
+            else aircraft_livery_rel_path(airline_name, aircraft_key)
+        )
         if rel:
             return ft.Image(
                 src=rel,
@@ -4648,14 +5135,50 @@ def main(page: ft.Page):
             ],
         )
 
+    def aircraft_profile_path(aircraft_name: Optional[str]) -> Optional[str]:
+        return aircraft_livery_rel_path("Generic", aircraft_name)
+
+    def aircraft_profile_image(aircraft_name: Optional[str], width: int, height: int) -> ft.Control:
+        return aircraft_livery_image("Generic", aircraft_name, width=width, height=height)
+
     def show_snack(message: str):
-        page.snack_bar = ft.SnackBar(ft.Text(message))
-        page.snack_bar.open = True
-        page.update()
+        page.show_dialog(ft.SnackBar(ft.Text(message)))
+
+    def show_alert(dialog):
+        prepare_controls(dialog)
+        page.show_dialog(dialog)
+
+    async def show_page_guide(tab):
+        nonlocal tutorial_dialog
+        await asyncio.sleep(0.15)
+        guide = page_guides.get(2 if tab == 3 else tab)
+        if (not guide or not state.is_logged_in or state.selected_tab_index != tab or state.tutorial_skipped
+                or guide[0] in state.tutorial_seen or flight_hibernation_prompt_modal.visible
+                or (tutorial_dialog and tutorial_dialog.open)):
+            return
+        title, instructions = guide
+
+        def dismiss(e, *, skip_all=False):
+            if skip_all:
+                state.tutorial_skipped = True
+                save_settings_data()
+            page.pop_dialog()
+
+        tutorial_dialog = ft.AlertDialog(
+            modal=True, title=ft.Text(title), content=ft.Text(instructions, width=380),
+            actions=[
+                ft.TextButton("Skip all tutorials", on_click=lambda e: dismiss(e, skip_all=True)),
+                ft.FilledButton("Got it", on_click=dismiss),
+            ],
+        )
+        show_alert(tutorial_dialog)
+        state.tutorial_seen.add(title)
+        save_settings_data()
 
     def safe_update_control(ctrl):
         try:
             if getattr(ctrl, "page", None):
+                prepare_controls(ctrl)
                 ctrl.update()
         except Exception:
             pass
@@ -4674,13 +5197,22 @@ def main(page: ft.Page):
                 overview_location_text,
                 overview_weather_text,
                 takeoff_date_text,
+                takeoff_route_time_text,
                 takeoff_time_text,
+                takeoff_clock_source_text,
+                takeoff_analog_clock_host,
                 takeoff_location_text,
                 takeoff_weather_text,
                 landing_date_text,
+                landing_route_time_text,
                 landing_time_text,
+                landing_clock_source_text,
+                landing_analog_clock_host,
             ):
                 safe_update_control(ctrl)
+            if state.selected_tab_index == 1:
+                for ctrl in (dashboard_weekday_text, dashboard_date_text, dashboard_year_text):
+                    safe_update_control(ctrl)
         if include_banner:
             safe_update_control(header_route_line_host)
 
@@ -4696,12 +5228,6 @@ def main(page: ft.Page):
             Path(__file__).resolve().parent / "assets",
             Path.cwd() / "assets",
         ]
-        try:
-            if getattr(sys, "frozen", False):
-                search_dirs.insert(0, Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets")
-                search_dirs.insert(1, Path(sys.executable).resolve().parent / "assets")
-        except Exception:
-            pass
         try:
             if getattr(sys, "frozen", False):
                 search_dirs.insert(0, Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets")
@@ -4778,79 +5304,22 @@ def main(page: ft.Page):
         # the new global background image.
         return None
 
-    def login_background_src() -> str:
-        return page_background_src("LOGIN") or state.page_backgrounds.get("LOGIN", "login_bg.jpg")
+    def login_audio_rel_src() -> Optional[str]:
+        return asset_rel_path_if_exists("audio/login.mp3")
 
-    def login_fms_lower_background_src() -> str:
-        # Put the lower image layer for the FMS cutout here:
-        # C:\FMS\assets\backgrounds\login_fms_lower_bg.jpg
-        for rel_path in (
-            "backgrounds/login_fms_lower_bg.png",
-            "backgrounds/login_fms_lower_bg.jpg",
-            "backgrounds/login_fms_lower_bg.jpeg",
-            "backgrounds/login_fms_lower_bg.webp",
-        ):
-            found = asset_rel_path_if_exists(rel_path)
-            if found:
-                return found
-        return login_background_src()
-
-    def login_fms_lower_background_abs_path() -> Optional[Path]:
-        for rel_path in (
-            "backgrounds/login_fms_lower_bg.png",
-            "backgrounds/login_fms_lower_bg.jpg",
-            "backgrounds/login_fms_lower_bg.jpeg",
-            "backgrounds/login_fms_lower_bg.webp",
-        ):
-            found = asset_abs_path_if_exists(rel_path)
-            if found:
-                return found
-        fallback = login_background_src()
-        return asset_abs_path_if_exists(fallback)
-
-    def refresh_login_background_preloader():
-        try:
-            src = login_background_src()
-            if getattr(login_background_preload_host, "_fms_login_bg_src", None) == src:
-                return
-            login_background_preload_host._fms_login_bg_src = src
-            login_background_preload_host.content = ft.Stack(
-                controls=[
-                    ft.Image(src=src, width=1, height=1, fit=ft.BoxFit.COVER),
-                    ft.Container(
-                        width=1,
-                        height=1,
-                        image=ft.DecorationImage(src=src, fit=ft.BoxFit.COVER, opacity=1.0),
-                    ),
-                ],
-            )
-        except Exception:
-            pass
-
-    def login_transition_audio_rel_src() -> Optional[str]:
-        return (
-            asset_rel_path_if_exists("audio/login_transition.mp3")
-            or asset_rel_path_if_exists("sounds/login_transition.mp3")
-            or asset_rel_path_if_exists("login_transition.mp3")
-        )
-
-    def login_transition_audio_abs_path() -> Optional[Path]:
-        return (
-            asset_abs_path_if_exists("audio/login_transition.mp3")
-            or asset_abs_path_if_exists("sounds/login_transition.mp3")
-            or asset_abs_path_if_exists("login_transition.mp3")
-        )
+    def login_audio_abs_path() -> Optional[Path]:
+        return asset_abs_path_if_exists("audio/login.mp3")
 
     def effective_app_volume() -> float:
         if bool(getattr(state, "app_muted", False)):
             return 0.0
         return clamp_setting(getattr(state, "app_volume", 0.85), 0.0, 1.0, 0.85)
 
-    def play_login_transition_audio_windows_mci(audio_path: Path):
+    def play_mp3_windows_mci(audio_path: Path):
         # Windows desktop fallback for MP3 playback. This does not depend on
         # Flet's Audio control, which may be unavailable in some desktop builds.
         def _worker():
-            alias = f"fms_login_transition_{int(time.time() * 1000)}"
+            alias = f"fms_audio_{int(time.time() * 1000)}"
             path_str = str(audio_path)
 
             def mci(command: str) -> int:
@@ -4878,43 +5347,43 @@ def main(page: ft.Page):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def play_login_transition_audio():
-        audio_abs = login_transition_audio_abs_path()
+    def play_login_audio():
+        audio_abs = login_audio_abs_path()
         if not audio_abs:
             return
 
         # Prefer native Windows MP3 playback on Windows because it works even
         # when ft.Audio is not available or silent.
         if os.name == "nt":
-            play_login_transition_audio_windows_mci(audio_abs)
+            play_mp3_windows_mci(audio_abs)
             return
 
         # Fallback for non-Windows/Flet builds.
-        if login_transition_audio is None:
+        if login_audio is None:
             return
 
-        audio_src = login_transition_audio_rel_src()
+        audio_src = login_audio_rel_src()
         if not audio_src:
             return
 
         try:
-            if getattr(login_transition_audio, "src", None) != audio_src:
-                login_transition_audio.src = audio_src
+            if getattr(login_audio, "src", None) != audio_src:
+                login_audio.src = audio_src
             if effective_app_volume() <= 0:
                 return
-            if hasattr(login_transition_audio, "volume"):
-                login_transition_audio.volume = effective_app_volume()
-            if hasattr(login_transition_audio, "seek"):
+            if hasattr(login_audio, "volume"):
+                login_audio.volume = effective_app_volume()
+            if hasattr(login_audio, "seek"):
                 try:
-                    login_transition_audio.seek(0)
+                    login_audio.seek(0)
                 except Exception:
                     pass
-            if hasattr(login_transition_audio, "play"):
-                login_transition_audio.play()
-            elif hasattr(login_transition_audio, "resume"):
-                login_transition_audio.resume()
-            if getattr(login_transition_audio, "page", None):
-                login_transition_audio.update()
+            if hasattr(login_audio, "play"):
+                login_audio.play()
+            elif hasattr(login_audio, "resume"):
+                login_audio.resume()
+            if getattr(login_audio, "page", None):
+                login_audio.update()
         except Exception:
             pass
 
@@ -4940,7 +5409,7 @@ def main(page: ft.Page):
             return
 
         if os.name == "nt":
-            play_login_transition_audio_windows_mci(audio_abs)
+            play_mp3_windows_mci(audio_abs)
             return
 
 
@@ -4955,161 +5424,174 @@ def main(page: ft.Page):
         )
 
 
-    def airport_card_background_src(code: Optional[str], fallback_key: str = "airport") -> Optional[str]:
-        canonical = (normalize_airport_code(code) or code or "").strip().upper()
-        fallback_key = (fallback_key or "airport").strip().lower()
+    def aircraft_value(record: dict) -> str:
+        return canonical_aircraft_name(record["name"]) or record["name"]
 
-        airport_background_groups = {
-            "KJFK": "NEW_YORK",
-            "KLGA": "NEW_YORK",
-            "KEWR": "NEW_YORK",
-            "ZSPD": "SHANGHAI",
-            "ZSSS": "SHANGHAI",
-        }
-
-        grouped_background = airport_background_groups.get(canonical)
-        candidates: List[str] = []
-        if grouped_background:
-            for ext in ("jpg", "jpeg", "png", "webp"):
-                candidates.append(f"overview/airport_cards/{grouped_background}.{ext}")
-                candidates.append(f"overview/airport_cards/{grouped_background.lower()}.{ext}")
-
-        if canonical:
-            for ext in ("jpg", "jpeg", "png", "webp"):
-                candidates.append(f"overview/airport_cards/{canonical}.{ext}")
-                candidates.append(f"overview/airport_cards/{canonical.lower()}.{ext}")
-
-        for ext in ("jpg", "jpeg", "png", "webp"):
-            candidates.append(f"overview/airport_cards/{fallback_key}_default.{ext}")
-            candidates.append(f"overview/airport_cards/airport_default.{ext}")
-
-        for rel_path in candidates:
-            found = asset_rel_path_if_exists(rel_path)
-            if found:
-                return found
-        return None
-
-    def discover_airport_card_background_assets() -> List[str]:
-        rel_paths: List[str] = []
-        seen = set()
-        for base in (Path(__file__).resolve().parent / "assets", Path.cwd() / "assets"):
-            folder = base / "overview" / "airport_cards"
-            if not folder.exists():
-                continue
-            for candidate in folder.iterdir():
-                if candidate.is_file() and candidate.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
-                    rel = f"overview/airport_cards/{candidate.name}"
-                    if rel not in seen:
-                        seen.add(rel)
-                        rel_paths.append(rel)
-        return rel_paths
-
-    def refresh_airport_background_preloader(update_page: bool = False):
-        try:
-            rel_paths = discover_airport_card_background_assets()
-
-            # Prioritize currently relevant route/airport images so they are cached first.
-            priority_codes = [
-                (state.departure or takeoff_departure_icao_tf.value or "").strip().upper(),
-                (state.arrival or landing_arrival_icao_tf.value or "").strip().upper(),
-                (takeoff_departure_icao_tf.value or "").strip().upper(),
-                (landing_arrival_icao_tf.value or "").strip().upper(),
-            ]
-            priority_paths: List[str] = []
-            for code in priority_codes:
-                found = airport_card_background_src(code, "airport")
-                if found and found not in priority_paths:
-                    priority_paths.append(found)
-
-            ordered_paths = priority_paths + [rel for rel in rel_paths if rel not in priority_paths]
-            current_paths = getattr(airport_background_preload_host, "_fms_preloaded_paths", None)
-            if current_paths == ordered_paths:
-                return
-
-            airport_background_preload_host._fms_preloaded_paths = list(ordered_paths)
-            airport_background_preload_host.content = ft.Row(
-                spacing=0,
-                controls=[
-                    ft.Image(
-                        src=rel,
-                        width=1,
-                        height=1,
-                        fit=ft.BoxFit.COVER,
-                        opacity=0.01,
-                    )
-                    for rel in ordered_paths
-                ],
-            )
-            if update_page and getattr(airport_background_preload_host, "page", None):
-                airport_background_preload_host.update()
-        except Exception:
-            pass
-
-    def airport_background_glass_card(
-        title: str,
-        content: ft.Control,
-        airport_code: Optional[str],
-        fallback_key: str,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        expand: bool = False,
-    ) -> ft.Control:
-        daylight_cards_active = use_daylight_cards()
-        background_src = airport_card_background_src(airport_code, fallback_key)
-
-        background_layers: List[ft.Control] = [
-            ft.Container(expand=True, bgcolor=tokens["panel"]),
-        ]
-        if background_src:
-            background_layers.extend([
-                ft.Container(
-                    expand=True,
-                    image=ft.DecorationImage(
-                        src=background_src,
-                        fit=ft.BoxFit.COVER,
-                        opacity=0.62 if daylight_cards_active else 0.50,
-                    ),
-                ),
-                ft.Container(
-                    expand=True,
-                    bgcolor=ft.Colors.with_opacity(0.16 if daylight_cards_active else 0.35, ft.Colors.BLACK),
-                ),
-            ])
-
-        return ft.Container(
-            width=width,
-            height=height,
-            expand=expand,
-            border_radius=20,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=ft.Colors.with_opacity(0.46, tokens["panel"]) if daylight_cards_active else ft.Colors.with_opacity(0.30, tokens["panel"]),
-            border=ft.border.all(1, tokens["card_border"] if daylight_cards_active else ft.Colors.with_opacity(0.35, tokens["card_border"])),
-            shadow=ft.BoxShadow(
-                blur_radius=18,
-                spread_radius=1,
-                color=ft.Colors.with_opacity(0.10, ft.Colors.BLACK),
-                offset=ft.Offset(0, 6),
-            ),
-            content=ft.Stack(
-                expand=True,
-                controls=[
-                    *background_layers,
-                    ft.Container(
-                        expand=True,
-                        padding=16,
-                        content=ft.Column(
-                            controls=[
-                                ft.Text(title, size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                                ft.Divider(height=10, opacity=0.15),
-                                content,
-                            ],
-                            spacing=10,
-                        ),
-                    ),
-                ],
-            ),
+    def aviation_autocomplete(label, kind, value, on_selection, *, width=None, expand=False, dropdown=False,
+                              commit_airport_code=False, floating_results=None):
+        nonlocal close_suggestions
+        selected = bool(value)
+        revision = 0
+        field = ft.TextField(
+            label=label, value=value or "", border_radius=14, filled=True,
+            bgcolor=tokens["input_bg"], hint_text="Search by name or code",
+            color=tokens["text"], label_style=ft.TextStyle(color=tokens["muted"]),
+            hint_style=ft.TextStyle(color=tokens["muted"]),
+        )
+        suggestions = ft.ListView(spacing=2, visible=False, height=0)
+        results = ft.Container(
+            content=suggestions, visible=False, bgcolor=tokens["panel"], border_radius=CONTROL_RADIUS,
+            border=ft.Border.all(1, tokens["card_border"]), clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        ) if dropdown else suggestions
+        if floating_results is not None:
+            floating_results[label] = results
+        control = ft.Column(
+            [field, results] if floating_results is None else [field],
+            width=width, expand=expand or None, spacing=4, tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH if dropdown else ft.CrossAxisAlignment.START,
         )
 
+        def show(controls, height=None):
+            suggestions.controls = controls
+            suggestions.visible = results.visible = bool(controls)
+            suggestions.height = height if height is not None else (28 if controls else 0)
+            safe_update_control(results if floating_results is not None else control)
+
+        def dismiss():
+            nonlocal revision
+            revision += 1
+            show([])
+
+        def choose(record):
+            nonlocal selected
+            selected = True
+            field.value = record["code"] if kind == "airport" else record["name"]
+            dismiss()
+            if floating_results is not None:
+                safe_update_control(field)
+            on_selection(record)
+
+        async def search(e):
+            nonlocal revision, selected, close_suggestions
+            query = field.value or ""
+            if selected and (not commit_airport_code or not query.strip()):
+                selected = False
+                on_selection(None)
+            if close_suggestions and close_suggestions is not dismiss:
+                close_suggestions()
+            close_suggestions = dismiss
+            revision += 1
+            request_revision = revision
+            if len(search_key(query)) < 2:
+                show([])
+                return
+            show([ft.Text("Searching…", color=tokens["muted"])])
+            await asyncio.sleep(0.25 if commit_airport_code else 0.5)
+            if request_revision != revision or query != (field.value or ""):
+                return
+            code = query.strip().upper()
+            # Three-letter IATA codes can also be the start of a four-letter ICAO code.
+            is_icao = commit_airport_code and re.fullmatch(r"[A-Z]{4}", code)
+            if is_icao and (record := AIRPORT_LIBRARY.get(code)):
+                choose(record)
+                return
+
+            local = ()
+            if kind == "aircraft":
+                local = tuple(
+                    dict(id=key, code=key, name=row["name"],
+                         manufacturer=row.get("manufacturer") or row["name"].split()[0])
+                    for key, row in AIRCRAFT_LIBRARY.items()
+                )
+            elif kind == "airline":
+                local = tuple(
+                    dict(id=name, name=name, iata=AIRLINE_CALLSIGNS.get(name, ""))
+                    for name in AIRLINES
+                )
+            elif kind == "airport":
+                local = tuple(AIRPORT_LIBRARY.values())
+            records, unavailable = await asyncio.to_thread(search_catalog, kind, query, local)
+            if request_revision != revision or query != (field.value or ""):
+                return
+            if is_icao:
+                exact = next((record for record in records if record.get("icao") == code or record.get("code") == code), None)
+                if exact:
+                    choose(exact)
+                    return
+
+            rows = []
+            for record in records:
+                keys = ("city", "iata", "icao", "code") if dropdown and kind == "airport" else ("iata", "icao", "callsign", "manufacturer")
+                details = [record.get(key) for key in keys]
+                leading = None
+                if kind == "airline":
+                    logo = airline_logo_source(record["name"], record.get("iata"))
+                    fallback = ft.Icon(ft.Icons.FLIGHT, size=18, color="#526171")
+                    leading = ft.Container(
+                        width=48,
+                        height=32,
+                        padding=3,
+                        border_radius=6,
+                        alignment=ft.Alignment(0, 0),
+                        bgcolor="#F0F3F6",
+                        content=ft.Image(
+                            src=logo, width=42, height=26, fit=ft.BoxFit.CONTAIN,
+                            error_content=fallback,
+                        ) if logo else fallback,
+                    )
+                rows.append(ft.ListTile(
+                    title=ft.Text(record["name"], size=13, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                    subtitle=ft.Text(" · ".join(dict.fromkeys(value for value in details if value)), size=11),
+                    leading=leading, dense=True, on_click=lambda e, row=record: choose(row),
+                ))
+            if unavailable:
+                rows.append(ft.TextButton("Search unavailable · Retry", on_click=search))
+            elif not rows:
+                rows.append(ft.Text("No matches", color=tokens["muted"]))
+            show(rows, min(156 if floating_results is not None else 230, len(rows) * 62))
+
+        field.on_change = search
+        return control
+
+    def on_aviation_keyboard(event):
+        if event.key == "Escape" and close_suggestions:
+            close_suggestions()
+
+    page.on_keyboard_event = on_aviation_keyboard
+
+    def planner_search(key, label, backing):
+        kind = "airport" if key in ("origin", "destination") else key
+        record = planner_records.get(key, {})
+        def select(selected):
+            if selected:
+                planner_records[key] = selected
+                if kind == "airport":
+                    remember_airport(selected)
+                    backing.value = selected["code"]
+                elif kind == "aircraft":
+                    backing.value = aircraft_value(selected)
+                else:
+                    backing.value = selected["name"]
+            else:
+                planner_records.pop(key, None)
+                backing.value = None
+            if kind == "airport":
+                refresh_calendar_route_preview()
+
+        display = backing.value if kind == "airport" else record.get("name") or backing.value
+        return aviation_autocomplete(label, kind, display, select, width=200)
+
+    def airport_card_background_src(code: Optional[str], fallback_key: str = "airport") -> Optional[str]:
+        canonical = normalize_airport_code(code)
+        image = airport_images.get(canonical)
+        if image:
+            return image
+        for key in (fallback_key, "airport"):
+            for ext in ("jpg", "jpeg", "png", "webp"):
+                found = asset_rel_path_if_exists(f"overview/airport_cards/{key}_default.{ext}")
+                if found:
+                    return found
+        return None
 
     def open_help_center(e=None):
         help_dialog = ft.AlertDialog(
@@ -5128,17 +5610,10 @@ def main(page: ft.Page):
                     ],
                 ),
             ),
-            actions=[ft.TextButton("Close", on_click=lambda evt: close_help_center())],
+            actions=[ft.TextButton("Close", on_click=lambda evt: page.pop_dialog())],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.dialog = help_dialog
-        help_dialog.open = True
-        page.update()
-
-    def close_help_center():
-        if page.dialog:
-            page.dialog.open = False
-            page.update()
+        show_alert(help_dialog)
 
     status_gate_tf = ft.TextField(label="Gate", value=state.departure_gate or "", width=180, border_radius=16, filled=True)
     status_boarding_dd = ft.Dropdown(
@@ -5176,7 +5651,7 @@ def main(page: ft.Page):
             width=460,
             padding=20,
             border_radius=22,
-            bgcolor=tokens["panel"],
+            bgcolor=surface_fill(tokens["panel"]),
             border=ft.border.all(1, tokens["card_border"]),
             shadow=ft.BoxShadow(
                 blur_radius=24,
@@ -5203,7 +5678,7 @@ def main(page: ft.Page):
                         alignment=ft.MainAxisAlignment.END,
                         controls=[
                             ft.TextButton("Cancel", on_click=lambda evt: close_status_center()),
-                            ft.ElevatedButton("Save", on_click=lambda evt: save_status_center(), bgcolor=tokens["accent"], color=ft.Colors.WHITE),
+                            ft.ElevatedButton("Save", on_click=lambda evt: save_status_center(), bgcolor=tokens["primary"], color=tokens["on_primary"]),
                         ],
                     ),
                 ],
@@ -5271,9 +5746,8 @@ def main(page: ft.Page):
     page.overlay.append(aircraft_picker_modal)
     page.overlay.append(flight_hibernation_prompt_modal)
     page.overlay.append(flight_end_summary_modal)
-    page.overlay.append(airport_background_preload_host)
-    if login_transition_audio is not None:
-        page.overlay.append(login_transition_audio)
+    if login_audio is not None:
+        page.overlay.append(login_audio)
 
     def parse_calendar_entry_datetime(entry: dict) -> datetime:
         date_str = (entry.get("date") or "").strip()
@@ -5342,19 +5816,18 @@ def main(page: ft.Page):
     def get_completed_log_entries() -> List[dict]:
         entries = [entry for entry in state.calendar_entries if bool(entry.get("completed"))]
         sort_mode = log_sort_dd.value or "Most recent date"
-        if sort_mode == "Oldest date":
-            entries.sort(key=lambda entry: (parse_calendar_entry_datetime(entry), entry.get("airline", "")))
-        elif sort_mode == "Longest flight time":
-            entries.sort(
-                key=lambda entry: (parse_flight_time_minutes(entry.get("flight_time", "")), parse_calendar_entry_datetime(entry)),
-                reverse=True,
-            )
-        elif sort_mode == "Shortest flight time":
-            entries.sort(
-                key=lambda entry: (parse_flight_time_minutes(entry.get("flight_time", "")), parse_calendar_entry_datetime(entry)),
-            )
-        else:
-            entries.sort(key=lambda entry: (parse_calendar_entry_datetime(entry), entry.get("airline", "")), reverse=True)
+        entries.sort(
+            key=lambda entry: (parse_calendar_entry_datetime(entry), entry.get("airline", "")),
+            reverse=sort_mode != "Oldest date",
+        )
+        if sort_mode in ("Lowest landing G", "Highest landing G"):
+            direction = 1 if sort_mode == "Lowest landing G" else -1
+
+            def landing_sort_key(entry):
+                value = parse_landing_g(entry.get("landing_g"))
+                return direction * value if value is not None else math.inf
+
+            entries.sort(key=landing_sort_key)
         return entries
 
     def summarize_log_entries(entries: List[dict]) -> dict:
@@ -5413,139 +5886,68 @@ def main(page: ft.Page):
             return f"{round(value_c * 9 / 5 + 32)}°F"
         return f"{round(value_c)}°C"
 
-    def airport_weather_for_card(code: Optional[str]) -> dict:
-        canonical = normalize_airport_code(code) or (code or "").strip().upper()
-        if not canonical:
-            return {"temperature": "—", "icon": "🌡️", "condition": "Weather unavailable"}
+    async def load_airport_media(code: str):
+        async def get_record():
+            record = lookup_airport_record(code)
+            if record:
+                return record
+            matches, _ = await asyncio.to_thread(search_catalog, "airport", code)
+            record = next((row for row in matches if code in (row["code"], row["iata"])), None)
+            if record:
+                remember_airport(record)
+            return record
 
-        now_ts = time.time()
-        cached = airport_weather_cache.get(canonical)
-        if cached and now_ts - float(cached.get("timestamp", 0.0)) < 900:
-            return cached
-
-        record = lookup_airport_record(canonical)
-        if not record:
-            payload = {
-                "timestamp": now_ts,
-                "temperature": "—",
-                "icon": "🌡️",
-                "condition": "Weather unavailable",
-            }
-            airport_weather_cache[canonical] = payload
-            return payload
-
-        try:
-            latitude = float(record["lat"])
-            longitude = float(record["lon"])
-            query = urllib.parse.urlencode(
-                {
-                    "latitude": f"{latitude:.5f}",
-                    "longitude": f"{longitude:.5f}",
-                    "current": "temperature_2m,weather_code,is_day,wind_speed_10m",
-                    "timezone": "auto",
-                }
-            )
-            url = f"https://api.open-meteo.com/v1/forecast?{query}"
-            with urllib.request.urlopen(url, timeout=4) as response:
-                payload_raw = json.loads(response.read().decode("utf-8"))
-
-            current = payload_raw.get("current", {})
-            temperature_c = current.get("temperature_2m")
-            weather_code = current.get("weather_code")
-            is_day = bool(current.get("is_day", 1))
-            wind_speed = current.get("wind_speed_10m")
-            icon, condition = weather_icon_and_label(weather_code, is_day=is_day, wind_speed_kmh=wind_speed)
-            payload = {
-                "timestamp": now_ts,
-                "temperature": format_temperature_for_default_unit(float(temperature_c)) if temperature_c is not None else "—",
-                "icon": icon,
-                "condition": condition,
-            }
-        except Exception:
-            payload = {
-                "timestamp": now_ts,
-                "temperature": "—",
-                "icon": "🌡️",
-                "condition": "Weather unavailable",
-            }
-
-        airport_weather_cache[canonical] = payload
-        return payload
-
-    def airport_environment_for_overview(code: Optional[str]) -> dict:
-        canonical = normalize_airport_code(code) or (code or "").strip().upper()
-        record = lookup_airport_record(canonical) if canonical else None
-        elevation_value = "—"
-        if record and record.get("elevation_ft") is not None:
+        async def load_report(station):
+            requested_at = time.monotonic()
             try:
-                elevation_value = f"{float(record.get('elevation_ft')):,.0f} ft"
-            except Exception:
-                elevation_value = f"{record.get('elevation_ft')} ft"
+                report = await asyncio.to_thread(fetch_metar, station) if re.fullmatch(r"[A-Z]{4}", station) else {}
+            except (OSError, ValueError):
+                report = {}
+            if airport_weather_cache.get(station, {}).get("timestamp", 0) <= requested_at:
+                airport_weather_cache[station] = {"report": report, "timestamp": time.monotonic()}
 
-        if not canonical:
-            return {
-                "timestamp": time.time(),
-                "wind": "—",
-                "visibility": "—",
-                "elevation": elevation_value,
-            }
-
-        now_ts = time.time()
-        cached = airport_environment_cache.get(canonical)
-        if cached and now_ts - float(cached.get("timestamp", 0.0)) < 900:
-            # Keep elevation fresh from the local airport library, even when
-            # METAR data is cached.
-            cached["elevation"] = elevation_value
-            return cached
-
-        payload = {
-            "timestamp": now_ts,
-            "wind": "—",
-            "visibility": "—",
-            "elevation": elevation_value,
-        }
+        async def load_image(record, station):
+            if station in airport_images or not record:
+                return
+            try:
+                airport_images[station] = await asyncio.to_thread(city_image, record["city"], record["country"])
+            except (OSError, ValueError):
+                pass
 
         try:
-            url = f"https://aviationweather.gov/api/data/metar?ids={canonical}&format=json"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=4) as response:
-                metar_payload = json.loads(response.read().decode("utf-8"))
+            record = await get_record()
+            station = (record.get("icao") or record["code"]) if record else code
+            await asyncio.gather(load_report(station), load_image(record, station))
+        finally:
+            pending_airport_media.discard(code)
+        route = {normalize_airport_code(state.departure), normalize_airport_code(state.arrival)}
+        if state.is_logged_in and state.selected_tab_index in (0, 4, 5) and (station in route or code in route):
+            refresh_active_page()
 
-            if metar_payload:
-                m = metar_payload[0]
-                wind_dir = m.get("wdir", None)
-                wind_speed = m.get("wspd", None)
-                wind_gust = m.get("wgst", None)
+    def queue_airport_media(code: Optional[str]):
+        canonical = normalize_airport_code(code)
+        if not canonical or canonical in pending_airport_media:
+            return
+        cached = airport_weather_cache.get(canonical, {})
+        ttl = 900 if cached.get("report") else 120
+        if cached and time.monotonic() - cached["timestamp"] < ttl:
+            return
+        pending_airport_media.add(canonical)
+        page.run_task(load_airport_media, canonical)
 
-                if wind_speed in (None, ""):
-                    wind_label = "Calm / unavailable"
-                else:
-                    direction_label = "VRB" if wind_dir in (None, "", "VRB") else f"{int(float(wind_dir)):03d}°"
-                    wind_label = f"{direction_label} {int(float(wind_speed))} kt"
-                    if wind_gust not in (None, "", 0, "0"):
-                        wind_label += f" G{int(float(wind_gust))}"
-
-                visibility = m.get("visib", None)
-                if visibility in (None, ""):
-                    visibility_label = "—"
-                else:
-                    visibility_label = str(visibility).strip()
-                    if visibility_label and not visibility_label.upper().endswith(("SM", "KM", "M")):
-                        visibility_label = f"{visibility_label} SM"
-
-                payload.update(
-                    {
-                        "timestamp": now_ts,
-                        "wind": wind_label,
-                        "visibility": visibility_label,
-                        "elevation": elevation_value,
-                    }
-                )
-        except Exception:
-            pass
-
-        airport_environment_cache[canonical] = payload
-        return payload
+    def airport_weather_for_card(code: Optional[str], *, fetch: bool = True) -> dict:
+        canonical = normalize_airport_code(code)
+        if fetch:
+            queue_airport_media(canonical)
+        report = airport_weather_cache.get(canonical, {}).get("report", {})
+        temperature = report.get("temp")
+        icon, condition = metar_condition(report)
+        return {
+            "temperature": format_temperature_for_default_unit(float(temperature)) if temperature is not None else "—",
+            "temperature_c": temperature,
+            "icon": icon,
+            "condition": condition,
+        }
 
     def update_weather_from_coordinates(latitude: float, longitude: float):
         try:
@@ -5740,20 +6142,17 @@ def main(page: ft.Page):
         dialog = ft.AlertDialog(
             modal=True,
             title=ft.Text("Enable location tracking"),
-            content=ft.Text("Allow FCAM to use device location for local position and future weather integration?"),
+            content=ft.Text("Allow FMS to use your device location for local weather and time?"),
             actions=[
                 ft.TextButton("Not now", on_click=lambda evt: close_location_prompt(False)),
-                ft.ElevatedButton("Allow", on_click=lambda evt: close_location_prompt(True), bgcolor=tokens["accent"], color=ft.Colors.WHITE),
+                ft.ElevatedButton("Allow", on_click=lambda evt: close_location_prompt(True), bgcolor=tokens["primary"], color=tokens["on_primary"]),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.dialog = dialog
-        dialog.open = True
-        page.update()
+        show_alert(dialog)
 
     def close_location_prompt(enabled: bool):
-        if page.dialog:
-            page.dialog.open = False
+        page.pop_dialog()
         state.location_permission_enabled = enabled
         if enabled and state.location_label == "Berlin":
             state.location_label = "Awaiting live device location"
@@ -5816,48 +6215,12 @@ def main(page: ft.Page):
         bgcolor=tokens["input_bg"],
     )
     settings_low_performance_switch = ft.Switch(label="Low performance mode", value=state.low_performance_mode)
-    settings_professional_info_switch = ft.Switch(
-        value=bool(getattr(state, "professional_info_enabled", False)),
-        active_color="#FF3B30",
-        active_track_color=ft.Colors.with_opacity(0.38, "#FF3B30"),
-        inactive_thumb_color=tokens["muted"],
-        inactive_track_color=ft.Colors.with_opacity(0.22, ft.Colors.WHITE),
-    )
     settings_volume_slider = ft.Slider(min=0.0, max=1.0, divisions=20, value=getattr(state, "app_volume", 0.85), width=300)
     settings_mute_switch = ft.Switch(label="Mute app sounds", value=bool(getattr(state, "app_muted", False)))
     settings_volume_value_text = ft.Text("Volume: 85%", size=12, color=tokens["muted"])
-    settings_performance_status_text = ft.Text("Low performance mode keeps the interface lighter by slowing live refreshes.", size=12, color=tokens["muted"])
     settings_export_status_text = ft.Text(f"Exports will be saved inside {storage_dir / 'exports'}.", size=12, color=tokens["muted"])
     settings_calendar_import_status_text = ft.Text("Upload a calendar JSON export to replace the current calendar.", size=12, color=tokens["muted"])
     settings_background_status_text = ft.Text(f"Global background path: {app_background_instruction_path()} | Daytime path: {daylight_background_instruction_path()}", size=12, color=tokens["muted"])
-    settings_professional_info_status_text = ft.Text("Normal information: advanced planning cards are hidden.", size=12, color=tokens["muted"])
-
-    username_tf = ft.TextField(
-        label="ID no.",
-        width=340,
-        border_radius=16,
-        filled=True,
-        bgcolor=tokens["input_bg"],
-        border_color=tokens["card_border"],
-        color=tokens["text"],
-        label_style=ft.TextStyle(color=tokens["muted"]),
-        text_size=14,
-    )
-
-    password_tf = ft.TextField(
-        label="Password",
-        width=340,
-        password=True,
-        can_reveal_password=True,
-        border_radius=16,
-        filled=True,
-        bgcolor=tokens["input_bg"],
-        border_color=tokens["card_border"],
-        color=tokens["text"],
-        label_style=ft.TextStyle(color=tokens["muted"]),
-        text_size=14,
-    )
-    login_error = ft.Text("", color="#FFB4B4", size=12)
 
     # Baggage controls rebuilt from the calculator workflow
     bag_mode_dd = ft.Dropdown(
@@ -5879,7 +6242,7 @@ def main(page: ft.Page):
     )
     bag_carry_on_tf = ft.TextField(
         label="Carry-on kg per passenger",
-        value="",
+        value="0",
         width=330,
         border_radius=16,
         filled=True,
@@ -5896,7 +6259,7 @@ def main(page: ft.Page):
     )
     bag_checked_kg_per_pax_tf = ft.TextField(
         label="Checked baggage kg per passenger",
-        value="",
+        value="0",
         width=330,
         border_radius=16,
         filled=True,
@@ -5915,7 +6278,7 @@ def main(page: ft.Page):
 
     bag_two_bag_percent_tf = ft.TextField(
         label="Passengers with 2 checked bags (%)",
-        value="25",
+        value="0",
         width=260,
         border_radius=16,
         filled=True,
@@ -5924,7 +6287,7 @@ def main(page: ft.Page):
     )
     bag_per_bag_kg_tf = ft.TextField(
         label="Mass per checked bag (kg)",
-        value="23",
+        value="0",
         width=220,
         border_radius=16,
         filled=True,
@@ -5939,6 +6302,13 @@ def main(page: ft.Page):
         color=tokens["muted"],
     )
     bag_status_text = ft.Text("Enter values and click Calculate.", size=13, weight=ft.FontWeight.W_600)
+
+    def set_baggage_status(message, *, error=False):
+        bag_status_text.value = message
+        bag_status_text.data = error
+        bag_status_text.tooltip = message
+        danger = "#FF8080" if page.theme_mode == ft.ThemeMode.DARK else "#B3261E"
+        bag_status_text.color = danger if error else tokens["muted"]
 
     bag_total_weight_text = ft.Text("TOTAL baggage: —", size=20, weight=ft.FontWeight.W_800, color=tokens["accent"])
     bag_baggage_weight_summary_text = ft.Text("Baggage weight: —", size=15, weight=ft.FontWeight.W_700, color=tokens["text"])
@@ -5984,17 +6354,10 @@ def main(page: ft.Page):
     # Calendar controls
     cal_date_tf = ft.TextField(label="Date", hint_text="YYYY-MM-DD", width=200, border_radius=16, filled=True)
     cal_time_tf = ft.TextField(label="Departure time", hint_text="HH:MM", width=200, border_radius=16, filled=True)
-    cal_airline_dd = ft.Dropdown(
-        label="Airline",
-        value=state.airline or None,
-        options=[ft.dropdown.Option(name) for name in AIRLINES],
-        width=200,
-        border_radius=16,
-        filled=True,
-    )
-    cal_aircraft_dd = ft.Dropdown(label="Aircraft", width=200, border_radius=16, filled=True)
-    cal_origin_tf = ft.TextField(label="Origin", hint_text="e.g. EDDB", width=200, border_radius=16, filled=True)
-    cal_destination_tf = ft.TextField(label="Destination", hint_text="e.g. OMDB", width=200, border_radius=16, filled=True)
+    cal_airline_dd = ft.TextField(value=state.airline or "")
+    cal_aircraft_dd = ft.TextField()
+    cal_origin_tf = ft.TextField(label="Departure", hint_text="e.g. EDDB", width=200, border_radius=16, filled=True)
+    cal_destination_tf = ft.TextField(label="Arrival", hint_text="e.g. OMDB", width=200, border_radius=16, filled=True)
     cal_flight_time_tf = ft.TextField(label="Flight time", hint_text="e.g. 6h 20m", width=200, border_radius=16, filled=True)
     cal_notes_tf = ft.TextField(label="Notes", multiline=True, min_lines=3, max_lines=5, border_radius=16, filled=True, expand=True)
     cal_form_message = ft.Text("Add a planned flight or edit flight details.", size=12, color="#8B0000")
@@ -6030,8 +6393,8 @@ def main(page: ft.Page):
         options=[
             ft.dropdown.Option("Most recent date"),
             ft.dropdown.Option("Oldest date"),
-            ft.dropdown.Option("Longest flight time"),
-            ft.dropdown.Option("Shortest flight time"),
+            ft.dropdown.Option("Highest landing G"),
+            ft.dropdown.Option("Lowest landing G"),
         ],
         width=220,
         border_radius=16,
@@ -6055,7 +6418,7 @@ def main(page: ft.Page):
     takeoff_wind_dir_tf = ft.TextField(label="Wind dir (deg)", value="0", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     takeoff_wind_speed_tf = ft.TextField(label="Wind speed (kt)", value="0", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     takeoff_wind_gust_tf = ft.TextField(label="Gust (kt)", value="0", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    takeoff_metar_status_text = ft.Text("Enter a departure ICAO or fetch METAR.", size=12, color=tokens["muted"])
+    takeoff_metar_status_text = ft.Text("", size=12, color=tokens["muted"])
     takeoff_raw_metar_tf = ft.TextField(label="Raw METAR", value="", width=684, multiline=True, min_lines=2, max_lines=4, read_only=True, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
 
     takeoff_runway_heading_tf = ft.TextField(label="Runway heading (deg)", value="0", width=180, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
@@ -6097,12 +6460,12 @@ def main(page: ft.Page):
     takeoff_margin_text = ft.Text("Runway margins: —", size=12, color=tokens["text"])
     takeoff_climb_initial_text = ft.Text("Initial: —", size=24, weight=ft.FontWeight.W_900, color=tokens["accent"])
     takeoff_climb_enroute_text = ft.Text("Enroute: —", size=24, weight=ft.FontWeight.W_900, color=tokens["accent"])
-    takeoff_climb_high_text = ft.Text("High Alt: —", size=24, weight=ft.FontWeight.W_900, color=tokens["accent"])
+    takeoff_climb_high_text = ft.Text("High altitude: —", size=24, weight=ft.FontWeight.W_900, color=tokens["accent"])
 
-    takeoff_route_distance_tf = ft.TextField(label="Route distance (NM, editable)", value="", width=240, border_radius=16, filled=True, bgcolor=tokens["input_bg"], hint_text="Auto-filled. Edit to override.")
-    takeoff_fuel_passengers_tf = ft.TextField(label="Passenger count", value="", width=170, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    takeoff_fuel_baggage_tf = ft.TextField(label="Baggage total (kg)", value="", width=190, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    takeoff_fuel_cargo_tf = ft.TextField(label="Cargo total (kg)", value="", width=180, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    takeoff_route_distance_tf = ft.TextField(label="Route distance (NM)", value="", width=158, border_radius=16, filled=True, bgcolor=tokens["input_bg"], hint_text="Editable")
+    takeoff_fuel_passengers_tf = ft.TextField(label="Passengers", value="", width=142, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    takeoff_fuel_baggage_tf = ft.TextField(label="Baggage (kg)", value="", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    takeoff_fuel_cargo_tf = ft.TextField(label="Cargo (kg)", value="", width=142, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     takeoff_cruise_gs_tf = ft.TextField(label="Cruise GS (kt)", value="", width=170, border_radius=16, filled=True, bgcolor=tokens["input_bg"], visible=False)
     takeoff_fuel_units_dd = ft.Dropdown(label="Display units", value="kg", options=[ft.dropdown.Option("kg"), ft.dropdown.Option("lb")], width=160, border_radius=16, filled=True, bgcolor=tokens["input_bg"], visible=False)
     takeoff_taxi_fuel_tf = ft.TextField(label="Taxi fuel", value="", width=160, border_radius=16, filled=True, bgcolor=tokens["input_bg"], visible=False)
@@ -6114,9 +6477,10 @@ def main(page: ft.Page):
     takeoff_fuel_aircraft_text = ft.Text("Selected aircraft: —", size=13, weight=ft.FontWeight.W_700, color=tokens["text"])
     takeoff_fuel_engine_text = ft.Text("Active route: —", size=12, color=tokens["text"])
     takeoff_fuel_assumptions_text = ft.Text("Model: route fuel from published range and fuel capacity • taxi 500 kg • passenger weight 84 kg • Jet fuel density 0.80 kg/L • safety margin 5%", size=12, color=tokens["muted"])
-    takeoff_fuel_status_text = ft.Text("Set departure, destination, aircraft, passengers, baggage, and cargo.", size=12, color=tokens["muted"])
+    takeoff_fuel_status_text = ft.Text("Set departure, arrival, aircraft, passengers, baggage, and cargo.", size=12, color=tokens["muted"])
     takeoff_trip_fuel_text = ft.Text("Base trip fuel: —", size=12, color=tokens["text"])
-    takeoff_block_fuel_text = ft.Text("Planned fuel: —", size=12, color=tokens["text"])
+    takeoff_block_fuel_text = ft.Text("— L  /  — kg", size=28, weight=ft.FontWeight.W_900, color=tokens["accent"])
+    takeoff_fuel_limits_text = ft.Text("", size=12, color=tokens["text"])
     takeoff_ete_text = ft.Text("Flight time: —", size=12, color=tokens["text"])
     takeoff_burn_rate_text = ft.Text("Actual payload: —", size=12, color=tokens["text"])
     takeoff_fuel_breakdown_text = ft.Text("Phase split: —", size=12, color=tokens["text"])
@@ -6141,7 +6505,7 @@ def main(page: ft.Page):
     landing_wind_dir_tf = ft.TextField(label="Wind dir (deg)", value="0", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     landing_wind_speed_tf = ft.TextField(label="Wind speed (kt)", value="0", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     landing_wind_gust_tf = ft.TextField(label="Gust (kt)", value="0", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    landing_metar_status_text = ft.Text("Enter an arrival ICAO or fetch METAR.", size=12, color=tokens["muted"])
+    landing_metar_status_text = ft.Text("", size=12, color=tokens["muted"])
     landing_raw_metar_tf = ft.TextField(label="Raw METAR", value="", width=684, multiline=True, min_lines=2, max_lines=4, read_only=True, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
 
     landing_aircraft_display_text = ft.Text(current_aircraft_label(), color=tokens["text"], weight=ft.FontWeight.W_700)
@@ -6185,6 +6549,7 @@ def main(page: ft.Page):
     landing_vs_text = ft.Text("Vs landing: —", size=28, weight=ft.FontWeight.W_900, color=tokens["accent"])
     landing_vref_text = ft.Text("Vref: —", size=28, weight=ft.FontWeight.W_900, color=tokens["accent"])
     landing_vapp_text = ft.Text("Vapp: —", size=28, weight=ft.FontWeight.W_900, color=tokens["accent"])
+    landing_additive_text = ft.Text(size=13, weight=ft.FontWeight.W_700, color=tokens["muted"], visible=False)
     landing_weight_ratio_text = ft.Text("Weight ratio: —", size=12, color=tokens["text"])
 
     landing_altitude_to_lose_text = ft.Text("Altitude to lose: —", size=12, color=tokens["text"])
@@ -6204,8 +6569,8 @@ def main(page: ft.Page):
         spacing=8,
         controls=[ft.Text("No active alerts.", size=12, color=tokens["muted"])],
     )
-    landing_vs_calc_altitude_tf = ft.TextField(label="V/S calc altitude to lose (ft)", value="", width=220, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    landing_vs_calc_ete_tf = ft.TextField(label="V/S calc ETE (min)", value="", width=180, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    landing_vs_calc_altitude_tf = ft.TextField(label="Altitude to lose (ft)", value="", width=164, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    landing_vs_calc_ete_tf = ft.TextField(label="ETE (min)", value="", width=148, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     landing_vs_calc_result_text = ft.Text("Required V/S: —", size=28, weight=ft.FontWeight.W_900, color=tokens["accent"])
     landing_vs_calc_alt_tf = landing_vs_calc_altitude_tf
 
@@ -6228,31 +6593,44 @@ def main(page: ft.Page):
         bgcolor=tokens["input_bg"],
     )
     seat_first_tf = ft.TextField(label="First seats", value="0", width=160, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    seat_business_tf = ft.TextField(label="Business seats", value="32", width=170, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    seat_premium_tf = ft.TextField(label="Premium Economy seats", value="28", width=220, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
-    seat_economy_tf = ft.TextField(label="Economy seats", value="226", width=180, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    seat_business_tf = ft.TextField(label="Business seats", value="0", width=170, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    seat_premium_tf = ft.TextField(label="Premium Economy seats", value="0", width=176, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
+    seat_economy_tf = ft.TextField(label="Economy seats", value="0", width=160, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
 
     seat_fill_first_tf = ft.TextField(label="Fill First", value="0", width=150, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     seat_fill_business_tf = ft.TextField(label="Fill Business", value="0", width=160, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     seat_fill_premium_tf = ft.TextField(label="Fill Premium", value="0", width=170, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
     seat_fill_economy_tf = ft.TextField(label="Fill Economy", value="0", width=160, border_radius=16, filled=True, bgcolor=tokens["input_bg"])
 
-    seat_status_text = ft.Text("Select airline, aircraft, and seat counts. Then generate the map.", size=13, weight=ft.FontWeight.W_600)
+    seat_capacity_fields = (seat_first_tf, seat_business_tf, seat_premium_tf, seat_economy_tf)
+    seat_fill_fields = dict(zip(CABIN_ORDER, (seat_fill_first_tf, seat_fill_business_tf, seat_fill_premium_tf, seat_fill_economy_tf)))
+    seat_initial_message = "Select airline, aircraft, and seat counts. Then generate the map."
+    seat_status_text = ft.Text(seat_initial_message, size=13, weight=ft.FontWeight.W_600)
     seat_summary_title = ft.Text("No seat map generated yet.", size=14, weight=ft.FontWeight.W_700, color=tokens["text"])
     seat_total_stat = ft.Text("Total seats: —", size=12, color=tokens["text"])
     seat_occupied_stat = ft.Text("Occupied seats: —", size=12, color=tokens["text"])
     seat_available_stat = ft.Text("Available seats: —", size=12, color=tokens["text"])
     seat_breakdown_stat = ft.Text("Breakdown: —", size=12, color=tokens["muted"])
 
-    seat_map_host = ft.Container(
-        padding=0,
-        bgcolor=ft.Colors.TRANSPARENT,
-        content=glass_card_with_background(
+    def empty_seat_map():
+        return glass_card_with_background(
             "Seat Map",
             ft.Text("Generate a seat map to see the cabin overview here.", color=tokens["muted"]),
             bg_key="seat_map",
-        ),
+        )
+
+    seat_map_host = ft.Container(padding=0, bgcolor=ft.Colors.TRANSPARENT, content=empty_seat_map())
+
+    seat_map_scroll = ft.Column(
+        [seat_map_host], scroll=ft.ScrollMode.AUTO, spacing=GAP,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
+
+    def set_seat_status(message, *, error=False):
+        seat_status_text.value = message
+        seat_status_text.tooltip = message
+        seat_status_text.data = error
+        seat_status_text.color = ("#A9291C" if use_daylight_cards() else "#FFB4A8") if error else tokens["muted"]
 
     seat_model = {
         "generated": False,
@@ -6264,6 +6642,7 @@ def main(page: ft.Page):
         "totals": {},
     }
     seat_passenger_load_host = ft.Container()
+    highlighted_seat_ids = set()
 
     def sync_input_colors():
         for ctrl in [
@@ -6272,6 +6651,7 @@ def main(page: ft.Page):
             bag_carry_on_tf,
             bag_category_dd,
             bag_checked_kg_per_pax_tf,
+            cargo_weight_tf,
             bag_two_bag_percent_tf,
             bag_per_bag_kg_tf,
             cal_date_tf,
@@ -6382,14 +6762,15 @@ def main(page: ft.Page):
                 pass
         bag_info_text.color = tokens["muted"]
         danger_color = "#FF8080" if (page.theme_mode == ft.ThemeMode.DARK or bool(state.airline)) else "#B3261E"
-        bag_status_text.color = danger_color
+        bag_status_text.color = danger_color if bag_status_text.data else tokens["muted"]
         cal_form_message.color = danger_color
         cal_route_preview.color = tokens["muted"]
         takeoff_metar_status_text.color = tokens["muted"]
+        takeoff_fuel_status_text.color = tokens["muted"]
         takeoff_status_text.color = danger_color
         landing_metar_status_text.color = tokens["muted"]
         landing_status_text.color = danger_color
-        seat_status_text.color = danger_color
+        set_seat_status(seat_status_text.value, error=bool(seat_status_text.data))
         seat_summary_title.color = tokens["text"]
         seat_total_stat.color = tokens["text"]
         seat_occupied_stat.color = tokens["text"]
@@ -6402,6 +6783,8 @@ def main(page: ft.Page):
         
         for ctrl in [
             bag_mode_result_text,
+            bag_baggage_weight_summary_text,
+            bag_cargo_weight_summary_text,
             bag_passengers_result_text,
             bag_carry_on_result_text,
             bag_checked_result_text,
@@ -6422,7 +6805,7 @@ def main(page: ft.Page):
             takeoff_headwind_text,
             takeoff_crosswind_text,
             takeoff_trip_fuel_text,
-            takeoff_block_fuel_text,
+            takeoff_fuel_limits_text,
             takeoff_fuel_ete_text,
             takeoff_fuel_burn_text,
             takeoff_fuel_breakdown_text,
@@ -6452,6 +6835,7 @@ def main(page: ft.Page):
         ]:
             ctrl.color = tokens["text"]
         for ctrl in [
+            takeoff_block_fuel_text,
             takeoff_vs_text,
             takeoff_v1_text,
             takeoff_vr_text,
@@ -6466,13 +6850,14 @@ def main(page: ft.Page):
         ]:
             ctrl.color = tokens["accent"]
         bag_total_weight_text.color = tokens["accent"]
+        bag_payload_weight_summary_text.color = tokens["accent"]
         refresh_seat_widget_styles(update_page=False)
 
     def default_checked_baggage_for_category(category: Optional[str]) -> float:
         return BAGGAGE_STANDARD_DEFAULTS.get(category or "", BAGGAGE_STANDARD_DEFAULTS["Within the European region"])
 
     def apply_baggage_category_default():
-        bag_checked_kg_per_pax_tf.value = f"{default_checked_baggage_for_category(bag_category_dd.value):.1f}".rstrip("0").rstrip(".")
+        bag_checked_kg_per_pax_tf.value = "0"
 
     def reset_baggage_result_display():
         bag_total_weight_text.value = "TOTAL baggage: —"
@@ -6504,13 +6889,8 @@ def main(page: ft.Page):
 
     def populate_calendar_aircraft_dropdown(airline_name: Optional[str] = None, preferred: Optional[str] = None):
         airline_name = airline_name or cal_airline_dd.value or state.airline
-        options = all_library_aircraft_names()
-        preferred = canonical_aircraft_name(preferred) or canonical_aircraft_name(state.aircraft) or preferred
-        cal_aircraft_dd.options = [ft.dropdown.Option(a) for a in options]
-        if preferred in options:
-            cal_aircraft_dd.value = preferred
-        else:
-            cal_aircraft_dd.value = None
+        preferred = canonical_aircraft_name(preferred) or canonical_aircraft_name(state.aircraft) or preferred or state.aircraft
+        cal_aircraft_dd.value = preferred or None
 
     def refresh_calendar_route_preview():
         origin = (cal_origin_tf.value or "").strip().upper()
@@ -6524,7 +6904,7 @@ def main(page: ft.Page):
 
     def lookup_airport_elevation_ft(icao: str) -> Optional[int]:
         record = lookup_airport_record(icao)
-        return int(record["elevation_ft"]) if record else None
+        return int(record["elevation_ft"]) if record and record.get("elevation_ft") is not None else None
 
     def populate_takeoff_aircraft_dropdown(airline_name: Optional[str] = None, preferred: Optional[str] = None):
         airline_name = airline_name or state.airline
@@ -6576,12 +6956,10 @@ def main(page: ft.Page):
     def apply_takeoff_departure_state(update_page: bool = True, fill_elevation: bool = False):
         departure = (takeoff_departure_icao_tf.value or "").strip().upper()
         takeoff_departure_icao_tf.value = departure
-        if departure:
-            state.departure = departure
+        state.departure = normalize_airport_code(departure) or ""
         if fill_elevation:
             elev = lookup_airport_elevation_ft(departure)
-            if elev is not None:
-                takeoff_elevation_tf.value = str(elev)
+            takeoff_elevation_tf.value = str(elev) if elev is not None else ""
         if update_page:
             page.update()
 
@@ -6603,7 +6981,7 @@ def main(page: ft.Page):
         takeoff_margin_text.value = "Runway margins: —"
         takeoff_climb_initial_text.value = "Initial: —"
         takeoff_climb_enroute_text.value = "Enroute: —"
-        takeoff_climb_high_text.value = "High Alt: —"
+        takeoff_climb_high_text.value = "High altitude: —"
         takeoff_warning_host.controls = [ft.Text("No active alerts.", size=12, color=tokens["muted"])]
 
     def reset_takeoff_form(update_page: bool = True):
@@ -6624,12 +7002,15 @@ def main(page: ft.Page):
         takeoff_tora_tf.value = ""
         takeoff_toda_tf.value = ""
         takeoff_asda_tf.value = ""
+        performance_metar_requests.pop("departure", None)
         takeoff_raw_metar_tf.value = ""
-        takeoff_metar_status_text.value = "Enter a departure ICAO or fetch METAR."
+        takeoff_metar_status_text.value = ""
         state.route_distance_override_nm = None
         state.route_distance_override_key = ""
         takeoff_route_distance_tf.value = ""
-        takeoff_fuel_passengers_tf.value = ""
+        takeoff_fuel_passengers_tf.value = (
+            str(sum(seat["occupied"] for seat in seat_model["seats"])) if seat_model.get("generated") else ""
+        )
         takeoff_fuel_baggage_tf.value = ""
         takeoff_fuel_cargo_tf.value = ""
         takeoff_cruise_gs_tf.value = ""
@@ -6641,12 +7022,13 @@ def main(page: ft.Page):
         takeoff_extra_fuel_tf.value = "0"
         takeoff_zfw_tf.value = ""
         takeoff_trip_fuel_text.value = "Base trip fuel: —"
-        takeoff_block_fuel_text.value = "Planned fuel: —"
+        takeoff_block_fuel_text.value = "— L  /  — kg"
+        takeoff_fuel_limits_text.value = ""
         takeoff_ete_text.value = "Flight time: —"
         takeoff_burn_rate_text.value = "Actual payload: —"
         takeoff_fuel_breakdown_text.value = "Phase split: —"
         takeoff_recommended_tow_text.value = "Estimated TOW: —"
-        takeoff_fuel_status_text.value = "Set departure, destination, aircraft, passengers, baggage, and cargo."
+        takeoff_fuel_status_text.value = "Set departure, arrival, aircraft, passengers, baggage, and cargo."
         set_takeoff_fuel_defaults(update_page=False)
         if state.aircraft:
             update_takeoff_aircraft_details(update_page=False)
@@ -6658,6 +7040,11 @@ def main(page: ft.Page):
         if update_page:
             page.update()
 
+    def performance_warning_ink(severity):
+        if page.theme_mode == ft.ThemeMode.DARK:
+            return "#FFB7B3" if severity == "warning" else "#FFD782"
+        return "#8B1F20" if severity == "warning" else "#714500"
+
     def render_takeoff_warnings(result: TakeoffResultData):
         controls = []
         for message in result.warnings:
@@ -6666,7 +7053,7 @@ def main(page: ft.Page):
                     padding=ft.padding.symmetric(horizontal=12, vertical=8),
                     border_radius=999,
                     bgcolor=ft.Colors.with_opacity(0.16, ft.Colors.RED),
-                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=ft.Colors.RED_700),
+                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=performance_warning_ink("warning"), data="warning"),
                 )
             )
         for message in result.cautions:
@@ -6675,7 +7062,7 @@ def main(page: ft.Page):
                     padding=ft.padding.symmetric(horizontal=12, vertical=8),
                     border_radius=999,
                     bgcolor=ft.Colors.with_opacity(0.18, ft.Colors.AMBER),
-                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=ft.Colors.AMBER_800),
+                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=performance_warning_ink("caution"), data="caution"),
                 )
             )
         if not controls:
@@ -6730,13 +7117,11 @@ def main(page: ft.Page):
     def apply_landing_arrival_state(update_page: bool = True, fill_elevation: bool = False):
         arrival = (landing_arrival_icao_tf.value or "").strip().upper()
         landing_arrival_icao_tf.value = arrival
-        if arrival:
-            state.arrival = normalize_airport_code(arrival) or arrival
-            landing_arrival_icao_tf.value = state.arrival
+        state.arrival = normalize_airport_code(arrival) or ""
+        landing_arrival_icao_tf.value = state.arrival
         if fill_elevation:
             elev = lookup_airport_elevation_ft(arrival)
-            if elev is not None:
-                landing_elevation_tf.value = str(elev)
+            landing_elevation_tf.value = str(elev) if elev is not None else ""
         sync_route_distance_from_state(update_page=False)
         refresh_takeoff_fuel_info(update_page=False)
         if update_page:
@@ -6751,6 +7136,8 @@ def main(page: ft.Page):
         landing_vs_text.value = "Vs landing: —"
         landing_vref_text.value = "Vref: —"
         landing_vapp_text.value = "Vapp: —"
+        landing_additive_text.value = ""
+        landing_additive_text.visible = False
         landing_weight_ratio_text.value = "Weight ratio: —"
         landing_altitude_to_lose_text.value = "Altitude to lose: —"
         landing_tod_text.value = "TOD distance: —"
@@ -6784,8 +7171,9 @@ def main(page: ft.Page):
         landing_autobrake_dd.value = "MED"
         landing_reverse_sw.value = True
         update_landing_aircraft_details(update_page=False, reset_weight=True)
+        performance_metar_requests.pop("arrival", None)
         landing_raw_metar_tf.value = ""
-        landing_metar_status_text.value = "Enter an arrival ICAO or fetch METAR."
+        landing_metar_status_text.value = ""
         if not state.aircraft:
             landing_status_text.value = "Select an aircraft in Takeoff to begin landing planning."
         reset_landing_result_display()
@@ -6795,7 +7183,7 @@ def main(page: ft.Page):
     def sync_aircraft_across_pages(aircraft_name: Optional[str], update_page: bool = True):
         canonical = canonical_aircraft_name(aircraft_name)
         if not canonical:
-            state.aircraft = ""
+            state.aircraft = str(aircraft_name or "").strip()
             takeoff_aircraft_dd.value = None
             landing_aircraft_dd.value = None
             update_takeoff_aircraft_details(update_page=False)
@@ -6806,6 +7194,8 @@ def main(page: ft.Page):
             return
 
         state.aircraft = canonical
+        if state.aircraft_record and aircraft_value(state.aircraft_record) != canonical:
+            state.aircraft_record = {}
         takeoff_aircraft_dd.value = canonical
         landing_aircraft_dd.value = canonical
         update_takeoff_aircraft_details(update_page=False)
@@ -6822,7 +7212,7 @@ def main(page: ft.Page):
                     padding=ft.padding.symmetric(horizontal=12, vertical=8),
                     border_radius=999,
                     bgcolor=ft.Colors.with_opacity(0.16, ft.Colors.RED),
-                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=ft.Colors.RED_700),
+                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=performance_warning_ink("warning"), data="warning"),
                 )
             )
         for message in result.cautions:
@@ -6831,7 +7221,7 @@ def main(page: ft.Page):
                     padding=ft.padding.symmetric(horizontal=12, vertical=8),
                     border_radius=999,
                     bgcolor=ft.Colors.with_opacity(0.18, ft.Colors.AMBER),
-                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=ft.Colors.AMBER_800),
+                    content=ft.Text(message, size=12, weight=ft.FontWeight.W_700, color=performance_warning_ink("caution"), data="caution"),
                 )
             )
         if not controls:
@@ -6851,36 +7241,44 @@ def main(page: ft.Page):
         else:
             seat_aircraft_dd.value = None
 
-    def apply_seat_template_defaults(aircraft_name: Optional[str] = None):
-        aircraft_name = aircraft_name or seat_aircraft_dd.value or state.aircraft
-        preset = get_aircraft_seat_preset(aircraft_name)
-        defaults = preset.get("defaults", {})
-        seat_first_tf.value = str(defaults.get("First", 0))
-        seat_business_tf.value = str(defaults.get("Business", 0))
-        seat_premium_tf.value = str(defaults.get("Premium Economy", 0))
-        seat_economy_tf.value = str(defaults.get("Economy", 0))
+    def seats_by_cabin():
+        cabins = {cabin: [] for cabin in CABIN_ORDER}
+        for seat in seat_model.get("seats", []):
+            cabins[seat["cabin"]].append(seat)
+        return cabins
 
-    def seat_available_color(cabin: str, occupied: bool) -> str:
-        if occupied:
-            return tokens["accent"]
-        return CABIN_COLORS.get(cabin, tokens["subpanel"])
+    def set_cabin_occupancy(seats, count):
+        occupied = [seat for seat in seats if seat["occupied"]]
+        for seat in occupied[count:]:
+            seat["occupied"] = False
+        if len(occupied) < count:
+            available = [seat for seat in seats if not seat["occupied"]]
+            for seat in available[:count - len(occupied)]:
+                seat["occupied"] = True
 
-    def seat_text_color(cabin: str, occupied: bool) -> str:
+    def sync_fill_target(cabin, old_count, new_count):
+        field = seat_fill_fields[cabin]
+        if (field.value or "").strip() == str(old_count):
+            field.value = str(new_count)
+
+    def seat_available_color(occupied: bool, seat_id: str) -> str:
         if occupied:
-            return ft.Colors.WHITE
-        if cabin == "Economy":
-            return "#374151"
-        return ft.Colors.WHITE
+            return SEAT_RED
+        return SEAT_YELLOW if seat_id in highlighted_seat_ids else SEAT_BLUE
+
+    def seat_text_color(occupied: bool, seat_id: str) -> str:
+        return "#222019" if not occupied and seat_id in highlighted_seat_ids else "#FFFFFF"
+
+    def update_seat_artwork(seat):
+        refs = seat_model.get("seat_controls", {}).get(seat["id"])
+        if refs:
+            back, label = refs
+            back.bgcolor = seat_available_color(seat["occupied"], seat["id"])
+            label.color = seat_text_color(seat["occupied"], seat["id"])
 
     def refresh_seat_widget_styles(update_page: bool = True):
         for seat in seat_model.get("seats", []):
-            refs = seat_model.get("seat_controls", {}).get(seat["id"])
-            if not refs:
-                continue
-            container, text = refs
-            container.bgcolor = seat_available_color(seat["cabin"], seat["occupied"])
-            container.border = ft.border.all(1, tokens["card_border"])
-            text.color = seat_text_color(seat["cabin"], seat["occupied"])
+            update_seat_artwork(seat)
         if seat_model.get("generated") and update_page:
             page.update()
 
@@ -6900,11 +7298,10 @@ def main(page: ft.Page):
         seat_available_stat.value = f"Available seats: {available}"
         seat_breakdown_stat.value = "Breakdown: " + (", ".join(breakdown_parts) if breakdown_parts else "—")
 
-        bag_pax_tf.value = str(occupied)
-
         if seat_model.get("generated"):
-            aircraft_name = canonical_aircraft_name(seat_model.get("aircraft")) or seat_model.get("aircraft") or current_aircraft_label()
-            seat_passenger_load_host.content = build_passenger_load_panel(aircraft_name)
+            bag_pax_tf.value = str(occupied)
+            takeoff_fuel_passengers_tf.value = str(occupied)
+            seat_passenger_load_host.content = build_passenger_load_panel()
             if update_page:
                 safe_update_control(seat_passenger_load_host)
 
@@ -6914,42 +7311,15 @@ def main(page: ft.Page):
     def toggle_seat_occupancy(seat_id: str):
         for seat in seat_model.get("seats", []):
             if seat["id"] == seat_id:
+                cabin = seat["cabin"]
+                old_count = sum(s["occupied"] for s in seats_by_cabin()[cabin])
                 seat["occupied"] = not seat["occupied"]
-                refs = seat_model.get("seat_controls", {}).get(seat_id)
-                if refs:
-                    container, text = refs
-                    container.bgcolor = seat_available_color(seat["cabin"], seat["occupied"])
-                    text.color = seat_text_color(seat["cabin"], seat["occupied"])
-                seat_status_text.value = f"Toggled seat {seat_id}."
+                sync_fill_target(cabin, old_count, old_count + (1 if seat["occupied"] else -1))
+                update_seat_artwork(seat)
+                set_seat_status(f"Toggled seat {seat_id}.")
                 update_seat_summary(update_page=False)
                 page.update()
                 return
-
-    def build_seat_control(seat: dict) -> ft.Control:
-        seat_text = ft.Text(seat["label"], size=10, weight=ft.FontWeight.W_700, color=seat_text_color(seat["cabin"], seat["occupied"]))
-        seat_box = ft.Container(
-            width=28,
-            height=28,
-            border_radius=9,
-            alignment=ft.Alignment(0, 0),
-            bgcolor=seat_available_color(seat["cabin"], seat["occupied"]),
-            border=ft.border.all(1, tokens["card_border"]),
-            content=seat_text,
-            tooltip=f"{seat['id']} • {seat['cabin']}",
-        )
-        seat_model["seat_controls"][seat["id"]] = (seat_box, seat_text)
-        return ft.GestureDetector(
-            mouse_cursor=ft.MouseCursor.CLICK,
-            on_tap=lambda e, seat_id=seat["id"]: toggle_seat_occupancy(seat_id),
-            content=seat_box,
-        )
-
-    def make_blank_seat() -> ft.Control:
-        return ft.Container(width=28, height=28)
-
-
-    def make_aisle_gap() -> ft.Control:
-        return ft.Container(width=18, height=28)
 
     def seat_groups_from_layout(layout: List[int]) -> List[List[str]]:
         if not layout:
@@ -6981,14 +7351,14 @@ def main(page: ft.Page):
     def flatten_seat_groups(groups: List[List[str]]) -> List[str]:
         return [seat for group in groups for seat in group]
 
-    def build_digital_seat_rows(counts: Dict[str, int], preset: Dict, start_row: int = 0, deck_prefix: str = "", deck_label: str = "") -> List[Dict]:
+    def build_digital_seat_rows(counts: Dict[str, int], preset: Dict, start_row: int = 0, deck_prefix: str = "", deck_label: str = "", *, single_aisle=False) -> List[Dict]:
         rows = []
         row_number = start_row
         for cabin in CABIN_ORDER:
             count = max(0, int(counts.get(cabin, 0)))
             layout = preset.get("layouts", {}).get(cabin)
             if cabin == "First" and count > 0 and not layout:
-                layout = [1, 2, 1]
+                layout = [1, 1] if single_aisle else [1, 2, 1]
             if count <= 0 or not layout:
                 continue
             groups = seat_groups_from_layout(layout)
@@ -7003,158 +7373,105 @@ def main(page: ft.Page):
                 rows.append({"row": row_number, "cabin": cabin, "groups": groups, "existing_seats": seat_order[:remainder], "deck": deck_label, "deck_prefix": deck_prefix})
         return rows
 
-    def build_seat_control_small(seat: dict) -> ft.Control:
-        seat_text = ft.Text(seat["label"], size=8, weight=ft.FontWeight.W_800, color=seat_text_color(seat["cabin"], seat["occupied"]))
-        seat_box = ft.Container(
-            width=24,
-            height=24,
-            border_radius=7,
-            alignment=ft.Alignment(0, 0),
-            bgcolor=seat_available_color(seat["cabin"], seat["occupied"]),
-            border=ft.border.all(1, ft.Colors.with_opacity(0.75, tokens["card_border"])),
-            content=seat_text,
-            tooltip=f"{seat['id']} • {seat['cabin']}",
-        )
-        seat_model["seat_controls"][seat["id"]] = (seat_box, seat_text)
-        return ft.GestureDetector(
-            mouse_cursor=ft.MouseCursor.CLICK,
-            on_tap=lambda e, seat_id=seat["id"]: toggle_seat_occupancy(seat_id),
-            content=seat_box,
-        )
+    def build_seat_diagram(rows, *, single_aisle):
+        def make_seat(row, letter, width, height, highlighted):
+            row_number = row["row"]
+            deck = row.get("deck_prefix", "")
+            label = f"{row_number}{letter}"
+            seat_id = f"{deck}{row_number:02d}{letter}" if deck else label
+            seat = {
+                "id": seat_id, "row": row_number, "label": letter, "cabin": row["cabin"],
+                "occupied": False, "deck": row.get("deck", ""),
+            }
+            if highlighted:
+                highlighted_seat_ids.add(seat_id)
+            seat_model["seats"].append(seat)
+            async def toggle(e):
+                toggle_seat_occupancy(seat_id)
 
-    def cabin_class_label(cabin: str) -> str:
-        return "Premium\nEconomy" if cabin == "Premium Economy" else cabin
+            seat_view, back, text = seat_artwork(
+                label, seat["cabin"], width, height,
+                seat_available_color(seat["occupied"], seat_id),
+                seat_text_color(seat["occupied"], seat_id),
+                f"{seat_id} · {seat['cabin']}",
+                toggle,
+            )
+            seat_model["seat_controls"][seat_id] = (back, text)
+            return seat_view
 
-    def build_seat_row_visual(row: Dict, last_cabin: str = None) -> ft.Control:
-        row_controls = [
-            ft.Container(
-                width=72,
-                alignment=ft.Alignment(-1, 0),
-                content=ft.Text(cabin_class_label(row["cabin"]) if row["cabin"] != last_cabin else "", size=10, weight=ft.FontWeight.W_800, color=tokens["muted"]),
-            ),
-            ft.Container(
-                width=34,
-                alignment=ft.Alignment(1, 0),
-                content=ft.Text(f"{row['row']:02d}", size=10, weight=ft.FontWeight.W_800, color=tokens["muted"]),
-            ),
-        ]
-        existing = set(row["existing_seats"])
-        for block_index, group in enumerate(row["groups"]):
-            for letter in group:
-                if letter in existing:
-                    seat_id = f"{row['deck_prefix']}{row['row']:02d}{letter}" if row.get("deck_prefix") else f"{row['row']}{letter}"
-                    seat = {
-                        "id": seat_id,
-                        "row": row["row"],
-                        "label": letter,
-                        "cabin": row["cabin"],
-                        "occupied": False,
-                        "deck": row.get("deck", ""),
-                    }
-                    seat_model["seats"].append(seat)
-                    row_controls.append(build_seat_control_small(seat))
-                else:
-                    row_controls.append(ft.Container(width=24, height=24, border_radius=7, bgcolor="#2A3034", border=ft.border.all(1, ft.Colors.with_opacity(0.5, tokens["card_border"]))))
-            if block_index < len(row["groups"]) - 1:
-                row_controls.append(ft.Container(width=34, height=24))
-        return ft.Row(spacing=6, alignment=ft.MainAxisAlignment.CENTER, vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=row_controls)
+        return cabin_diagram(rows, make_seat, single_aisle=single_aisle)
 
-    def build_cabin_body_panel(rows: List[Dict], title: str = "Main Deck") -> ft.Control:
-        controls = []
-        last_cabin = None
-        for row in rows:
-            controls.append(build_seat_row_visual(row, last_cabin))
-            last_cabin = row["cabin"]
-        if not controls:
-            controls = [ft.Text("No cabin rows generated.", color=tokens["muted"])]
-        return ft.Container(
-            padding=ft.padding.symmetric(horizontal=18, vertical=16),
-            border_radius=22,
-            bgcolor="#151A1D",
-            border=ft.border.all(1, "#2B343A"),
-            content=ft.Column(
-                spacing=10,
-                controls=[
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        controls=[
-                            ft.Text(title, size=16, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                            ft.Text("Click seats to toggle passenger fill", size=11, color=tokens["muted"]),
-                        ],
-                    ),
-                    ft.Divider(height=8, opacity=0.10),
-                    ft.Column(spacing=8, controls=controls),
-                ],
-            ),
-        )
-
-    def build_cabin_legend() -> ft.Control:
-        legend_items = []
-        for cabin in CABIN_ORDER:
-            legend_items.append(
+    def build_cabin_legend():
+        return ft.Row(
+            wrap=True, spacing=12, run_spacing=5, alignment=ft.MainAxisAlignment.CENTER,
+            controls=[
                 ft.Row(
-                    spacing=10,
+                    tight=True, spacing=5,
                     controls=[
-                        ft.Container(width=24, height=24, border_radius=7, bgcolor=CABIN_COLORS[cabin], border=ft.border.all(1, "#D7DEE6")),
-                        ft.Text(cabin, size=11, color=tokens["muted"], weight=ft.FontWeight.W_600),
+                        ft.Container(width=12, height=12, border_radius=3, bgcolor=color),
+                        ft.Text(label, size=11, color=tokens["muted"]),
                     ],
                 )
-            )
-        legend_items.append(
-            ft.Row(
-                spacing=10,
-                controls=[
-                    ft.Container(width=24, height=24, border_radius=7, bgcolor=tokens["accent"], border=ft.border.all(1, tokens["accent"])),
-                    ft.Text("Filled passenger seat", size=11, color=tokens["muted"], weight=ft.FontWeight.W_600),
-                ],
-            )
-        )
-        return ft.Container(
-            width=320,
-            padding=18,
-            border_radius=22,
-            bgcolor=tokens["subpanel"],
-            border=ft.border.all(1, tokens["card_border"]),
-            content=ft.Column(spacing=12, controls=[ft.Text("Legend", size=16, weight=ft.FontWeight.W_800, color=tokens["text"]), *legend_items]),
+                for label, color in (
+                    ("Available", SEAT_BLUE),
+                    ("Bulkhead or exit row", SEAT_YELLOW),
+                    ("Occupied", SEAT_RED),
+                )
+            ],
         )
 
-    def build_passenger_load_panel(aircraft_name: str) -> ft.Control:
-        capacity = {cabin: sum(1 for seat in seat_model.get("seats", []) if seat.get("cabin") == cabin) for cabin in CABIN_ORDER}
-        occupied = {cabin: sum(1 for seat in seat_model.get("seats", []) if seat.get("cabin") == cabin and seat.get("occupied")) for cabin in CABIN_ORDER}
+    def build_passenger_load_panel() -> ft.Control:
+        cabins = seats_by_cabin()
+        capacity = {cabin: len(seats) for cabin, seats in cabins.items()}
+        occupied = {cabin: sum(seat["occupied"] for seat in seats) for cabin, seats in cabins.items()}
         total_capacity = sum(capacity.values())
         total_occupied = sum(occupied.values())
         payload_kg = total_occupied * STANDARD_PASSENGER_WEIGHT_KG
         load_factor = 0 if total_capacity == 0 else total_occupied / total_capacity * 100
-        rows = []
-        for cabin in CABIN_ORDER:
-            rows.append(
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        cabin_totals = []
+        for cabin, label in zip(CABIN_ORDER, ("First", "Business", "Premium", "Economy")):
+            total = f"{occupied[cabin]}/{capacity[cabin]}"
+            cabin_totals.append(ft.Container(
+                expand=True, tooltip=f"{cabin}: {total} seats",
+                content=ft.Column(
+                    spacing=1,
                     controls=[
-                        ft.Text(cabin, size=11, color=tokens["muted"]),
-                        ft.Text(f"{occupied[cabin]} / {capacity[cabin]}", size=11, color=tokens["text"], weight=ft.FontWeight.W_800),
+                        ft.Text(label, size=12, color=tokens["muted"], no_wrap=True),
+                        ft.Text(total, size=13, weight=ft.FontWeight.W_700, color=tokens["text"],
+                                no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
                     ],
-                )
-            )
-        return ft.Container(
-            width=320,
-            padding=18,
-            border_radius=22,
-            bgcolor=tokens["subpanel"],
-            border=ft.border.all(1, tokens["card_border"]),
-            content=ft.Column(
-                spacing=12,
+                ),
+            ))
+        card = glass_card(
+            "Passenger Load",
+            ft.Column(
+                spacing=4,
                 controls=[
-                    ft.Text("Passenger Load", size=16, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                    ft.Text(aircraft_name, size=11, color=tokens["muted"]),
-                    *rows,
-                    ft.Divider(height=8, opacity=0.12),
-                    ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[ft.Text("Passenger total", size=11, color=tokens["muted"]), ft.Text(f"{total_occupied} / {total_capacity}", size=12, color=tokens["text"], weight=ft.FontWeight.W_800)]),
-                    ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[ft.Text("Load factor", size=11, color=tokens["muted"]), ft.Text(f"{load_factor:.1f}%", size=12, color=tokens["accent"], weight=ft.FontWeight.W_800)]),
-                    ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[ft.Text("Passenger payload", size=11, color=tokens["muted"]), ft.Text(f"{payload_kg:,.0f} kg", size=12, color="#D88A42", weight=ft.FontWeight.W_800)]),
+                    ft.Row(cabin_totals, spacing=4),
+                    ft.Divider(height=3, opacity=0.15),
+                    ft.Row(
+                        [
+                            ft.Text(f"{total_occupied} / {total_capacity} passengers", size=13, weight=ft.FontWeight.W_700,
+                                    color=tokens["text"], expand=True, no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                            ft.Text(f"{payload_kg:,.0f} kg", size=13, color=tokens["text"], no_wrap=True,
+                                    tooltip="Passenger payload"),
+                        ],
+                        spacing=4,
+                    ),
                 ],
             ),
         )
+        card.content.controls[0] = ft.Row(
+            [
+                card.content.controls[0],
+                ft.Text(f"{load_factor:.1f}%", size=14, weight=ft.FontWeight.W_800, color=tokens["accent"],
+                        tooltip="Load factor"),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+        card.padding = 8
+        card.content.spacing = 4
+        return card
 
     def build_cabin_distribution_panel() -> ft.Control:
         capacity = {cabin: sum(1 for seat in seat_model.get("seats", []) if seat.get("cabin") == cabin) for cabin in CABIN_ORDER}
@@ -7181,7 +7498,7 @@ def main(page: ft.Page):
         return ft.Container(
             padding=18,
             border_radius=22,
-            bgcolor=tokens["subpanel"],
+            bgcolor=surface_fill(tokens["subpanel"]),
             border=ft.border.all(1, tokens["card_border"]),
             content=ft.Column(spacing=14, controls=[
                 ft.Text("Cabin Distribution", size=16, weight=ft.FontWeight.W_800, color=tokens["text"]),
@@ -7190,304 +7507,107 @@ def main(page: ft.Page):
             ]),
         )
 
-    def build_digital_seat_map(airline_name: str, aircraft_name: str, counts: Dict[str, int], preset: Dict) -> ft.Control:
+    def build_digital_seat_map(aircraft_name: str, counts: Dict[str, int], preset: Dict, *, restoring=False) -> ft.Control:
+        previous_cabins = seats_by_cabin()
         seat_model["seats"] = []
         seat_model["seat_controls"] = {}
+        highlighted_seat_ids.clear()
 
-        def seat_dashboard_metric(label: str, value: str, subtitle: str = "") -> ft.Control:
-            return ft.Container(
-                width=150,
-                height=90,
-                padding=12,
-                border_radius=18,
-                bgcolor=tokens["subpanel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                content=ft.Column(
-                    spacing=4,
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    controls=[
-                        ft.Text(label, size=10, color=tokens["muted"]),
-                        ft.Text(value, size=18, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                        ft.Text(subtitle, size=9, color=tokens["muted"]),
-                    ],
-                ),
-            )
-
-        header = ft.Row(
-            alignment=ft.MainAxisAlignment.START,
-            controls=[
-                ft.Row(spacing=12, controls=[
-                    seat_dashboard_metric("Capacity", f"{sum(counts.values())}", "configured seats"),
-                    seat_dashboard_metric("Filled", "0", "passengers"),
-                    seat_dashboard_metric("Payload", "0 kg", "passenger weight"),
-                ]),
-            ],
-        )
-
-        def side_payload_card(title: str, controls: List[ft.Control], bg_key: Optional[str] = None) -> ft.Control:
-            background_src = card_background_src(bg_key) if bg_key else None
-            return ft.Container(
-                width=320,
-                padding=16,
-                border_radius=22,
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=ft.Colors.TRANSPARENT if background_src else tokens["subpanel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                image=ft.DecorationImage(src=background_src, fit=ft.BoxFit.COVER, opacity=0.26) if background_src else None,
-                content=ft.Column(
-                    spacing=10,
-                    controls=[
-                        ft.Text(title, size=16, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                        ft.Divider(height=8, opacity=0.12),
-                        *controls,
-                    ],
-                ),
-            )
-
-        def calculate_seat_baggage(e):
-            occupied = sum(1 for seat in seat_model.get("seats", []) if seat.get("occupied"))
-            bag_pax_tf.value = str(occupied)
-            do_baggage_calc(e)
-
-        def reset_seat_baggage(e):
-            reset_baggage_form(e)
-            occupied = sum(1 for seat in seat_model.get("seats", []) if seat.get("occupied"))
-            bag_pax_tf.value = str(occupied)
-            page.update()
-
-        bag_pax_tf.read_only = True
-        bag_pax_tf.label = "Filled passengers"
-        bag_pax_tf.width = 250
-        bag_carry_on_tf.width = 250
-        bag_checked_kg_per_pax_tf.width = 250
-        cargo_weight_tf.width = 250
-        bag_pax_tf.value = "0"
-
-        if aircraft_name == "Airbus A380-800":
-            upper_counts = {"First": counts.get("First", 0), "Business": counts.get("Business", 0), "Premium Economy": counts.get("Premium Economy", 0), "Economy": 0}
-            lower_counts = {"First": 0, "Business": 0, "Premium Economy": 0, "Economy": counts.get("Economy", 0)}
+        layouts = [layout for layout in preset.get("layouts", {}).values() if layout]
+        single_aisle = bool(layouts) and all(len(layout) <= 2 for layout in layouts)
+        if canonical_aircraft_name(aircraft_name) == "A380-800":
+            upper_counts = {cabin: count for cabin, count in counts.items() if cabin != "Economy"}
+            lower_counts = {"Economy": counts.get("Economy", 0)}
             upper_rows = build_digital_seat_rows(upper_counts, preset, start_row=0, deck_prefix="U", deck_label="Upper Deck")
             lower_rows = build_digital_seat_rows(lower_counts, preset, start_row=49, deck_prefix="L", deck_label="Lower Deck")
-            cabin_body = ft.Row(
-                spacing=16,
-                vertical_alignment=ft.CrossAxisAlignment.START,
-                controls=[
-                    ft.Container(expand=1, content=build_cabin_body_panel(upper_rows, "Upper Deck")),
-                    ft.Container(expand=1, content=build_cabin_body_panel(lower_rows, "Lower Deck")),
-                ],
-            )
+            deck_rows = {"Upper deck": upper_rows, "Lower deck": lower_rows}
         else:
-            rows = build_digital_seat_rows(counts, preset, start_row=0)
-            cabin_body = build_cabin_body_panel(rows, "Main Deck")
-        seat_passenger_load_host.content = build_passenger_load_panel(aircraft_name)
-        side_panel = ft.Column(
-            spacing=14,
-            controls=[
-                build_cabin_legend(),
-                seat_passenger_load_host,
-                side_payload_card(
-                    "Baggage",
-                    [
-                        ft.Text("Passenger count follows filled seats.", size=12, color=tokens["muted"]),
-                        bag_pax_tf,
-                        bag_carry_on_tf,
-                        bag_checked_kg_per_pax_tf,
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
-                            controls=[
-                                ft.ElevatedButton("Calculate", on_click=calculate_seat_baggage, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                ft.OutlinedButton("Reset", on_click=reset_seat_baggage),
-                            ],
-                        ),
-                        bag_status_text,
-                    ],
-                    "baggage",
-                ),
-                side_payload_card(
-                    "Cargo",
-                    [
-                        ft.Text("Extra hold cargo added to baggage payload.", size=12, color=tokens["muted"]),
-                        cargo_weight_tf,
-                    ],
-                    "cargo",
-                ),
-                side_payload_card(
-                    "Calculated Weight",
-                    [
-                        bag_baggage_weight_summary_text,
-                        bag_cargo_weight_summary_text,
-                        ft.Divider(height=8, opacity=0.12),
-                        bag_payload_weight_summary_text,
-                        ft.Container(
-                            padding=12,
-                            border_radius=14,
-                            bgcolor=tokens["subpanel"],
-                            border=ft.border.all(1, tokens["card_border"]),
-                            content=ft.Column(
-                                spacing=6,
-                                controls=[
-                                    ft.Text("Breakdown", size=12, color=tokens["muted"]),
-                                    bag_carry_on_result_text,
-                                    bag_checked_result_text,
-                                ],
-                            ),
-                        ),
-                    ],
-                    "calculated_weight",
-                ),
-            ],
-        )
+            deck_rows = {"Cabin diagram": build_digital_seat_rows(counts, preset, single_aisle=single_aisle)}
+        panels = {
+            label: ft.Column(
+                spacing=GAP, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[build_cabin_legend(), build_seat_diagram(rows, single_aisle=single_aisle)],
+            )
+            for label, rows in deck_rows.items()
+        }
+
+        for cabin, seats in seats_by_cabin().items():
+            previous = previous_cabins[cabin]
+            old_count = sum(seat["occupied"] for seat in previous)
+            # Keep the same position within each cabin when earlier rows are renumbered.
+            for old_seat, new_seat in zip(previous, seats):
+                new_seat["occupied"] = old_seat["occupied"]
+            new_count = min(old_count, len(seats))
+            set_cabin_occupancy(seats, new_count)
+            if not restoring:
+                sync_fill_target(cabin, old_count, new_count)
+        refresh_seat_widget_styles(update_page=False)
+
+        active_panel = next(iter(panels))
+        panel_host = ft.Container(alignment=ft.Alignment(0, -1), content=panels[active_panel])
+        tabs = ft.Row(wrap=True, spacing=6, run_spacing=6)
+
+        def select_panel(label):
+            nonlocal active_panel
+            if label == active_panel:
+                return
+            active_panel = label
+            panel_host.content = panels[label]
+            update_panel_tabs()
+            prepare_controls(tabs, panel_host)
+            page.update()
+
+        def update_panel_tabs():
+            tabs.controls = [
+                ft.OutlinedButton(
+                    label, style=button_style(tokens, primary=label == active_panel),
+                    on_click=lambda e, target=label: select_panel(target),
+                )
+                for label in panels
+            ]
+
+        update_panel_tabs()
         return ft.Column(
-            spacing=18,
+            spacing=GAP, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             controls=[
                 ft.Row(
-                    spacing=18,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
-                    controls=[ft.Container(expand=1, content=cabin_body), side_panel],
+                    wrap=True, spacing=12, run_spacing=5,
+                    controls=[seat_total_stat, seat_occupied_stat, seat_available_stat],
                 ),
+                *([tabs] if len(panels) > 1 else []),
+                panel_host,
             ],
         )
 
-    def build_seat_legend(counts: Dict[str, int]) -> ft.Control:
-        return ft.Row(
-            wrap=True,
-            spacing=10,
-            controls=[
-                ft.Container(
-                    padding=ft.padding.symmetric(horizontal=10, vertical=6),
-                    border_radius=999,
-                    bgcolor=ft.Colors.with_opacity(0.14, CABIN_COLORS[cabin]),
-                    content=ft.Text(cabin, size=11, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                )
-                for cabin in CABIN_ORDER if counts.get(cabin, 0) > 0
-            ] + [
-                ft.Container(
-                    padding=ft.padding.symmetric(horizontal=10, vertical=6),
-                    border_radius=999,
-                    bgcolor=ft.Colors.with_opacity(0.14, tokens["accent"]),
-                    content=ft.Text("Occupied", size=11, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                )
-            ],
-        )
+    def seat_map_theme_key():
+        return tuple(tokens[name] for name in ("panel", "text", "muted", "card_border"))
 
-    def build_seat_sections(counts: Dict[str, int], preset: Dict, start_row: int = 1, deck_prefix: str = "", deck_label: str = ""):
-        section_controls = []
-        current_row = start_row
-
-        for cabin in CABIN_ORDER:
-            cabin_total = counts.get(cabin, 0)
-            layout = preset.get("layouts", {}).get(cabin)
-            if cabin == "First" and cabin_total > 0 and not layout:
-                layout = [1, 2, 1]
-            if cabin_total <= 0 or not layout:
-                continue
-
-            seats_per_row = sum(layout)
-            row_plan = build_row_seat_plan(cabin_total, seats_per_row)
-            letter_blocks = layout_letter_blocks(layout)
-
-            section_controls.append(
-                ft.Container(
-                    margin=ft.margin.only(top=4, bottom=4),
-                    padding=ft.padding.symmetric(horizontal=12, vertical=8),
-                    border_radius=14,
-                    bgcolor=ft.Colors.with_opacity(0.12, CABIN_COLORS.get(cabin, tokens["accent"])),
-                    content=ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        controls=[
-                            ft.Text(cabin, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                            ft.Text(
-                                f"{cabin_total} seats • layout {'-'.join(str(x) for x in layout)}",
-                                size=11,
-                                color=tokens["muted"],
-                            ),
-                        ],
-                    ),
-                )
-            )
-
-            for row_seat_count in row_plan:
-                row_controls = [
-                    ft.Container(
-                        width=42,
-                        alignment=ft.Alignment(1, 0),
-                        content=ft.Text(f"{current_row:02d}", weight=ft.FontWeight.W_700, color=tokens["text"]),
-                    )
-                ]
-                block_allocations = distribute_seats_across_blocks(layout, row_seat_count)
-
-                for block_index, active_count in enumerate(block_allocations):
-                    visible_letters = choose_letters_for_block(
-                        letter_blocks[block_index],
-                        active_count,
-                        block_index,
-                        len(layout),
-                    )
-
-                    for letter in visible_letters:
-                        seat = {
-                            "id": f"{deck_prefix}{current_row:02d}{letter}" if deck_prefix else f"{current_row}{letter}",
-                            "row": current_row,
-                            "label": letter,
-                            "cabin": cabin,
-                            "occupied": False,
-                            "deck": deck_label,
-                        }
-                        seat_model["seats"].append(seat)
-                        row_controls.append(build_seat_control(seat))
-
-                    if block_index < len(layout) - 1:
-                        row_controls.append(make_aisle_gap())
-
-                section_controls.append(
-                    ft.Row(
-                        spacing=6,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=row_controls,
-                    )
-                )
-                current_row = next_seat_row_number(current_row)
-
-            section_controls.append(ft.Divider(height=10, opacity=0.08))
-
-        if not section_controls:
-            section_controls = [ft.Text("No cabins configured on this deck.", size=12, color=tokens["muted"])]
-        return section_controls, current_row
-
-
-    def build_deck_panel(deck_name: str, counts: Dict[str, int], preset: Dict, start_row: int, deck_prefix: str) -> ft.Control:
-        deck_sections, _ = build_seat_sections(counts, preset, start_row=start_row, deck_prefix=deck_prefix, deck_label=deck_name)
-        return ft.Container(
-            padding=ft.padding.symmetric(horizontal=18, vertical=14),
-            border_radius=20,
-            border=ft.border.all(1, tokens["card_border"]),
-            bgcolor=tokens["subpanel"],
-            content=ft.Column(
-                spacing=8,
-                controls=[
-                    ft.Text(deck_name, size=16, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                    ft.Divider(height=8, opacity=0.08),
-                    *deck_sections,
-                ],
+    def render_seat_map(*, restoring=False):
+        seat_map_host.content = glass_card_with_background(
+            "Seat Map",
+            build_digital_seat_map(
+                seat_model["aircraft"], seat_model["totals"], seat_model["template"], restoring=restoring,
             ),
+            bg_key="seat_map",
         )
+        seat_map_host.data = seat_map_theme_key()
+        prepare_controls(seat_map_host)
 
-    def generate_seat_map(e):
+    async def generate_seat_map(e):
         try:
             first_count = max(0, int((seat_first_tf.value or "0").strip()))
             business_count = max(0, int((seat_business_tf.value or "0").strip()))
             premium_count = max(0, int((seat_premium_tf.value or "0").strip()))
             economy_count = max(0, int((seat_economy_tf.value or "0").strip()))
         except Exception:
-            seat_status_text.value = "Seat counts must be whole numbers."
+            set_seat_status("Seat counts must be whole numbers.", error=True)
             page.update()
             return
 
         airline_name = state.airline or "Generic"
         aircraft_name = canonical_aircraft_name(state.aircraft) or state.aircraft or ""
         if not aircraft_name:
-            seat_status_text.value = "Select an aircraft on the Home page first."
+            set_seat_status("Select an aircraft on the Dashboard first.", error=True)
             page.update()
             return
         preset = get_aircraft_seat_preset(aircraft_name)
@@ -7502,93 +7622,101 @@ def main(page: ft.Page):
         seat_model["airline"] = airline_name
         seat_model["aircraft"] = aircraft_name
         seat_model["template"] = preset
-        seat_model["seats"] = []
-        seat_model["seat_controls"] = {}
         seat_model["totals"] = counts.copy()
 
-        seat_map_host.content = glass_card_with_background(
-            "Seat Map",
-            build_digital_seat_map(airline_name, aircraft_name, counts, preset),
-            bg_key="seat_map",
-        )
+        render_seat_map()
+        bag_pax_tf.read_only = True
+        bag_pax_tf.label = "Filled passengers"
 
         seat_summary_title.value = f"{aircraft_name} seat map generated"
-        if aircraft_name == "Airbus A380-800":
-            seat_status_text.value = "A380 double-deck map generated. Upper deck is on the left. Lower deck is on the right."
+        if canonical_aircraft_name(aircraft_name) == "A380-800":
+            set_seat_status("Seat map generated. Switch between the upper and lower deck above the diagram.")
         else:
-            seat_status_text.value = "Seat map generated. Click seats or use the auto-fill controls below."
-        seat_fill_first_tf.value = str(first_count if first_count <= 8 else 0)
-        seat_fill_business_tf.value = "0"
-        seat_fill_premium_tf.value = "0"
-        seat_fill_economy_tf.value = "0"
+            set_seat_status("Seat map generated. Click seats or use the auto-fill controls below.")
         update_seat_summary(update_page=False)
-        refresh_seat_widget_styles(update_page=False)
         page.update()
 
-    def clear_seat_occupancy(e):
+        try:
+            await seat_map_scroll.scroll_to(offset=0, duration=120)
+        except RuntimeError:
+            # The map can detach while switching tabs or closing the window.
+            pass
+
+    async def clear_seat_occupancy(e):
         if not seat_model.get("generated"):
-            seat_status_text.value = "Generate a seat map first."
+            set_seat_status("Generate a seat map first.", error=True)
             page.update()
             return
-        for seat in seat_model.get("seats", []):
-            seat["occupied"] = False
-            refs = seat_model.get("seat_controls", {}).get(seat["id"])
-            if refs:
-                container, text = refs
-                container.bgcolor = seat_available_color(seat["cabin"], False)
-                text.color = seat_text_color(seat["cabin"], False)
-        seat_status_text.value = "All seat occupancy has been cleared."
+        for cabin, seats in seats_by_cabin().items():
+            old_count = sum(seat["occupied"] for seat in seats)
+            set_cabin_occupancy(seats, 0)
+            sync_fill_target(cabin, old_count, 0)
+        refresh_seat_widget_styles(update_page=False)
+        set_seat_status("All seat occupancy has been cleared.")
         update_seat_summary(update_page=False)
         page.update()
 
-    def auto_fill_seats(e):
+    async def auto_fill_seats(e):
         if not seat_model.get("generated"):
-            seat_status_text.value = "Generate a seat map first."
+            set_seat_status("Generate a seat map first.", error=True)
             page.update()
             return
 
         try:
             requested = {
-                "First": max(0, int((seat_fill_first_tf.value or "0").strip())),
-                "Business": max(0, int((seat_fill_business_tf.value or "0").strip())),
-                "Premium Economy": max(0, int((seat_fill_premium_tf.value or "0").strip())),
-                "Economy": max(0, int((seat_fill_economy_tf.value or "0").strip())),
+                cabin: max(0, int((field.value or "0").strip()))
+                for cabin, field in seat_fill_fields.items()
             }
         except Exception:
-            seat_status_text.value = "Passenger fill values must be whole numbers."
+            set_seat_status("Passenger fill values must be whole numbers.", error=True)
             page.update()
             return
 
-        available_by_cabin = {
-            cabin: sum(1 for seat in seat_model.get("seats", []) if seat.get("cabin") == cabin)
-            for cabin in CABIN_ORDER
-        }
+        cabins = seats_by_cabin()
         for cabin, requested_count in requested.items():
-            if requested_count > available_by_cabin.get(cabin, 0):
-                seat_status_text.value = f"{cabin} fill exceeds the configured seat count."
+            if requested_count > len(cabins[cabin]):
+                set_seat_status(f"{cabin} fill exceeds the configured seat count.", error=True)
                 page.update()
                 return
 
-        for seat in seat_model.get("seats", []):
-            seat["occupied"] = False
+        for cabin, count in requested.items():
+            set_cabin_occupancy(cabins[cabin], count)
+            seat_fill_fields[cabin].value = str(count)
 
-        for cabin in CABIN_ORDER:
-            remaining = requested.get(cabin, 0)
-            for seat in seat_model.get("seats", []):
-                if seat.get("cabin") == cabin and remaining > 0:
-                    seat["occupied"] = True
-                    remaining -= 1
+        refresh_seat_widget_styles(update_page=False)
 
-        for seat in seat_model.get("seats", []):
-            refs = seat_model.get("seat_controls", {}).get(seat["id"])
-            if refs:
-                container, text = refs
-                container.bgcolor = seat_available_color(seat["cabin"], seat["occupied"])
-                text.color = seat_text_color(seat["cabin"], seat["occupied"])
-
-        seat_status_text.value = "Seats filled from your passenger counts."
+        set_seat_status("Seats filled from your passenger counts.")
         update_seat_summary(update_page=False)
         page.update()
+
+    def reset_seat_map():
+        seat_model.clear()
+        seat_model.update({
+            "generated": False,
+            "airline": "",
+            "aircraft": "",
+            "template": get_aircraft_seat_preset(""),
+            "seats": [],
+            "seat_controls": {},
+            "totals": {},
+        })
+        highlighted_seat_ids.clear()
+        set_seat_status(seat_initial_message)
+        seat_summary_title.value = "No seat map generated yet."
+        seat_total_stat.value = "Total seats: —"
+        seat_occupied_stat.value = "Occupied seats: —"
+        seat_available_stat.value = "Available seats: —"
+        seat_breakdown_stat.value = "Breakdown: —"
+        seat_map_host.content = empty_seat_map()
+        seat_passenger_load_host.content = None
+
+    def reset_cabin():
+        for control in (*seat_capacity_fields, *seat_fill_fields.values()):
+            control.value = "0"
+        if seat_model.get("generated"):
+            bag_pax_tf.value = "0"
+            takeoff_fuel_passengers_tf.value = "0"
+        reset_seat_map()
 
     # Seat page reads airline and aircraft from Home. No local seat-page aircraft/airline selection.
     seat_airline_dd.on_change = None
@@ -7602,13 +7730,11 @@ def main(page: ft.Page):
 
     cal_origin_tf.on_change = lambda e: refresh_calendar_route_preview()
     cal_destination_tf.on_change = lambda e: refresh_calendar_route_preview()
-    cal_airline_dd.on_change = lambda e: (populate_calendar_aircraft_dropdown(e.control.value), page.update())
-    log_sort_dd.on_change = lambda e: refresh_ui()
-    cal_sort_dd.on_change = lambda e: refresh_ui()
-    cal_status_filter_dd.on_change = lambda e: refresh_ui()
+    log_sort_dd.on_select = lambda e: refresh_active_page()
+    cal_sort_dd.on_change = lambda e: refresh_active_page()
+    cal_status_filter_dd.on_change = lambda e: refresh_active_page()
     populate_calendar_aircraft_dropdown(state.airline, canonical_aircraft_name(state.aircraft) or state.aircraft)
     populate_seat_aircraft_dropdown(state.airline, canonical_aircraft_name(state.aircraft) or state.aircraft)
-    apply_seat_template_defaults(seat_aircraft_dd.value)
 
     def reset_calendar_form():
         state.calendar_editing_id = None
@@ -7619,6 +7745,7 @@ def main(page: ft.Page):
         populate_calendar_aircraft_dropdown(state.airline, canonical_aircraft_name(state.aircraft) or state.aircraft)
         cal_origin_tf.value = ""
         cal_destination_tf.value = ""
+        planner_records.clear()
         cal_flight_time_tf.value = ""
         cal_notes_tf.value = ""
         cal_form_message.value = "Add a planned flight or edit flight details."
@@ -7736,16 +7863,8 @@ def main(page: ft.Page):
             return [json_safe_value(item) for item in value]
         return str(value)
 
-    def flight_hibernation_elapsed_seconds() -> float:
-        if (
-            bool(getattr(state, "overview_progress_running", False))
-            and isinstance(getattr(state, "overview_takeoff_start_timestamp", None), (int, float))
-        ):
-            return max(0.0, time.time() - float(state.overview_takeoff_start_timestamp))
-        return 0.0
-
     def flight_hibernation_summary() -> Dict[str, object]:
-        route = f"{(state.departure or takeoff_departure_icao_tf.value or 'ORIGIN').strip().upper()} -> {(state.arrival or landing_arrival_icao_tf.value or 'DESTINATION').strip().upper()}"
+        route = f"{(state.departure or takeoff_departure_icao_tf.value or 'DEPARTURE').strip().upper()} -> {(state.arrival or landing_arrival_icao_tf.value or 'ARRIVAL').strip().upper()}"
         return {
             "route": route,
             "airline": state.airline or "No airline selected",
@@ -7778,7 +7897,10 @@ def main(page: ft.Page):
 
         state.airline = ""
         state.aircraft = ""
+        state.aircraft_record = {}
+        state.airline_record = {}
         state.flight_number = ""
+        state.dashboard_flight_plan.clear()
         state.departure = ""
         state.arrival = ""
         state.departure_gate = ""
@@ -7790,12 +7912,30 @@ def main(page: ft.Page):
         state.catering_status = "Not started"
         state.flight_status = "Select an airline"
         state.overview_flight_status_index = 0
-        state.overview_flight_time_minutes = 120
+        state.overview_flight_time_minutes = 0
         state.overview_takeoff_start_timestamp = None
         state.overview_locked_eta_timestamp = None
         state.overview_progress_running = False
+        state.overview_paused_elapsed_seconds = None
         state.overview_calendar_completion_key = ""
-        state.flight_hibernation_menu_open = False
+        state.captain_announcement_language = "English"
+        state.captain_announcement_phase = "departure"
+        state.captain_announcement_text = ""
+        state.captain_departure_announcement_text = ""
+        state.captain_descent_announcement_text = ""
+        state.captain_announcement_cruise_altitude_ft = ""
+        state.captain_announcement_current_altitude_ft = ""
+        state.captain_announcement_generating = False
+        state.takeoff_announcement_expanded = False
+        state.descent_announcement_expanded = False
+        state.takeoff_operations_view = "menu"
+        state.landing_operations_view = "menu"
+        state.checklist_section = "turn_on_aircraft"
+        state.checklist_completed = {}
+        state.takeoff_clock_source = "route"
+        state.landing_clock_source = "route"
+        state.takeoff_clock_menu_open = False
+        state.landing_clock_menu_open = False
         state.route_distance_override_nm = None
         state.route_distance_override_key = ""
         state.ramp_status_phase = "departure"
@@ -7820,54 +7960,19 @@ def main(page: ft.Page):
 
         bag_mode_dd.value = "Standard"
         bag_pax_tf.value = "0"
-        bag_carry_on_tf.value = ""
+        bag_carry_on_tf.value = "0"
         bag_category_dd.value = "Within the European region"
         apply_baggage_category_default()
         cargo_weight_tf.value = "0"
-        bag_two_bag_percent_tf.value = "25"
-        bag_per_bag_kg_tf.value = "23"
+        bag_two_bag_percent_tf.value = "0"
+        bag_per_bag_kg_tf.value = "0"
         refresh_baggage_mode_ui(update_page=False)
         reset_baggage_result_display()
-        bag_status_text.value = "Enter values and click Calculate."
-        bag_status_text.color = "#FF8080" if page.theme_mode == ft.ThemeMode.DARK else "#B3261E"
+        set_baggage_status("Enter values and click Calculate.")
 
         seat_airline_dd.value = None
         seat_aircraft_dd.value = None
-        for control in (
-            seat_first_tf,
-            seat_business_tf,
-            seat_premium_tf,
-            seat_economy_tf,
-            seat_fill_first_tf,
-            seat_fill_business_tf,
-            seat_fill_premium_tf,
-            seat_fill_economy_tf,
-        ):
-            control.value = "0"
-        seat_model.clear()
-        seat_model.update(
-            {
-                "generated": False,
-                "airline": "",
-                "aircraft": "",
-                "template": get_aircraft_seat_preset(""),
-                "seats": [],
-                "seat_controls": {},
-                "totals": {},
-            }
-        )
-        seat_status_text.value = "Select airline, aircraft, and seat counts. Then generate the map."
-        seat_summary_title.value = "No seat map generated yet."
-        seat_total_stat.value = "Total seats: â€”"
-        seat_occupied_stat.value = "Occupied seats: â€”"
-        seat_available_stat.value = "Available seats: â€”"
-        seat_breakdown_stat.value = "Breakdown: â€”"
-        seat_map_host.content = glass_card_with_background(
-            "Seat Map",
-            ft.Text("Generate a seat map to see the cabin overview here.", color=tokens["muted"]),
-            bg_key="seat_map",
-        )
-        seat_passenger_load_host.content = ft.Container()
+        reset_cabin()
 
         status_gate_tf.value = ""
         status_boarding_dd.value = "Not started"
@@ -7895,7 +8000,10 @@ def main(page: ft.Page):
             "pilot_name",
             "airline",
             "aircraft",
+            "airline_record",
+            "aircraft_record",
             "flight_number",
+            "dashboard_flight_plan",
             "departure",
             "arrival",
             "departure_gate",
@@ -7910,6 +8018,14 @@ def main(page: ft.Page):
             "overview_flight_time_minutes",
             "overview_locked_eta_timestamp",
             "overview_progress_running",
+            "overview_paused_elapsed_seconds",
+            "captain_announcement_language",
+            "captain_announcement_phase",
+            "captain_announcement_text",
+            "captain_departure_announcement_text",
+            "captain_descent_announcement_text",
+            "captain_announcement_cruise_altitude_ft",
+            "captain_announcement_current_altitude_ft",
             "route_distance_override_nm",
             "route_distance_override_key",
             "ramp_status_phase",
@@ -7927,7 +8043,10 @@ def main(page: ft.Page):
                 field_name: json_safe_value(getattr(state, field_name, None))
                 for field_name in saved_state_fields
             },
-            "overview_elapsed_seconds": flight_hibernation_elapsed_seconds(),
+            "planner_records": planner_records,
+            "airport_records": [record for code in (state.departure, state.arrival)
+                                if (record := lookup_airport_record(code))],
+            "overview_elapsed_seconds": overview_elapsed_seconds(),
             "controls": controls_payload,
             "seat_model": json_safe_value(seat_model),
         }
@@ -7936,14 +8055,17 @@ def main(page: ft.Page):
                 json.dumps(payload, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            state.flight_hibernation_menu_open = False
-            show_snack("Flight hibernation saved. You can restore it after the next login.")
+            show_snack("Paused flight saved. You can resume it after the next login.")
             refresh_ui()
         except Exception as ex:
-            state.flight_hibernation_menu_open = False
-            show_snack(f"Could not save flight hibernation: {ex}")
+            show_snack(f"Could not save the paused flight: {ex}")
 
     def restore_flight_hibernation_payload(payload: dict):
+        planner_records.clear()
+        planner_records.update(payload.get("planner_records") or {})
+        for record in [*payload.get("airport_records", []), planner_records.get("origin"), planner_records.get("destination")]:
+            if isinstance(record, dict) and record.get("code"):
+                remember_airport(record)
         saved_state = payload.get("state", {}) if isinstance(payload, dict) else {}
         if isinstance(saved_state, dict):
             for key, value in saved_state.items():
@@ -7951,12 +8073,13 @@ def main(page: ft.Page):
                     setattr(state, key, value)
 
         if state.airline:
+            state.airline = canonical_airline_name(state.airline)
             register_custom_airline(state.airline)
         state.aircraft = canonical_aircraft_name(state.aircraft) or state.aircraft
 
         controls_payload = payload.get("controls", {}) if isinstance(payload, dict) else {}
         if isinstance(controls_payload, dict):
-            airline_value = str(controls_payload.get("airline") or state.airline or "").strip()
+            airline_value = canonical_airline_name(controls_payload.get("airline") or state.airline)
             if airline_value:
                 state.airline = airline_value
                 register_custom_airline(airline_value)
@@ -7978,13 +8101,17 @@ def main(page: ft.Page):
                     set_control_snapshot(control, value)
 
         saved_seat_model = payload.get("seat_model", {}) if isinstance(payload, dict) else {}
-        if isinstance(saved_seat_model, dict):
+        if isinstance(saved_seat_model, dict) and saved_seat_model.get("generated") and saved_seat_model.get("totals"):
             seat_model.clear()
             seat_model.update(saved_seat_model)
             seat_model["seat_controls"] = {}
+        else:
+            reset_seat_map()
 
         state.departure = normalize_airport_code(state.departure or takeoff_departure_icao_tf.value) or (state.departure or "")
         state.arrival = normalize_airport_code(state.arrival or landing_arrival_icao_tf.value) or (state.arrival or "")
+        queue_airport_media(state.departure)
+        queue_airport_media(state.arrival)
         state.departure_gate = takeoff_gate_tf.value or state.departure_gate
         state.arrival_gate = landing_gate_tf.value or state.arrival_gate
         state.departure_terminal = takeoff_terminal_tf.value or state.departure_terminal
@@ -7995,13 +8122,16 @@ def main(page: ft.Page):
             elapsed_seconds = max(0.0, float(elapsed_seconds or 0.0))
         except Exception:
             elapsed_seconds = 0.0
-        if bool(getattr(state, "overview_progress_running", False)):
-            duration_seconds = max(60, int(getattr(state, "overview_flight_time_minutes", 120) or 120) * 60)
-            elapsed_seconds = min(elapsed_seconds, float(duration_seconds))
-            state.overview_takeoff_start_timestamp = time.time() - elapsed_seconds
-            state.overview_locked_eta_timestamp = time.time() + max(0.0, float(duration_seconds) - elapsed_seconds)
-        elif int(getattr(state, "overview_flight_status_index", 0) or 0) >= 5:
-            duration_seconds = max(60, int(getattr(state, "overview_flight_time_minutes", 120) or 120) * 60)
+        duration_seconds = planned_overview_minutes() * 60
+        if state.overview_progress_running or state.overview_paused_elapsed_seconds is not None:
+            if duration_seconds:
+                elapsed_seconds = min(elapsed_seconds, duration_seconds)
+            now = time.time()
+            state.overview_takeoff_start_timestamp = now - elapsed_seconds
+            state.overview_locked_eta_timestamp = now + duration_seconds - elapsed_seconds if duration_seconds else None
+            if not state.overview_progress_running:
+                state.overview_paused_elapsed_seconds = elapsed_seconds
+        elif int(getattr(state, "overview_flight_status_index", 0) or 0) >= 5 and duration_seconds:
             state.overview_takeoff_start_timestamp = time.time() - duration_seconds
 
         refresh_baggage_mode_ui(update_page=False)
@@ -8019,7 +8149,7 @@ def main(page: ft.Page):
 
     def start_new_after_hibernation_prompt():
         reset_active_flight_workspace(show_message=False)
-        show_snack("Saved hibernation cleared. Starting a new flight.")
+        show_snack("Saved flight discarded.")
 
     def show_flight_hibernation_prompt():
         if not state.is_logged_in or bool(getattr(state, "flight_hibernation_prompt_seen", False)):
@@ -8038,7 +8168,7 @@ def main(page: ft.Page):
             width=520,
             padding=22,
             border_radius=26,
-            bgcolor=ft.Colors.with_opacity(0.92, tokens["panel"]),
+            bgcolor=surface_fill(tokens["panel"]),
             border=ft.border.all(1, tokens["card_border"]),
             shadow=ft.BoxShadow(
                 blur_radius=34,
@@ -8059,14 +8189,14 @@ def main(page: ft.Page):
                         ],
                     ),
                     ft.Text(
-                        "A hibernated flight was found. Continue exactly where you left off, or clear it and start fresh.",
+                        "A paused flight was found. Resume where you left off, or discard the saved flight.",
                         size=12,
                         color=tokens["muted"],
                     ),
                     ft.Container(
                         padding=16,
                         border_radius=18,
-                        bgcolor=ft.Colors.with_opacity(0.40, tokens["subpanel"]),
+                        bgcolor=surface_fill(tokens["subpanel"]),
                         border=ft.border.all(1, tokens["card_border"]),
                         content=ft.Column(
                             tight=True,
@@ -8082,12 +8212,12 @@ def main(page: ft.Page):
                         alignment=ft.MainAxisAlignment.END,
                         spacing=10,
                         controls=[
-                            ft.OutlinedButton("Start New Flight", on_click=lambda e: start_new_after_hibernation_prompt()),
+                            ft.OutlinedButton("Discard saved flight", on_click=lambda e: start_new_after_hibernation_prompt()),
                             ft.ElevatedButton(
                                 "Continue Previous Flight",
                                 on_click=lambda e, saved_payload=payload: continue_previous_flight(saved_payload),
-                                bgcolor=tokens["accent"],
-                                color=ft.Colors.WHITE,
+                                bgcolor=tokens["primary"],
+                                color=tokens["on_primary"],
                             ),
                         ],
                     ),
@@ -8101,13 +8231,10 @@ def main(page: ft.Page):
         origin = normalize_airport_code(state.departure or takeoff_departure_icao_tf.value) or (state.departure or takeoff_departure_icao_tf.value or "").strip().upper()
         destination = normalize_airport_code(state.arrival or landing_arrival_icao_tf.value) or (state.arrival or landing_arrival_icao_tf.value or "").strip().upper()
         distance_value = route_distance_nm(origin, destination) if origin and destination else None
-        planned_minutes = int(getattr(state, "overview_flight_time_minutes", 120) or 120)
-        elapsed_minutes = planned_minutes
-        if isinstance(getattr(state, "overview_takeoff_start_timestamp", None), (int, float)):
-            elapsed_minutes = int(max(0.0, time.time() - float(state.overview_takeoff_start_timestamp)) / 60.0)
-            elapsed_minutes = min(max(0, elapsed_minutes), max(1, planned_minutes))
-        elif int(getattr(state, "overview_flight_status_index", 0) or 0) < 5:
-            elapsed_minutes = 0
+        planned_minutes = planned_overview_minutes()
+        elapsed_minutes = int(overview_elapsed_seconds() / 60.0)
+        if planned_minutes and int(state.overview_flight_status_index or 0) >= 5:
+            elapsed_minutes = planned_minutes
 
         fuel_plan = state.takeoff_last_result.get("fuel_plan", {}) if isinstance(getattr(state, "takeoff_last_result", None), dict) else {}
         planned_fuel = fuel_plan.get("planned_fuel_kg") if isinstance(fuel_plan, dict) else None
@@ -8125,16 +8252,16 @@ def main(page: ft.Page):
                 except Exception:
                     pass
         return {
-            "route": f"{origin or 'ORIGIN'} -> {destination or 'DESTINATION'}",
+            "route": f"{origin or 'DEPARTURE'} -> {destination or 'ARRIVAL'}",
             "origin": origin or "—",
             "destination": destination or "—",
             "airline": state.airline or "No airline selected",
             "aircraft": state.aircraft or takeoff_aircraft_dd.value or "No aircraft selected",
             "flight_number": state.flight_number or "—",
             "distance": f"{distance_value:.0f} NM" if distance_value else "—",
-            "planned_time": format_hours_to_hm(planned_minutes / 60.0),
-            "elapsed_time": format_hours_to_hm(elapsed_minutes / 60.0) if elapsed_minutes > 0 else "Not started",
-            "progress": f"{min(100, max(0, round((elapsed_minutes / max(1, planned_minutes)) * 100)))}%",
+            "planned_time": format_hours_to_hm(planned_minutes / 60.0) if planned_minutes else "—",
+            "elapsed_time": format_hours_to_hm(elapsed_minutes / 60.0) if elapsed_minutes > 0 else "—",
+            "progress": f"{min(100, round(elapsed_minutes / planned_minutes * 100))}%" if planned_minutes else "—",
             "departure_gate": state.departure_gate or takeoff_gate_tf.value or "—",
             "arrival_gate": state.arrival_gate or landing_gate_tf.value or "—",
             "departure_terminal": state.departure_terminal or takeoff_terminal_tf.value or "—",
@@ -8151,7 +8278,7 @@ def main(page: ft.Page):
             width=width,
             padding=ft.padding.symmetric(horizontal=14, vertical=12),
             border_radius=17,
-            bgcolor=ft.Colors.with_opacity(0.34, tokens["subpanel"]),
+            bgcolor=surface_fill(tokens["subpanel"]),
             border=ft.border.all(1, ft.Colors.with_opacity(0.18, ft.Colors.WHITE)),
             content=ft.Column(
                 tight=True,
@@ -8191,6 +8318,10 @@ def main(page: ft.Page):
             completion_key = f"overview-{session_timestamp}-{origin}-{destination}"
             state.overview_calendar_completion_key = completion_key
 
+        flight_time = str(summary.get("planned_time") or "").strip()
+        if not parse_flight_time_minutes(flight_time):
+            flight_time = str(summary.get("elapsed_time") or "").strip()
+
         passenger_value = str(summary.get("passengers_on_board") or "").strip()
         if not re.fullmatch(r"\d+", passenger_value):
             passenger_value = ""
@@ -8203,7 +8334,6 @@ def main(page: ft.Page):
             "origin": origin,
             "destination": destination,
             "route": f"{origin} -> {destination}",
-            "flight_time": str(summary.get("planned_time") or format_hours_to_hm(float(state.overview_flight_time_minutes or 120) / 60.0)),
             "flight_number": str(summary.get("flight_number") or state.flight_number or ""),
             "gate": str(summary.get("departure_gate") or state.departure_gate or ""),
             "arrival_gate": str(summary.get("arrival_gate") or state.arrival_gate or ""),
@@ -8218,6 +8348,8 @@ def main(page: ft.Page):
             "source": "overview_flight_end",
             "overview_completion_key": completion_key,
         }
+        if state.dashboard_flight_plan:
+            completion_updates["dashboard_flight_plan"] = dict(state.dashboard_flight_plan)
 
         existing_entry = next(
             (
@@ -8261,10 +8393,14 @@ def main(page: ft.Page):
             ]
             existing_entry = min(planned_matches, key=departure_time_distance) if planned_matches else None
 
+        if parse_flight_time_minutes(flight_time):
+            completion_updates["flight_time"] = flight_time
+
         if existing_entry is None:
             existing_entry = {
                 "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
                 "notes": completion_note,
+                "flight_time": "",
             }
             existing_entry.update(completion_updates)
             state.calendar_entries.append(existing_entry)
@@ -8284,23 +8420,23 @@ def main(page: ft.Page):
         summary = flight_end_summary_values()
         calendar_action = save_completed_overview_flight(summary)
         state.overview_progress_running = False
+        state.overview_paused_elapsed_seconds = None
         state.overview_flight_status_index = 6
         state.flight_status = "Flight ended"
-        state.flight_hibernation_menu_open = False
         clear_flight_hibernation_save()
+        reset_cabin()
         flight_end_summary_modal.visible = False
         refresh_ui()
         show_snack(f"Flight ended, {calendar_action} in Calendar, and marked completed.")
 
     def show_flight_end_summary(e=None):
-        state.flight_hibernation_menu_open = False
         summary = flight_end_summary_values()
         flight_end_summary_modal.content = ft.Container(
             width=720,
             padding=24,
             border_radius=30,
             clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=ft.Colors.with_opacity(0.90, tokens["panel"]),
+            bgcolor=surface_fill(tokens["panel"]),
             blur=ft.Blur(16, 16, ft.BlurTileMode.CLAMP),
             border=ft.border.all(1, ft.Colors.with_opacity(0.18, ft.Colors.WHITE)),
             shadow=ft.BoxShadow(
@@ -8356,12 +8492,12 @@ def main(page: ft.Page):
                         ),
                     ),
                     ft.Row(
-                        wrap=True,
+                        wrap=False,
                         spacing=12,
                         run_spacing=12,
                         controls=[
-                            flight_end_summary_tile("Origin", str(summary["origin"]), f"T{summary['departure_terminal']} / Gate {summary['departure_gate']}"),
-                            flight_end_summary_tile("Destination", str(summary["destination"]), f"T{summary['arrival_terminal']} / Gate {summary['arrival_gate']}"),
+                            flight_end_summary_tile("Departure", str(summary["origin"]), f"T{summary['departure_terminal']} / Gate {summary['departure_gate']}"),
+                            flight_end_summary_tile("Arrival", str(summary["destination"]), f"T{summary['arrival_terminal']} / Gate {summary['arrival_gate']}"),
                             flight_end_summary_tile("Flight Time", str(summary["planned_time"]), "Scheduled"),
                             flight_end_summary_tile("Distance", str(summary["distance"]), "Route estimate"),
                             flight_end_summary_tile("Passengers On Board", str(summary["passengers_on_board"]), str(summary["passenger_source"])),
@@ -8373,8 +8509,8 @@ def main(page: ft.Page):
                         spacing=12,
                         run_spacing=12,
                         controls=[
-                            flight_end_summary_tile("Origin", str(summary["origin"]), f"T{summary['departure_terminal']} • Gate {summary['departure_gate']}"),
-                            flight_end_summary_tile("Destination", str(summary["destination"]), f"T{summary['arrival_terminal']} • Gate {summary['arrival_gate']}"),
+                            flight_end_summary_tile("Departure", str(summary["origin"]), f"T{summary['departure_terminal']} • Gate {summary['departure_gate']}"),
+                            flight_end_summary_tile("Arrival", str(summary["destination"]), f"T{summary['arrival_terminal']} • Gate {summary['arrival_gate']}"),
                         ],
                     ),
                     ft.Container(
@@ -8393,7 +8529,7 @@ def main(page: ft.Page):
                         spacing=10,
                         controls=[
                             ft.OutlinedButton("Keep Flight Open", on_click=close_flight_end_summary),
-                            ft.ElevatedButton("End Flight", bgcolor=tokens["accent"], color=ft.Colors.WHITE, on_click=finish_current_flight),
+                            ft.ElevatedButton("End Flight", bgcolor="#B3261E", color=ft.Colors.WHITE, on_click=finish_current_flight),
                         ],
                     ),
                 ],
@@ -8403,32 +8539,47 @@ def main(page: ft.Page):
         page.update()
 
     def refresh_ui():
-        nonlocal ui_refresh_in_progress
+        nonlocal ui_refresh_in_progress, close_suggestions
         if ui_refresh_in_progress:
             return
         ui_refresh_in_progress = True
         try:
+            if close_suggestions:
+                close_suggestions()
+                close_suggestions = None
             apply_theme()
-            page.bgcolor = ft.Colors.BLACK
+            page.bgcolor = tokens["bg"]
             root_host.bgcolor = ft.Colors.TRANSPARENT
             sync_input_colors()
             refresh_header_texts()
-            refresh_airport_background_preloader(update_page=False)
             airline_dd.value = state.airline or None
             theme_toggle.value = page.theme_mode == ft.ThemeMode.DARK
             if state.selected_tab_index < 0:
                 state.selected_tab_index = 0
-            if state.selected_tab_index > 12:
-                state.selected_tab_index = 12
+            if state.selected_tab_index > 13:
+                state.selected_tab_index = 13
+            if state.selected_tab_index == 6:
+                state.selected_tab_index = 0
             if (not state.is_logged_in) or state.selected_tab_index != 0:
                 close_overview_globe_webview()
-            root_host.content = login_page() if not state.is_logged_in else app_shell()
+            if not state.is_logged_in or state.selected_tab_index != 1:
+                close_dashboard_airport_map()
+                page.on_resize = None
+            if not state.is_logged_in:
+                close_live_map()
+            elif state.selected_tab_index != 0 or not state.overview_live:
+                set_live_map_visibility(False)
+            root_host.content = app_shell()
+            prepare_controls(root_host, *page.overlay)
             page.update()
+            guide = page_guides.get(2 if state.selected_tab_index == 3 else state.selected_tab_index)
+            if state.is_logged_in and not state.tutorial_skipped and guide and guide[0] not in state.tutorial_seen:
+                page.run_task(show_page_guide, state.selected_tab_index)
         finally:
             ui_refresh_in_progress = False
 
     def apply_selected_airline(force_refresh: bool = False):
-        selected_value = (airline_dd.value or state.airline or "").strip()
+        selected_value = canonical_airline_name(airline_dd.value or state.airline)
 
         state.airline = selected_value
         airline_dd.value = selected_value or None
@@ -8440,9 +8591,9 @@ def main(page: ft.Page):
             seat_airline_dd.value = selected_value or None
         populate_seat_aircraft_dropdown(selected_value, state.aircraft)
 
-        if cal_airline_dd.value != (selected_value or None):
+        if not state.calendar_editing_id and not planner_records:
             cal_airline_dd.value = selected_value or None
-        populate_calendar_aircraft_dropdown(selected_value)
+            populate_calendar_aircraft_dropdown(selected_value)
 
         populate_takeoff_aircraft_dropdown(selected_value, state.aircraft)
         populate_landing_aircraft_dropdown(selected_value, state.aircraft)
@@ -8456,8 +8607,11 @@ def main(page: ft.Page):
         apply_selected_airline(force_refresh=True)
 
     def set_airline(value: str):
-        airline_dd.value = value or None
-        state.airline = value or ""
+        airline_name = canonical_airline_name(value)
+        airline_dd.value = airline_name or None
+        state.airline = airline_name
+        if canonical_airline_name(state.airline_record.get("name")) != airline_name:
+            state.airline_record = {}
         apply_selected_airline(force_refresh=True)
 
     def close_airline_picker(e=None):
@@ -8523,7 +8677,7 @@ def main(page: ft.Page):
             width=float("inf"),
             padding=ft.padding.only(left=22, right=22, top=18, bottom=18),
             border_radius=ft.border_radius.only(top_left=28, top_right=28),
-            bgcolor=tokens["panel"],
+            bgcolor=surface_fill(tokens["panel"]),
             border=ft.border.all(1, tokens["card_border"]),
             shadow=ft.BoxShadow(
                 blur_radius=28,
@@ -8696,7 +8850,7 @@ def main(page: ft.Page):
             width=float("inf"),
             padding=ft.padding.only(left=22, right=22, top=18, bottom=18),
             border_radius=ft.border_radius.only(top_left=28, top_right=28),
-            bgcolor=tokens["panel"],
+            bgcolor=surface_fill(tokens["panel"]),
             border=ft.border.all(1, tokens["card_border"]),
             shadow=ft.BoxShadow(
                 blur_radius=28,
@@ -8733,49 +8887,6 @@ def main(page: ft.Page):
     airline_dd.on_change = lambda e: set_airline(e.control.value)
     theme_toggle.on_change = lambda e: set_theme(e.control.value)
 
-    async def complete_login_after_transition():
-        await asyncio.sleep(3.0)
-        state.is_logged_in = True
-        state.login_transition_active = False
-        state.login_transition_progress = 0.0
-        refresh_ui()
-        show_flight_hibernation_prompt()
-
-    def do_login(e):
-        username = (username_tf.value or "").strip()
-        password = (password_tf.value or "").strip()
-        if not username or not password:
-            login_error.value = "Enter ID and password."
-            page.update()
-            return
-
-        if bool(getattr(state, "login_transition_active", False)):
-            return
-
-        login_error.value = ""
-        state.pilot_name = username
-        state.selected_tab_index = 1
-        state.flight_hibernation_prompt_seen = False
-        state.flight_hibernation_menu_open = False
-
-        # Start the client-side swipe-up state immediately.
-        play_login_transition_audio()
-        state.login_transition_active = True
-        state.login_transition_progress = 1.0
-        refresh_ui()
-
-        try:
-            page.run_task(complete_login_after_transition)
-        except Exception:
-            # Fallback: still allow login if this Flet build cannot schedule tasks.
-            time.sleep(0.35)
-            state.is_logged_in = True
-            state.login_transition_active = False
-            state.login_transition_progress = 0.0
-            refresh_ui()
-            show_flight_hibernation_prompt()
-
-    password_tf.on_submit = do_login
 
     def close_overview_globe_webview(wait: bool = False):
         process = getattr(state, "overview_globe_webview_process", None)
@@ -8801,44 +8912,6 @@ def main(page: ft.Page):
         else:
             threading.Thread(target=terminate_process, daemon=True).start()
 
-    def close_mapcn_webview(wait: bool = False):
-        process = getattr(state, "mapcn_webview_process", None)
-        if process is None:
-            setattr(state, "mapcn_webview_url", None)
-            return
-        setattr(state, "mapcn_webview_process", None)
-        setattr(state, "mapcn_webview_url", None)
-
-        def terminate_process():
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=1.5)
-                    except Exception:
-                        process.kill()
-            except Exception:
-                pass
-
-        if wait:
-            terminate_process()
-        else:
-            threading.Thread(target=terminate_process, daemon=True).start()
-
-    def do_logout(e):
-        close_overview_globe_webview(wait=True)
-        close_mapcn_webview(wait=True)
-        state.is_logged_in = True
-        state.pilot_name = "User"
-        state.selected_tab_index = 1
-        state.login_intro_started = False
-        state.login_transition_active = False
-        state.login_transition_progress = 0.0
-        state.flight_hibernation_prompt_seen = False
-        state.flight_hibernation_menu_open = False
-        password_tf.value = ""
-        login_error.value = ""
-        refresh_ui()
 
     async def show_application_window():
         if app_exit_requested:
@@ -8859,7 +8932,8 @@ def main(page: ft.Page):
             return
         app_exit_requested = True
         close_overview_globe_webview(wait=True)
-        close_mapcn_webview(wait=True)
+        close_dashboard_airport_map()
+        close_live_map()
         if tray_icon is not None:
             try:
                 tray_icon.stop()
@@ -8938,7 +9012,7 @@ def main(page: ft.Page):
                 pass
             return False
 
-    tray_enabled = start_windows_tray()
+    tray_enabled = not _INTERFACE_PREVIEW and start_windows_tray()
     page.window.prevent_close = tray_enabled
     if tray_enabled:
         page.window.on_event = on_window_event
@@ -9010,15 +9084,20 @@ def main(page: ft.Page):
         page.update()
 
     def on_takeoff_departure_changed(e=None):
+        previous_airport = state.departure
         apply_takeoff_departure_state(update_page=False, fill_elevation=True)
+        if state.departure != previous_airport:
+            clear_dashboard_time_override()
+            performance_metar_requests.pop("departure", None)
+            takeoff_raw_metar_tf.value = ""
+            takeoff_metar_status_text.value = ""
         sync_route_distance_from_state(update_page=False)
+        refresh_takeoff_fuel_info(update_page=False)
         page.update()
 
     takeoff_aircraft_dd.on_change = on_takeoff_aircraft_changed
     takeoff_aircraft_dd.on_blur = on_takeoff_aircraft_changed
     # Do not update/uppercase on every key press. It can make the field lose focus.
-    takeoff_departure_icao_tf.on_blur = on_takeoff_departure_changed
-    takeoff_departure_icao_tf.on_submit = on_takeoff_departure_changed
     takeoff_gate_tf.on_change = lambda e: setattr(state, "departure_gate", (e.control.value or "").strip())
     takeoff_terminal_tf.on_change = lambda e: setattr(state, "departure_terminal", (e.control.value or "").strip())
 
@@ -9070,7 +9149,7 @@ def main(page: ft.Page):
                 takeoff_route_distance_tf.value = format_route_distance_value(float(override_nm))
             elif route_nm is not None:
                 takeoff_route_distance_tf.value = format_route_distance_value(route_nm)
-            elif not (takeoff_route_distance_tf.value or "").strip():
+            else:
                 takeoff_route_distance_tf.value = ""
 
         if update_page:
@@ -9083,6 +9162,8 @@ def main(page: ft.Page):
         route_key = active_route_distance_key()
 
         if not raw:
+            if state.route_distance_override_nm is not None:
+                clear_dashboard_time_override()
             state.route_distance_override_nm = None
             state.route_distance_override_key = ""
             sync_route_distance_from_state(update_page=False, overwrite_field=True)
@@ -9098,11 +9179,15 @@ def main(page: ft.Page):
             page.update()
             return
 
-        if manual_nm <= 0:
+        if not math.isfinite(manual_nm) or manual_nm <= 0:
             takeoff_fuel_status_text.value = "Route distance must be greater than zero."
             page.update()
             return
 
+        calculated_nm = route_distance_nm(state.departure, state.arrival) if route_key else None
+        previous_nm = state.route_distance_override_nm if state.route_distance_override_key == route_key else calculated_nm
+        if previous_nm is None or abs(manual_nm - previous_nm) >= 0.05:
+            clear_dashboard_time_override()
         state.route_distance_override_nm = manual_nm
         state.route_distance_override_key = route_key
         takeoff_route_distance_tf.value = format_route_distance_value(manual_nm)
@@ -9139,10 +9224,12 @@ def main(page: ft.Page):
             page.update()
 
     def refresh_takeoff_fuel_info(update_page: bool = False):
+        minutes = fuel_plan_flight_minutes()
+        takeoff_ete_text.value = f"Flight time: {format_hours_to_hm(minutes / 60)}" if minutes else "Flight time: —"
         aircraft_name = canonical_aircraft_name(takeoff_aircraft_dd.value or state.aircraft)
         route_origin = (state.departure or takeoff_departure_icao_tf.value or "").strip().upper()
         route_destination = (state.arrival or landing_arrival_icao_tf.value or "").strip().upper()
-        route_label = f"{route_origin} → {route_destination}" if route_origin and route_destination else "Set departure and destination"
+        route_label = f"{route_origin} → {route_destination}" if route_origin and route_destination else "Set departure and arrival"
         route_key = active_route_distance_key()
         override_nm = getattr(state, "route_distance_override_nm", None)
         has_valid_override = (
@@ -9206,10 +9293,11 @@ def main(page: ft.Page):
                 state.route_distance_override_nm = None
                 state.route_distance_override_key = ""
 
-        if route_distance <= 0:
+        if not math.isfinite(route_distance) or route_distance <= 0:
             takeoff_fuel_status_text.value = 'Enter a route distance greater than zero.'
             takeoff_trip_fuel_text.value = 'Base trip fuel: —'
-            takeoff_block_fuel_text.value = 'Planned fuel: —'
+            takeoff_block_fuel_text.value = "— L  /  — kg"
+            takeoff_fuel_limits_text.value = ""
             takeoff_ete_text.value = 'Flight time: —'
             takeoff_burn_rate_text.value = 'Actual payload: —'
             takeoff_fuel_breakdown_text.value = 'Phase split: —'
@@ -9240,7 +9328,12 @@ def main(page: ft.Page):
         mlw_kg = float(lib.get('mlw', 0.0) or 0.0)
         mtow_kg = float(lib.get('mtow', 0.0) or 0.0)
 
+        ete_minutes = max(1, round(plan.ete_hours * 60))
+        clear_dashboard_time_override()
         state.takeoff_last_result['fuel_plan'] = {
+            'route_key': route_key,
+            'aircraft': aircraft_name,
+            'ete_minutes': ete_minutes,
             'trip_fuel_kg': round(plan.corrected_trip_fuel_kg, 1),
             'block_fuel_kg': round(plan.planned_fuel_kg, 1),
             'ete_hours': round(plan.ete_hours, 2),
@@ -9252,6 +9345,9 @@ def main(page: ft.Page):
             'mtow_kg': round(mtow_kg, 1),
             'route_distance_nmi': round(plan.route_distance_nmi, 1),
         }
+        start = state.overview_takeoff_start_timestamp
+        if not state.overview_flight_time_minutes and state.overview_progress_running and isinstance(start, (int, float)):
+            state.overview_locked_eta_timestamp = start + ete_minutes * 60
 
         if estimated_tow_kg > 0:
             takeoff_zfw_tf.value = f"{estimated_zfw_kg:.0f}"
@@ -9260,12 +9356,12 @@ def main(page: ft.Page):
             f"Base trip fuel: {plan.base_trip_fuel_l:,.0f} L • {plan.base_trip_fuel_kg:,.0f} kg | "
             f"Corrected: {plan.corrected_trip_fuel_l:,.0f} L • {plan.corrected_trip_fuel_kg:,.0f} kg"
         )
-        takeoff_block_fuel_text.value = (
-            f"Planned fuel: {plan.planned_fuel_l:,.0f} L • {plan.planned_fuel_kg:,.0f} kg | "
+        takeoff_block_fuel_text.value = f"{plan.planned_fuel_l:,.0f} L  /  {plan.planned_fuel_kg:,.0f} kg"
+        takeoff_fuel_limits_text.value = (
             f"Margin: {plan.planning_margin_l:,.0f} L • {plan.planning_margin_kg:,.0f} kg | "
             f"Fuel capacity: {plan.fuel_capacity_l:,.0f} L • {plan.fuel_capacity_kg:,.0f} kg"
         )
-        takeoff_ete_text.value = f"Flight time: {int(plan.ete_hours)}h {int(round((plan.ete_hours % 1) * 60)):02d}m • Effective distance {plan.effective_distance_nmi:,.0f} NM"
+        takeoff_ete_text.value = f"Flight time: {format_hours_to_hm(ete_minutes / 60)} • Effective distance {plan.effective_distance_nmi:,.0f} NM"
         takeoff_burn_rate_text.value = (
             f"Actual payload: {plan.actual_payload_kg:,.0f} kg | Payload factor {plan.payload_factor:.3f} | "
             f"Long-haul factor {plan.long_haul_efficiency_factor:.3f} | Burn coefficient {plan.burn_coefficient_l_per_nmi:,.2f} L/NM"
@@ -9335,36 +9431,51 @@ def main(page: ft.Page):
             landing_vs_calc_result_text.value = f"Required V/S: -{vs:,} fpm"
         page.update()
 
-    def do_fetch_takeoff_metar(e):
-        icao = (takeoff_departure_icao_tf.value or "").strip().upper()
-        takeoff_departure_icao_tf.value = icao
-        if not icao:
-            takeoff_metar_status_text.value = "Enter a valid ICAO before fetching METAR."
-            page.update()
+    async def fetch_performance_metar(
+        role, airport, status, raw, fetch_report, weather_fields, runway_heading, apply_airport,
+    ):
+        icao = normalize_airport_code(getattr(state, role))
+        if not icao or not re.fullmatch(r"[A-Z0-9]{4}", icao) or role in performance_metar_requests:
             return
-        takeoff_metar_status_text.value = f"Fetching METAR for {icao}..."
-        page.update()
-        metar = fetch_takeoff_metar(icao)
+
+        tab_index = 4 if role == "departure" else 5
+        request = object()
+        performance_metar_requests[role] = request
+        status.value = ""
+        refresh_active_page()
+        metar = await asyncio.to_thread(fetch_report, icao)
+
+        if performance_metar_requests.get(role) is not request:
+            return
+        performance_metar_requests.pop(role)
+        if normalize_airport_code(getattr(state, role)) != icao:
+            return
         if not metar:
-            takeoff_metar_status_text.value = f"No METAR found for {icao}."
-            takeoff_raw_metar_tf.value = ""
-            apply_takeoff_departure_state(update_page=False, fill_elevation=True)
-            refresh_airport_background_preloader(update_page=False)
-            refresh_ui()
-            return
-        takeoff_oat_tf.value = f"{metar.temperature_c:.0f}"
-        takeoff_qnh_tf.value = f"{metar.qnh_hpa:.1f}"
-        takeoff_wind_dir_tf.value = str(metar.wind_dir_deg)
-        takeoff_wind_speed_tf.value = str(metar.wind_speed_kt)
-        takeoff_wind_gust_tf.value = str(metar.wind_gust_kt)
-        if not (takeoff_runway_heading_tf.value or "").strip() or takeoff_runway_heading_tf.value == "0":
-            takeoff_runway_heading_tf.value = str(metar.wind_dir_deg)
-        takeoff_raw_metar_tf.value = metar.raw
-        takeoff_metar_status_text.value = f"Updated from METAR for {icao}."
-        apply_takeoff_departure_state(update_page=False, fill_elevation=True)
-        state.flight_status = "METAR updated"
-        refresh_airport_background_preloader(update_page=False)
-        refresh_ui()
+            status.value = f"No METAR received for {icao}. Try again."
+        else:
+            values = (
+                f"{metar.temperature_c:.0f}", f"{metar.qnh_hpa:.1f}", str(metar.wind_dir_deg),
+                str(metar.wind_speed_kt), str(metar.wind_gust_kt),
+            )
+            for field, value in zip(weather_fields, values):
+                field.value = value
+            if (runway_heading.value or "").strip() in ("", "0"):
+                runway_heading.value = str(metar.wind_dir_deg)
+            raw.value = metar.raw
+            if metar.observation:
+                airport_weather_cache[icao] = {"report": metar.observation, "timestamp": time.monotonic()}
+            airport.value = icao
+            apply_airport(update_page=False, fill_elevation=True)
+            state.flight_status = "METAR updated" if role == "departure" else "Landing METAR updated"
+        if state.selected_tab_index == tab_index:
+            refresh_active_page()
+
+    async def do_fetch_takeoff_metar(e):
+        await fetch_performance_metar(
+            "departure", takeoff_departure_icao_tf, takeoff_metar_status_text, takeoff_raw_metar_tf, fetch_takeoff_metar,
+            (takeoff_oat_tf, takeoff_qnh_tf, takeoff_wind_dir_tf, takeoff_wind_speed_tf, takeoff_wind_gust_tf),
+            takeoff_runway_heading_tf, apply_takeoff_departure_state,
+        )
 
     def parse_optional_float(value: str) -> Optional[float]:
         value = (value or "").strip()
@@ -9412,12 +9523,12 @@ def main(page: ft.Page):
         sync_aircraft_across_pages(inputs.aircraft_name, update_page=False)
 
         result = compute_takeoff_performance(inputs)
-        state.takeoff_last_result = {
+        state.takeoff_last_result.update({
             "weight_kg": inputs.takeoff_weight_kg,
             "vr_kt": result.vr_kt,
             "v2_kt": result.v2_kt,
             "takeoff_distance_m": result.takeoff_distance_m,
-        }
+        })
         state.flight_status = "Takeoff computed"
 
         takeoff_mtow_value_text.value = f"MTOW: {result.mtow_kg:,.0f} kg"
@@ -9441,9 +9552,9 @@ def main(page: ft.Page):
             takeoff_margin_text.value = "Runway margins: " + "  •  ".join(margin_parts)
         else:
             takeoff_margin_text.value = "Runway margins: no TORA/TODA/ASDA entered"
-        takeoff_climb_initial_text.value = f"Initial: {result.climb_initial_fpm:,} fpm"
-        takeoff_climb_enroute_text.value = f"Enroute: {result.climb_enroute_fpm:,} fpm"
-        takeoff_climb_high_text.value = f"High Alt: {result.climb_high_alt_fpm:,} fpm"
+        takeoff_climb_initial_text.value = f"Initial: {result.climb_initial_fpm:,}"
+        takeoff_climb_enroute_text.value = f"Enroute: {result.climb_enroute_fpm:,}"
+        takeoff_climb_high_text.value = f"High altitude: {result.climb_high_alt_fpm:,}"
 
         render_takeoff_warnings(result)
         takeoff_status_text.value = f"Computed for {inputs.aircraft_name} from {state.departure}."
@@ -9478,6 +9589,7 @@ def main(page: ft.Page):
             "aircraft": aircraft_name,
             "origin": origin,
             "destination": destination,
+            "aviation_records": active_flight_records(origin, destination),
             "route": f"{origin} → {destination}",
             "flight_time": "—",
             "notes": " | ".join(notes) if notes else "Takeoff planning saved from Takeoff tab.",
@@ -9497,49 +9609,30 @@ def main(page: ft.Page):
         sync_aircraft_across_pages(selected_aircraft, update_page=False)
         page.update()
     def on_landing_arrival_changed(e=None):
+        previous_airport = state.arrival
         apply_landing_arrival_state(update_page=False, fill_elevation=True)
+        if state.arrival != previous_airport:
+            clear_dashboard_time_override()
+            performance_metar_requests.pop("arrival", None)
+            landing_raw_metar_tf.value = ""
+            landing_metar_status_text.value = ""
         sync_route_distance_from_state(update_page=False)
+        refresh_takeoff_fuel_info(update_page=False)
         page.update()
 
     landing_aircraft_dd.on_change = on_landing_aircraft_changed
     # Do not update/uppercase on every key press. It can make the field lose focus.
-    landing_arrival_icao_tf.on_blur = on_landing_arrival_changed
-    landing_arrival_icao_tf.on_submit = on_landing_arrival_changed
     landing_gate_tf.on_change = lambda e: setattr(state, "arrival_gate", (e.control.value or "").strip())
     landing_terminal_tf.on_change = lambda e: setattr(state, "arrival_terminal", (e.control.value or "").strip())
     populate_landing_aircraft_dropdown(state.airline, state.aircraft)
     reset_landing_form(update_page=False)
 
-    def do_fetch_landing_metar(e):
-        icao = (landing_arrival_icao_tf.value or "").strip().upper()
-        landing_arrival_icao_tf.value = icao
-        if not icao:
-            landing_metar_status_text.value = "Enter a valid ICAO before fetching METAR."
-            page.update()
-            return
-        landing_metar_status_text.value = f"Fetching METAR for {icao}..."
-        page.update()
-        metar = fetch_landing_metar(icao)
-        if not metar:
-            landing_metar_status_text.value = f"No METAR found for {icao}."
-            landing_raw_metar_tf.value = ""
-            apply_landing_arrival_state(update_page=False, fill_elevation=True)
-            refresh_airport_background_preloader(update_page=False)
-            refresh_ui()
-            return
-        landing_oat_tf.value = f"{metar.temperature_c:.0f}"
-        landing_qnh_tf.value = f"{metar.qnh_hpa:.1f}"
-        landing_wind_dir_tf.value = str(metar.wind_dir_deg)
-        landing_wind_speed_tf.value = str(metar.wind_speed_kt)
-        landing_wind_gust_tf.value = str(metar.wind_gust_kt)
-        if not (landing_runway_heading_tf.value or "").strip() or landing_runway_heading_tf.value == "0":
-            landing_runway_heading_tf.value = str(metar.wind_dir_deg)
-        landing_raw_metar_tf.value = metar.raw
-        landing_metar_status_text.value = f"Updated from METAR for {icao}."
-        apply_landing_arrival_state(update_page=False, fill_elevation=True)
-        state.flight_status = "Landing METAR updated"
-        refresh_airport_background_preloader(update_page=False)
-        refresh_ui()
+    async def do_fetch_landing_metar(e):
+        await fetch_performance_metar(
+            "arrival", landing_arrival_icao_tf, landing_metar_status_text, landing_raw_metar_tf, fetch_landing_metar,
+            (landing_oat_tf, landing_qnh_tf, landing_wind_dir_tf, landing_wind_speed_tf, landing_wind_gust_tf),
+            landing_runway_heading_tf, apply_landing_arrival_state,
+        )
 
     def do_compute_landing(e):
         aircraft_name = canonical_aircraft_name(state.aircraft or landing_aircraft_dd.value)
@@ -9599,7 +9692,9 @@ def main(page: ft.Page):
 
         landing_vs_text.value = f"Vs landing: {result.vs_landing_kt} kt"
         landing_vref_text.value = f"Vref: {result.vref_kt} kt"
-        landing_vapp_text.value = f"Vapp: {result.vapp_kt} kt  •  Additive +{result.additive_kt} kt"
+        landing_vapp_text.value = f"Vapp: {result.vapp_kt} kt"
+        landing_additive_text.value = f"Additive +{result.additive_kt} kt"
+        landing_additive_text.visible = True
         landing_weight_ratio_text.value = f"Weight ratio to MLW: {result.weight_ratio:.3f}"
 
         landing_altitude_to_lose_text.value = f"Altitude to lose: {result.altitude_to_lose_ft:,} ft"
@@ -9646,6 +9741,7 @@ def main(page: ft.Page):
             "aircraft": aircraft_name,
             "origin": origin,
             "destination": destination,
+            "aviation_records": active_flight_records(origin, destination),
             "route": f"{origin} → {destination}",
             "flight_time": f"{state.landing_last_result.get('tod_distance_nm', '—')} NM to go" if state.landing_last_result else "—",
             "notes": " | ".join(notes) if notes else "Landing planning saved from Landing tab.",
@@ -9664,7 +9760,7 @@ def main(page: ft.Page):
         try:
             passengers = max(0, int((bag_pax_tf.value or "0").strip()))
         except Exception:
-            bag_status_text.value = "Passenger count must be a whole number."
+            set_baggage_status("Passenger count must be a whole number.", error=True)
             page.update()
             return
 
@@ -9673,7 +9769,7 @@ def main(page: ft.Page):
             if carry_on_kg < 0:
                 raise ValueError
         except Exception:
-            bag_status_text.value = "Carry-on mass per passenger must be a valid number."
+            set_baggage_status("Carry-on mass per passenger must be a valid number.", error=True)
             page.update()
             return
 
@@ -9682,7 +9778,7 @@ def main(page: ft.Page):
             if cargo_kg < 0:
                 raise ValueError
         except Exception:
-            bag_status_text.value = "Cargo weight must be a valid number."
+            set_baggage_status("Cargo weight must be a valid number.", error=True)
             page.update()
             return
 
@@ -9695,7 +9791,7 @@ def main(page: ft.Page):
                 if checked_kg_per_pax < 0:
                     raise ValueError
             except Exception:
-                bag_status_text.value = "Checked baggage kg per passenger must be a valid number."
+                set_baggage_status("Checked baggage kg per passenger must be a valid number.", error=True)
                 page.update()
                 return
 
@@ -9721,14 +9817,14 @@ def main(page: ft.Page):
             bag_assumption_2.value = f"Carry-on per passenger: {carry_on_kg:,.1f} kg"
             bag_assumption_3.value = f"Checked baggage per passenger: {checked_kg_per_pax:,.1f} kg"
             bag_assumption_4.value = f"Category default checked baggage: {default_checked_baggage_for_category(category):,.1f} kg"
-            bag_status_text.value = "Baggage and cargo payload calculated."
+            set_baggage_status("Baggage and cargo payload calculated.")
         else:
             try:
                 pct_two = float((bag_two_bag_percent_tf.value or "0").strip())
                 if pct_two < 0 or pct_two > 100:
                     raise ValueError
             except Exception:
-                bag_status_text.value = "Passengers with 2 checked bags must be a number from 0 to 100."
+                set_baggage_status("Passengers with 2 checked bags must be a number from 0 to 100.", error=True)
                 page.update()
                 return
 
@@ -9737,7 +9833,7 @@ def main(page: ft.Page):
                 if per_bag_kg < 0:
                     raise ValueError
             except Exception:
-                bag_status_text.value = "Mass per checked bag must be a valid number."
+                set_baggage_status("Mass per checked bag must be a valid number.", error=True)
                 page.update()
                 return
 
@@ -9760,24 +9856,26 @@ def main(page: ft.Page):
             bag_assumption_2.value = f"Passengers with 2 checked bags: {pct_two:,.1f}%"
             bag_assumption_3.value = f"Mass per checked bag: {per_bag_kg:,.1f} kg"
             bag_assumption_4.value = "Each remaining passenger is counted with 1 checked bag."
-            bag_status_text.value = "Calculated in Allowance mode. Total shown on the right."
+            set_baggage_status("Calculated in Allowance mode.")
 
-        bag_status_text.color = "#FF8080" if page.theme_mode == ft.ThemeMode.DARK else "#B3261E"
+        # Push only the calculated baggage total into Fuel Planning. The fuel
+        # field remains a normal editable TextField for operational overrides.
+        takeoff_fuel_baggage_tf.value = f"{result.total_baggage_kg:.1f}".rstrip("0").rstrip(".")
         page.update()
 
     def reset_baggage_form(e):
         bag_mode_dd.value = "Standard"
-        bag_pax_tf.value = "0"
-        bag_carry_on_tf.value = ""
+        if not seat_model.get("generated"):
+            bag_pax_tf.value = "0"
+        bag_carry_on_tf.value = "0"
         bag_category_dd.value = "Within the European region"
         apply_baggage_category_default()
         cargo_weight_tf.value = "0"
-        bag_two_bag_percent_tf.value = "25"
-        bag_per_bag_kg_tf.value = "23"
+        bag_two_bag_percent_tf.value = "0"
+        bag_per_bag_kg_tf.value = "0"
         refresh_baggage_mode_ui(update_page=False)
         reset_baggage_result_display()
-        bag_status_text.value = "Enter values and click Calculate."
-        bag_status_text.color = "#FF8080" if page.theme_mode == ft.ThemeMode.DARK else "#B3261E"
+        set_baggage_status("Enter values and click Calculate.")
         page.update()
 
     def add_or_update_calendar_entry(e):
@@ -9796,7 +9894,7 @@ def main(page: ft.Page):
         completed = bool(existing_entry.get("completed", False)) if existing_entry else False
 
         if not date_str or not airline_name or not aircraft_name or not origin or not destination or not flight_time:
-            cal_form_message.value = "Fill date, airline, aircraft, origin, destination, and flight time."
+            cal_form_message.value = "Select an airline, aircraft, departure, and arrival. Enter the date and flight time."
             page.update()
             return
 
@@ -9826,6 +9924,11 @@ def main(page: ft.Page):
             "origin": origin,
             "destination": destination,
             "route": route_label,
+            "aviation_records": {
+                **planner_records,
+                **{key: record for key, code in (("origin", origin), ("destination", destination))
+                   if (record := lookup_airport_record(code))},
+            },
             "flight_time": flight_time,
             "notes": notes,
             "completed": completed,
@@ -9853,7 +9956,7 @@ def main(page: ft.Page):
             refresh_calendar_route_preview()
         else:
             reset_calendar_form()
-        refresh_ui()
+        refresh_active_page()
 
     def load_calendar_entry_for_edit(entry_id: str):
         entry = next((item for item in state.calendar_entries if item.get("id") == entry_id), None)
@@ -9862,8 +9965,10 @@ def main(page: ft.Page):
         state.calendar_editing_id = entry_id
         cal_date_tf.value = entry.get("date", "")
         cal_time_tf.value = entry.get("time", "")
-        cal_airline_dd.value = entry.get("airline", state.airline or "")
-        populate_calendar_aircraft_dropdown(cal_airline_dd.value, entry.get("aircraft"))
+        cal_airline_dd.value = entry.get("airline", "")
+        cal_aircraft_dd.value = entry.get("aircraft", "")
+        planner_records.clear()
+        planner_records.update(entry.get("aviation_records") or {})
         cal_origin_tf.value = entry.get("origin", "")
         cal_destination_tf.value = entry.get("destination", "")
         cal_flight_time_tf.value = entry.get("flight_time", "")
@@ -9874,7 +9979,7 @@ def main(page: ft.Page):
         state.calendar_display_month = int(entry_date_value[5:7])
         cal_form_message.value = f"Editing flight: {entry.get('route', '')}"
         refresh_calendar_route_preview()
-        refresh_ui()
+        refresh_active_page()
 
     def delete_calendar_entry(entry_id: str):
         for item in state.calendar_entries:
@@ -9889,20 +9994,32 @@ def main(page: ft.Page):
         if state.calendar_editing_id == entry_id:
             reset_calendar_form()
         save_calendar_entries()
-        refresh_ui()
+        refresh_active_page()
+
+    def complete_calendar_entry(entry_id: str):
+        if not mark_calendar_entry_completed(state.calendar_entries, entry_id):
+            return
+        sync_profile_from_calendar_completion()
+        save_calendar_entries()
+        refresh_active_page()
+        show_snack("Flight marked completed.")
 
     def clear_calendar_form(e):
         reset_calendar_form()
         page.update()
 
     def go_to_tab(index: int):
-        new_index = max(0, min(12, int(index)))
+        new_index = max(0, min(13, int(index)))
+        if new_index == 6:
+            new_index = 0
+        if new_index == 12:
+            state.selected_tab_index = 0
+            change_overview_mode(True)
+            return
         if state.selected_tab_index == new_index:
             return
         if state.selected_tab_index == 0 and new_index != 0:
             close_overview_globe_webview()
-        if state.selected_tab_index == 6 and new_index != 6:
-            close_mapcn_webview()
         state.selected_tab_index = new_index
         refresh_ui()
 
@@ -9911,879 +10028,7 @@ def main(page: ft.Page):
         refresh_ui()
         show_snack("Takeoff tab opened. Scroll to Fuel Planning.")
 
-    def legacy_login_page():
-        # Clean FMS cutout login rewrite.
-        # The login screen is intentionally simple now:
-        # Layer 1: pure black base
-        # Layer 2: generated transparent FMS cutout image
-        # Layer 3: login panel
-        # Layer 4: transition aircraft
-        #
-        # Put the lower image visible inside FMS here:
-        # C:\FMS\assets\backgrounds\login_fms_lower_bg.jpg
 
-        refresh_login_background_preloader()
-
-        def login_input_field(field: ft.TextField) -> ft.TextField:
-            field.width = 360
-            field.border_radius = 16
-            field.filled = True
-            field.bgcolor = "#000000"
-            field.border_color = ft.Colors.with_opacity(0.28, ft.Colors.WHITE)
-            field.focused_border_color = ft.Colors.with_opacity(0.85, ft.Colors.WHITE)
-            field.color = ft.Colors.WHITE
-            field.label_style = ft.TextStyle(color=ft.Colors.with_opacity(0.72, ft.Colors.WHITE))
-            field.text_size = 14
-            return field
-
-        login_input_field(username_tf)
-        login_input_field(password_tf)
-        login_error.color = "#FFB4B4"
-        login_error.size = 12
-
-        def generated_fms_cutout_base64() -> Optional[str]:
-            lower_bg_abs = login_fms_lower_background_abs_path()
-            if not lower_bg_abs or not lower_bg_abs.exists():
-                try:
-                    print("FMS login cutout warning: lower background image not found. Expected assets/backgrounds/login_fms_lower_bg.jpg")
-                except Exception:
-                    pass
-                return None
-
-            try:
-                from PIL import Image, ImageDraw, ImageFont
-                import io
-                import base64
-            except Exception as ex:
-                try:
-                    print(f"FMS login cutout warning: Pillow is missing or unavailable: {ex}")
-                except Exception:
-                    pass
-                return None
-
-            try:
-                canvas_w, canvas_h = 3500, 925
-                bg = Image.open(lower_bg_abs).convert("RGB")
-                bg_ratio = bg.width / max(1, bg.height)
-                target_ratio = canvas_w / canvas_h
-                if bg_ratio > target_ratio:
-                    new_h = canvas_h
-                    new_w = int(new_h * bg_ratio)
-                else:
-                    new_w = canvas_w
-                    new_h = int(new_w / bg_ratio)
-                bg_resized = bg.resize((new_w, new_h))
-                crop_x = max(0, (new_w - canvas_w) // 2)
-                crop_y = max(0, (new_h - canvas_h) // 2)
-                bg_crop = bg_resized.crop((crop_x, crop_y, crop_x + canvas_w, crop_y + canvas_h)).convert("RGBA")
-
-                font_candidates = [
-                    Path(r"C:\Windows\Fonts\ariblk.ttf"),
-                    Path(r"C:\Windows\Fonts\impact.ttf"),
-                    Path(r"C:\Windows\Fonts\arialbd.ttf"),
-                    Path(r"C:\Windows\Fonts\bahnschrift.ttf"),
-                ]
-                font_path = next((p for p in font_candidates if p.exists()), None)
-                font = ImageFont.truetype(str(font_path), 750) if font_path else ImageFont.load_default()
-
-                mask = Image.new("L", (canvas_w, canvas_h), 0)
-                text_value = "FMS"
-
-                tmp_w, tmp_h = 2600, 860
-                temp = Image.new("L", (tmp_w, tmp_h), 0)
-                temp_draw = ImageDraw.Draw(temp)
-                bbox = temp_draw.textbbox((0, 0), text_value, font=font)
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-                temp_draw.text(
-                    ((tmp_w - tw) // 2 - bbox[0], (tmp_h - th) // 2 - bbox[1] - 10),
-                    text_value,
-                    font=font,
-                    fill=255,
-                )
-
-                stretch_w = int(tmp_w * 1.32)
-                temp = temp.resize((stretch_w, tmp_h))
-                x = (canvas_w - temp.width) // 2
-                y = (canvas_h - temp.height) // 2
-                mask.paste(temp, (x, y))
-
-                output = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-                output.paste(bg_crop, (0, 0), mask)
-
-                buffer = io.BytesIO()
-                output.save(buffer, format="PNG")
-                return base64.b64encode(buffer.getvalue()).decode("ascii")
-            except Exception as ex:
-                try:
-                    print(f"FMS login cutout warning: cutout generation failed: {ex}")
-                except Exception:
-                    pass
-                return None
-
-        def fms_text_layer() -> ft.Control:
-            cutout_base64 = generated_fms_cutout_base64()
-            if cutout_base64:
-                return ft.Container(
-                    width=2600,
-                    height=688,
-                    alignment=ft.Alignment(0, 0),
-                    content=ft.Image(
-                        src=f"data:image/png;base64,{cutout_base64}",
-                        width=2600,
-                        height=688,
-                        fit=ft.BoxFit.CONTAIN,
-                    ),
-                )
-
-            return ft.Container(
-                width=2600,
-                height=688,
-                alignment=ft.Alignment(0, 0),
-                content=ft.Text(
-                    "FMS",
-                    size=550,
-                    weight=ft.FontWeight.W_900,
-                    color=ft.Colors.with_opacity(0.28, ft.Colors.WHITE),
-                    text_align=ft.TextAlign.CENTER,
-                ),
-            )
-
-        login_form = ft.Container(
-            width=440,
-            height=330,
-            padding=ft.padding.only(left=24, right=24, top=26, bottom=22),
-            content=ft.Column(
-                tight=True,
-                spacing=14,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Text(
-                        "Enter your crew credentials to continue.",
-                        size=12,
-                        color=ft.Colors.with_opacity(0.72, ft.Colors.WHITE),
-                        text_align=ft.TextAlign.CENTER,
-                    ),
-                    username_tf,
-                    password_tf,
-                    login_error,
-                    ft.GestureDetector(
-                        mouse_cursor=ft.MouseCursor.CLICK,
-                        on_tap=do_login,
-                        content=ft.Container(
-                            width=360,
-                            height=48,
-                            margin=ft.margin.only(top=2),
-                            alignment=ft.Alignment(0, 0),
-                            border_radius=16,
-                            bgcolor=ft.Colors.with_opacity(0.95, "#061A40"),
-                            border=ft.border.all(1, ft.Colors.with_opacity(0.28, ft.Colors.WHITE)),
-                            shadow=ft.BoxShadow(
-                                blur_radius=18,
-                                spread_radius=0,
-                                color=ft.Colors.with_opacity(0.28, tokens["accent"]),
-                                offset=ft.Offset(0, 7),
-                            ),
-                            content=ft.Text(
-                                "Enter Dashboard",
-                                size=14,
-                                weight=ft.FontWeight.W_800,
-                                color=ft.Colors.WHITE,
-                                text_align=ft.TextAlign.CENTER,
-                            ),
-                        ),
-                    ),
-                ],
-            ),
-        )
-
-        login_panel = ft.Container(
-            width=440,
-            height=330,
-            border_radius=30,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=ft.Colors.BLACK,
-            shadow=ft.BoxShadow(
-                blur_radius=34,
-                spread_radius=1,
-                color=ft.Colors.with_opacity(0.45, ft.Colors.BLACK),
-                offset=ft.Offset(0, 14),
-            ),
-            content=login_form,
-        )
-
-        hero_top_label = ft.Container(
-            height=64,
-            padding=ft.padding.only(left=42, right=42, top=18),
-            content=ft.Row(
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Row(
-                        spacing=12,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.Container(
-                                width=34,
-                                height=34,
-                                border_radius=11,
-                                alignment=ft.Alignment(0, 0),
-                                bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.WHITE),
-                                border=ft.border.all(1, ft.Colors.with_opacity(0.22, ft.Colors.WHITE)),
-                                content=ft.Icon(ft.Icons.FLIGHT_TAKEOFF, size=19, color=ft.Colors.WHITE),
-                            ),
-                            ft.Text(
-                                "Flight Management Systems",
-                                size=17,
-                                weight=ft.FontWeight.W_700,
-                                color=ft.Colors.with_opacity(0.90, ft.Colors.WHITE),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        )
-
-        login_layout = ft.Stack(
-            expand=True,
-            controls=[
-                hero_top_label,
-                ft.Container(
-                    top=-18,
-                    left=0,
-                    right=0,
-                    alignment=ft.Alignment(0, -1),
-                    content=fms_text_layer(),
-                ),
-                ft.Container(
-                    top=515,
-                    left=0,
-                    right=0,
-                    alignment=ft.Alignment(0, -1),
-                    content=login_panel,
-                ),
-            ],
-        )
-
-        transition_active = bool(getattr(state, "login_transition_active", False))
-        login_transition_icon_src = (
-            asset_rel_path_if_exists("icons/nav/login_transition_aircraft.png")
-            or asset_rel_path_if_exists("icons/login_transition_aircraft.png")
-            or asset_rel_path_if_exists("login_transition_aircraft.png")
-        )
-
-        viewport_height = int(getattr(page, "window_height", 820) or 820)
-        transition_distance = viewport_height + 420
-        login_slide_y = transition_distance if transition_active else 0
-        aircraft_top = -360 if transition_active else viewport_height + 110
-        transition_opacity = 1.0 if transition_active else 0.0
-
-        try:
-            transition_animation = ft.Animation(3000, ft.AnimationCurve.EASE_IN_OUT)
-        except Exception:
-            transition_animation = None
-
-        login_layer_kwargs = dict(
-            top=-login_slide_y,
-            left=0,
-            right=0,
-            height=viewport_height,
-            content=login_layout,
-        )
-
-        aircraft_layer_kwargs = dict(
-            key="login_full_page_aircraft_transition",
-            top=aircraft_top,
-            left=0,
-            right=0,
-            height=320,
-            opacity=transition_opacity,
-            alignment=ft.Alignment(0, 0),
-            content=ft.Column(
-                tight=True,
-                spacing=12,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    (
-                        ft.Image(
-                            src=login_transition_icon_src,
-                            width=116,
-                            height=116,
-                            fit=ft.BoxFit.CONTAIN,
-                        )
-                        if login_transition_icon_src
-                        else ft.Icon(ft.Icons.FLIGHT_TAKEOFF, size=104, color=ft.Colors.WHITE)
-                    ),
-                ],
-            ),
-        )
-
-        if transition_animation is not None:
-            login_layer_kwargs["animate_position"] = transition_animation
-            aircraft_layer_kwargs["animate_position"] = transition_animation
-
-        login_content_layer = ft.Container(**login_layer_kwargs)
-        transition_aircraft_layer = ft.Container(**aircraft_layer_kwargs)
-
-        copyright_text = ft.Container(
-            expand=True,
-            alignment=ft.Alignment(0, 1),
-            padding=ft.padding.only(bottom=10),
-            content=ft.Text(
-                "© 2026 Flight Management Systems. All rights reserved.",
-                size=11,
-                color=ft.Colors.with_opacity(0.42, ft.Colors.WHITE),
-                text_align=ft.TextAlign.CENTER,
-            ),
-        )
-
-        return ft.Stack(
-            expand=True,
-            controls=[
-                ft.Container(expand=True, bgcolor=ft.Colors.BLACK),
-                copyright_text,
-                login_content_layer,
-                transition_aircraft_layer,
-            ],
-        )
-
-    def login_page():
-        field_animation = ft.Animation(260, ft.AnimationCurve.EASE_IN_OUT_CUBIC)
-        reveal_animation = ft.Animation(760, ft.AnimationCurve.EASE_IN_OUT_CUBIC)
-
-        def app_icon_png_src() -> Optional[str]:
-            if bool(getattr(login_page, "_app_icon_loaded", False)):
-                return getattr(login_page, "_app_icon_src", None)
-
-            icon_src = None
-            try:
-                from PIL import Image
-                import base64
-                import io
-
-                if runtime_icon.exists():
-                    with Image.open(runtime_icon) as icon_image:
-                        rgba = icon_image.convert("RGBA")
-                        rgba.thumbnail((384, 384), Image.Resampling.LANCZOS)
-                        buffer = io.BytesIO()
-                        rgba.save(buffer, format="PNG")
-                        icon_src = f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
-            except Exception:
-                icon_src = None
-
-            login_page._app_icon_loaded = True
-            login_page._app_icon_src = icon_src
-            return icon_src
-
-        def style_login_field(field: ft.TextField, hint_text: str):
-            field.label = None
-            field.hint_text = hint_text
-            field.width = 342
-            field.height = 58
-            field.border = ft.InputBorder.NONE
-            field.border_radius = 20
-            field.filled = True
-            field.bgcolor = ft.Colors.TRANSPARENT
-            field.focused_bgcolor = ft.Colors.TRANSPARENT
-            field.color = "#F7F8FA"
-            field.cursor_color = ft.Colors.WHITE
-            field.hint_style = ft.TextStyle(
-                color=ft.Colors.with_opacity(0.76, ft.Colors.WHITE),
-                size=15,
-                weight=ft.FontWeight.W_500,
-            )
-            field.text_size = 15
-            field.content_padding = ft.padding.only(left=18, right=16, top=10, bottom=10)
-
-        style_login_field(username_tf, "Username")
-        style_login_field(password_tf, "Password")
-        username_tf.autofocus = False
-        login_error.color = "#FFB7B7"
-        login_error.size = 11
-        login_error.height = 18
-        login_error.text_align = ft.TextAlign.CENTER
-
-        def active_slot_shadow():
-            return ft.BoxShadow(
-                blur_radius=20,
-                spread_radius=0,
-                color=ft.Colors.with_opacity(0.24, ft.Colors.BLACK),
-                offset=ft.Offset(0, 8),
-            )
-
-        username_slot = ft.Container(
-            width=350,
-            height=60,
-            border_radius=21,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=ft.Colors.with_opacity(0.16, ft.Colors.WHITE),
-            border=ft.border.all(1, ft.Colors.with_opacity(0.58, ft.Colors.WHITE)),
-            shadow=active_slot_shadow(),
-            animate_size=field_animation,
-            animate=field_animation,
-            alignment=ft.Alignment(0, 0),
-            content=username_tf,
-        )
-        password_slot = ft.Container(
-            width=350,
-            height=42,
-            border_radius=18,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=ft.Colors.TRANSPARENT,
-            border=ft.border.all(1, ft.Colors.TRANSPARENT),
-            animate_size=field_animation,
-            animate=field_animation,
-            alignment=ft.Alignment(0, 0),
-            content=password_tf,
-        )
-
-        active_field = {"value": "username"}
-
-        def set_active_login_field(field_name: str):
-            if field_name not in ("username", "password") or active_field["value"] == field_name:
-                return
-            active_field["value"] = field_name
-            username_active = field_name == "username"
-
-            for slot, is_active in ((username_slot, username_active), (password_slot, not username_active)):
-                slot.height = 60 if is_active else 42
-                slot.border_radius = 21 if is_active else 18
-                slot.bgcolor = ft.Colors.with_opacity(0.16, ft.Colors.WHITE) if is_active else ft.Colors.TRANSPARENT
-                slot.border = ft.border.all(
-                    1,
-                    ft.Colors.with_opacity(0.58, ft.Colors.WHITE) if is_active else ft.Colors.TRANSPARENT,
-                )
-                slot.shadow = active_slot_shadow() if is_active else None
-
-            username_tf.height = 58 if username_active else 40
-            password_tf.height = 58 if not username_active else 40
-            username_tf.text_size = 15 if username_active else 13
-            password_tf.text_size = 15 if not username_active else 13
-            page.update()
-
-        def hover_activates(field_name: str):
-            def _handler(e):
-                set_active_login_field(field_name)
-            return _handler
-
-        username_slot.on_hover = hover_activates("username")
-        password_slot.on_hover = hover_activates("password")
-        username_tf.on_focus = lambda e: set_active_login_field("username")
-        password_tf.on_focus = lambda e: set_active_login_field("password")
-        username_tf.on_click = lambda e: set_active_login_field("username")
-        password_tf.on_click = lambda e: set_active_login_field("password")
-
-        async def submit_username(e):
-            set_active_login_field("password")
-            try:
-                await password_tf.focus()
-            except Exception:
-                pass
-
-        username_tf.on_submit = submit_username
-        password_tf.on_submit = do_login
-
-        def google_login_placeholder(e=None):
-            show_snack("Google sign-in is ready for its OAuth backend in the next phase.")
-
-        credentials_panel = ft.Container(
-            width=374,
-            height=128,
-            padding=ft.padding.all(10),
-            border_radius=28,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=ft.Colors.with_opacity(0.13, ft.Colors.WHITE),
-            border=ft.border.all(1, ft.Colors.with_opacity(0.30, ft.Colors.WHITE)),
-            blur=ft.Blur(16, 16, ft.BlurTileMode.CLAMP),
-            shadow=[
-                ft.BoxShadow(
-                    blur_radius=32,
-                    spread_radius=0,
-                    color=ft.Colors.with_opacity(0.52, ft.Colors.BLACK),
-                    offset=ft.Offset(0, 16),
-                ),
-                ft.BoxShadow(
-                    blur_radius=20,
-                    spread_radius=0,
-                    color=ft.Colors.with_opacity(0.08, ft.Colors.WHITE),
-                    offset=ft.Offset(0, -4),
-                ),
-            ],
-            content=ft.Column(
-                tight=True,
-                spacing=6,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[username_slot, password_slot],
-            ),
-        )
-
-        sign_in_button = ft.Container(
-            width=374,
-            height=47,
-            alignment=ft.Alignment(0, 0),
-            border_radius=18,
-            bgcolor="#F3F5F8",
-            border=ft.border.all(1, ft.Colors.with_opacity(0.78, ft.Colors.WHITE)),
-            shadow=ft.BoxShadow(
-                blur_radius=22,
-                spread_radius=0,
-                color=ft.Colors.with_opacity(0.18, ft.Colors.WHITE),
-                offset=ft.Offset(0, 8),
-            ),
-            on_click=do_login,
-            content=ft.Row(
-                alignment=ft.MainAxisAlignment.CENTER,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=10,
-                controls=[
-                    ft.Text("Sign in", size=14, weight=ft.FontWeight.W_800, color="#111317"),
-                    ft.Icon(ft.Icons.ARROW_FORWARD_ROUNDED, size=18, color="#111317"),
-                ],
-            ),
-        )
-
-        google_button = ft.Container(
-            width=374,
-            height=45,
-            alignment=ft.Alignment(0, 0),
-            border_radius=18,
-            bgcolor=ft.Colors.with_opacity(0.40, ft.Colors.BLACK),
-            border=ft.border.all(1, ft.Colors.with_opacity(0.24, ft.Colors.WHITE)),
-            on_click=google_login_placeholder,
-            content=ft.Row(
-                alignment=ft.MainAxisAlignment.CENTER,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=11,
-                controls=[
-                    ft.Container(
-                        width=24,
-                        height=24,
-                        alignment=ft.Alignment(0, 0),
-                        shape=ft.BoxShape.CIRCLE,
-                        bgcolor=ft.Colors.WHITE,
-                        content=ft.Text("G", size=14, weight=ft.FontWeight.W_900, color="#4285F4"),
-                    ),
-                    ft.Text(
-                        "Sign in with Gmail",
-                        size=13,
-                        weight=ft.FontWeight.W_600,
-                        color=ft.Colors.with_opacity(0.92, ft.Colors.WHITE),
-                    ),
-                ],
-            ),
-        )
-
-        login_panel = ft.Container(
-            width=410,
-            height=384,
-            opacity=1.0,
-            offset=ft.Offset(0, 0),
-            animate_opacity=reveal_animation,
-            animate_offset=reveal_animation,
-            content=ft.Stack(
-                controls=[
-                    ft.Container(left=18, top=128, content=credentials_panel),
-                    ft.Container(
-                        left=0,
-                        right=0,
-                        top=258,
-                        alignment=ft.Alignment(0, 0),
-                        content=login_error,
-                    ),
-                    ft.Container(left=18, top=280, content=sign_in_button),
-                    ft.Container(left=18, top=337, content=google_button),
-                ],
-            ),
-        )
-
-        def fms_text(text_color: str, top: int) -> ft.Container:
-            return ft.Container(
-                left=0,
-                right=0,
-                top=top,
-                alignment=ft.Alignment(0, 0),
-                content=ft.Text(
-                    "FMS",
-                    size=216,
-                    weight=ft.FontWeight.W_900,
-                    font_family="Arial Black",
-                    color=text_color,
-                ),
-            )
-
-        fms_title_layer = ft.Container(
-            width=840,
-            height=330,
-            opacity=1.0,
-            scale=1.0,
-            animate_opacity=reveal_animation,
-            animate_scale=reveal_animation,
-            content=ft.Stack(
-                controls=[
-                    fms_text("#41454D", 27),
-                    fms_text("#A9ADB5", 22),
-                    fms_text("#F7F8FA", 17),
-                ],
-            ),
-        )
-
-        light_beam_layer = ft.Container(
-            width=855,
-            height=360,
-            opacity=1.0,
-            animate_opacity=ft.Animation(900, ft.AnimationCurve.EASE_IN_OUT_SINE),
-            content=ft.Stack(
-                controls=[
-                    ft.Container(
-                        left=0,
-                        right=0,
-                        top=3,
-                        height=350,
-                        gradient=ft.RadialGradient(
-                            center=ft.Alignment(0, -1),
-                            radius=0.96,
-                            colors=[
-                                ft.Colors.with_opacity(0.15, ft.Colors.WHITE),
-                                ft.Colors.with_opacity(0.07, ft.Colors.WHITE),
-                                ft.Colors.TRANSPARENT,
-                                ft.Colors.TRANSPARENT,
-                            ],
-                            stops=[0.0, 0.32, 0.82, 1.0],
-                        ),
-                    ),
-                    ft.Container(
-                        left=30,
-                        right=30,
-                        top=3,
-                        height=342,
-                        gradient=ft.RadialGradient(
-                            center=ft.Alignment(0, -1),
-                            radius=1.05,
-                            colors=[
-                                ft.Colors.with_opacity(0.25, ft.Colors.WHITE),
-                                ft.Colors.with_opacity(0.11, ft.Colors.WHITE),
-                                ft.Colors.with_opacity(0.03, ft.Colors.WHITE),
-                                ft.Colors.TRANSPARENT,
-                            ],
-                            stops=[0.0, 0.30, 0.66, 1.0],
-                        ),
-                    ),
-                    ft.Container(
-                        left=60,
-                        right=60,
-                        top=3,
-                        height=334,
-                        gradient=ft.RadialGradient(
-                            center=ft.Alignment(0, -1),
-                            radius=1.04,
-                            colors=[
-                                ft.Colors.with_opacity(0.42, ft.Colors.WHITE),
-                                ft.Colors.with_opacity(0.18, ft.Colors.WHITE),
-                                ft.Colors.with_opacity(0.04, ft.Colors.WHITE),
-                                ft.Colors.TRANSPARENT,
-                            ],
-                            stops=[0.0, 0.28, 0.64, 1.0],
-                        ),
-                    ),
-                    ft.Container(
-                        left=147,
-                        right=147,
-                        top=3,
-                        height=3,
-                        border_radius=2,
-                        gradient=ft.LinearGradient(
-                            begin=ft.Alignment(-1, 0),
-                            end=ft.Alignment(1, 0),
-                            colors=[
-                                ft.Colors.TRANSPARENT,
-                                ft.Colors.with_opacity(0.98, ft.Colors.WHITE),
-                                ft.Colors.TRANSPARENT,
-                            ],
-                            stops=[0.0, 0.5, 1.0],
-                        ),
-                    ),
-                ],
-            ),
-        )
-
-        app_icon_src = app_icon_png_src()
-        logo_morph_animation = ft.Animation(920, ft.AnimationCurve.EASE_IN_OUT_CUBIC)
-        app_icon_visual = ft.Container(
-            width=124,
-            height=124,
-            opacity=0.0,
-            scale=0.92,
-            animate_opacity=logo_morph_animation,
-            animate_scale=logo_morph_animation,
-            alignment=ft.Alignment(0, 0),
-            content=(
-                ft.Image(src=app_icon_src, width=118, height=118, fit=ft.BoxFit.CONTAIN, anti_alias=True)
-                if app_icon_src
-                else ft.Icon(ft.Icons.FLIGHT_TAKEOFF, size=92, color=ft.Colors.WHITE)
-            ),
-        )
-
-        hero = ft.Container(
-            width=855,
-            height=360,
-            content=ft.Stack(controls=[light_beam_layer, fms_title_layer]),
-        )
-
-        transition_active = bool(getattr(state, "login_transition_active", False))
-        viewport_height = int(getattr(page, "height", 0) or getattr(page, "window_height", 820) or 820)
-        splash_center_top = max(0, int((viewport_height - 124) / 2))
-        app_icon_position_layer = ft.Container(
-            left=0,
-            right=0,
-            top=splash_center_top,
-            height=124,
-            alignment=ft.Alignment(0, 0),
-            animate_position=logo_morph_animation,
-            content=app_icon_visual,
-        )
-
-        intro_pending = not bool(getattr(state, "login_intro_started", False)) and not transition_active
-        if intro_pending:
-            state.login_intro_started = True
-            app_icon_visual.opacity = 1.0
-            app_icon_visual.scale = 0.96
-            fms_title_layer.opacity = 0.0
-            fms_title_layer.scale = 0.72
-            light_beam_layer.opacity = 0.0
-            login_panel.opacity = 0.0
-            login_panel.offset = ft.Offset(0, 0.08)
-
-        login_layout = ft.Stack(
-            expand=True,
-            controls=[
-                ft.Container(
-                    left=0,
-                    right=0,
-                    top=34,
-                    height=360,
-                    alignment=ft.Alignment(0, -1),
-                    content=hero,
-                ),
-                ft.Container(
-                    left=0,
-                    right=0,
-                    top=0,
-                    bottom=0,
-                    alignment=ft.Alignment(0, 0),
-                    content=login_panel,
-                ),
-                app_icon_position_layer,
-            ],
-        )
-
-        async def play_login_intro():
-            await asyncio.sleep(2.0)
-            if state.is_logged_in or bool(getattr(state, "login_transition_active", False)):
-                return
-            app_icon_position_layer.top = 86
-            app_icon_visual.scale = ft.Scale(scale_x=5.0, scale_y=0.68)
-            app_icon_visual.opacity = 0.05
-            fms_title_layer.opacity = 1.0
-            fms_title_layer.scale = 1.0
-            light_beam_layer.opacity = 1.0
-            login_panel.opacity = 1.0
-            login_panel.offset = ft.Offset(0, 0)
-            page.update()
-            await asyncio.sleep(0.85)
-            if state.is_logged_in or bool(getattr(state, "login_transition_active", False)):
-                return
-            app_icon_visual.opacity = 0.0
-            light_beam_layer.opacity = 0.86
-            page.update()
-            await asyncio.sleep(0.40)
-            if state.is_logged_in or bool(getattr(state, "login_transition_active", False)):
-                return
-            light_beam_layer.opacity = 1.0
-            page.update()
-
-        login_transition_icon_src = (
-            asset_rel_path_if_exists("icons/nav/login_transition_aircraft.png")
-            or asset_rel_path_if_exists("icons/login_transition_aircraft.png")
-            or asset_rel_path_if_exists("login_transition_aircraft.png")
-        )
-        transition_distance = viewport_height + 420
-        login_slide_y = transition_distance if transition_active else 0
-        aircraft_top = -360 if transition_active else viewport_height + 110
-        transition_opacity = 1.0 if transition_active else 0.0
-        transition_animation = ft.Animation(3000, ft.AnimationCurve.EASE_IN_OUT_CUBIC)
-
-        login_content_layer = ft.Container(
-            key="login_full_page_content",
-            top=-login_slide_y,
-            bottom=login_slide_y,
-            left=0,
-            right=0,
-            animate_position=transition_animation,
-            content=login_layout,
-        )
-        transition_aircraft_layer = ft.Container(
-            key="login_full_page_aircraft_transition",
-            top=aircraft_top,
-            left=0,
-            right=0,
-            height=320,
-            opacity=transition_opacity,
-            animate_position=transition_animation,
-            alignment=ft.Alignment(0, 0),
-            content=(
-                ft.Image(
-                    src=login_transition_icon_src,
-                    width=116,
-                    height=116,
-                    fit=ft.BoxFit.CONTAIN,
-                )
-                if login_transition_icon_src
-                else ft.Icon(ft.Icons.FLIGHT_TAKEOFF, size=104, color=ft.Colors.WHITE)
-            ),
-        )
-
-        copyright_text = ft.Container(
-            expand=True,
-            alignment=ft.Alignment(0, 1),
-            padding=ft.padding.only(bottom=10),
-            content=ft.Text(
-                "Copyright 2026 Flight Management Systems. All rights reserved.",
-                size=11,
-                color=ft.Colors.with_opacity(0.42, ft.Colors.WHITE),
-                text_align=ft.TextAlign.CENTER,
-            ),
-        )
-
-        result = ft.Stack(
-            expand=True,
-            controls=[
-                ft.Container(expand=True, bgcolor="#111214"),
-                ft.Container(
-                    expand=True,
-                    gradient=ft.RadialGradient(
-                        center=ft.Alignment(0, -0.68),
-                        radius=1.12,
-                        colors=["#25272B", "#151618", "#101113"],
-                        stops=[0.0, 0.48, 1.0],
-                    ),
-                ),
-                copyright_text,
-                login_content_layer,
-                transition_aircraft_layer,
-            ],
-        )
-
-        if intro_pending:
-            try:
-                page.run_task(play_login_intro)
-            except Exception:
-                app_icon_visual.opacity = 0.0
-                fms_title_layer.opacity = 1.0
-                fms_title_layer.scale = 1.0
-                light_beam_layer.opacity = 1.0
-                login_panel.opacity = 1.0
-                login_panel.offset = ft.Offset(0, 0)
-        return result
 
     def build_globe_route_url(view_mode: str = "full") -> Optional[str]:
         web_map_index = base_dir / "globe-gl-test-web" / "dist" / "index.html"
@@ -10843,18 +10088,24 @@ def main(page: ft.Page):
 
 
     def overview_page():
-        nonlocal overview_progress_refresh_callback, ramp_status_refresh_callback
-        # Phase 4 debug version:
-        # Keep the original app intact and rebuild only the Overview page body.
-        # This avoids the previous blank/gray render while preserving all other pages.
-        overview_daylight_mode = str(getattr(state, "display_mode", "dark") or "dark").lower() == "daylight"
+        nonlocal overview_progress_refresh_callback, ramp_status_refresh_callback, live_render_callback
+        if not live_map_process:
+            live_render_callback = None
+        overview_daylight_mode = use_daylight_cards()
         overview_route_scale = 1.00
         overview_card_height = 440
         overview_ramp_width = 430
-        overview_flight_width = 240
-        overview_margin = 18
-        overview_glass_fill = ft.Colors.with_opacity(0.34, tokens["panel"])
-        overview_glass_border = ft.Colors.with_opacity(0.14, ft.Colors.WHITE)
+        airport_card_width = 196
+        bottom_card_height = 100
+        metrics_width = 332
+        overview_glass_fill = ft.Colors.with_opacity(0.20, tokens["panel"])
+        overview_glass_border = tokens["card_border"]
+        # Satellite tiles can be bright or dark in either display mode.
+        overview_text_color = DARK["text"]
+        overview_text_style = ft.TextStyle(shadow=[
+            ft.BoxShadow(color="#101820", blur_radius=2),
+            ft.BoxShadow(color="#101820", blur_radius=4, offset=ft.Offset(0, 1)),
+        ])
         overview_airport_marker_size = 126
         overview_progress_height = 58
         overview_route_aircraft_marker = None
@@ -10869,7 +10120,7 @@ def main(page: ft.Page):
             height: Optional[int] = None,
             expand: bool = False,
             padding: int = 14,
-            radius: int = 20,
+            radius: int = CARD_RADIUS,
         ) -> ft.Control:
             return ft.Container(
                 width=width,
@@ -10879,14 +10130,9 @@ def main(page: ft.Page):
                 border_radius=radius,
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
                 bgcolor=overview_glass_fill,
-                blur=ft.Blur(12, 12, ft.BlurTileMode.CLAMP),
+                blur=ft.Blur(8, 8, ft.BlurTileMode.CLAMP),
                 border=ft.border.all(1, overview_glass_border),
-                shadow=ft.BoxShadow(
-                    blur_radius=18,
-                    spread_radius=1,
-                    color=ft.Colors.with_opacity(0.10, ft.Colors.BLACK),
-                    offset=ft.Offset(0, 6),
-                ),
+                shadow=surface_shadow(0.72),
                 content=content,
             )
 
@@ -10896,6 +10142,7 @@ def main(page: ft.Page):
         destination_icao = (state.arrival or landing_arrival_icao_tf.value or "").strip().upper()
         origin_icao = normalize_airport_code(origin_icao) or origin_icao
         destination_icao = normalize_airport_code(destination_icao) or destination_icao
+        has_complete_route = bool(origin_icao and destination_icao)
         if origin_icao:
             state.departure = origin_icao
         if destination_icao:
@@ -10912,51 +10159,12 @@ def main(page: ft.Page):
             and getattr(state, "route_distance_override_key", "") == overview_route_key
         )
         route_nm = float(override_nm) if override_active else calculated_route_nm
-        distance_subtitle = "Manual from fuel plan" if override_active else "Great-circle estimate"
-        fuel_plan = state.takeoff_last_result.get("fuel_plan", {}) if state.takeoff_last_result else {}
-        ete_hours = fuel_plan.get("ete_hours") if isinstance(fuel_plan, dict) else None
-        if not isinstance(ete_hours, (int, float)) or ete_hours <= 0:
-            try:
-                gs = resolve_takeoff_fuel_config(state.aircraft or takeoff_aircraft_dd.value).cruise_gs_kt_default
-            except Exception:
-                gs = 460
-            ete_hours = (route_nm / gs) if route_nm else None
-
-        total_ete_minutes = int(round(float(ete_hours) * 60)) if ete_hours else 0
-        if total_ete_minutes <= 0:
-            total_ete_minutes = int(getattr(state, "overview_flight_time_minutes", 0) or 0)
-
-        ete_remaining_minutes = total_ete_minutes
-        if int(state.overview_flight_status_index or 0) >= 5:
-            ete_remaining_minutes = 0
-        elif (
-            bool(getattr(state, "overview_progress_running", False))
-            and isinstance(getattr(state, "overview_takeoff_start_timestamp", None), (int, float))
-            and total_ete_minutes > 0
-        ):
-            elapsed_minutes = int(max(0.0, time.time() - float(state.overview_takeoff_start_timestamp)) / 60.0)
-            ete_remaining_minutes = max(0, total_ete_minutes - elapsed_minutes)
-
-        ete_label = format_hours_to_hm(ete_remaining_minutes / 60.0) if total_ete_minutes > 0 else "Awaiting route"
-
-        if isinstance(getattr(state, "overview_locked_eta_timestamp", None), (int, float)):
-            eta_timestamp = float(state.overview_locked_eta_timestamp)
-        elif ete_hours:
-            eta_timestamp = datetime.now().timestamp() + float(ete_hours) * 3600
-        else:
-            eta_timestamp = None
-        eta_text = datetime.fromtimestamp(eta_timestamp).strftime("%H:%M") if eta_timestamp else "—"
-        overview_ete_value_text.value = ete_label
-        overview_eta_value_text.value = eta_text
-        overview_ete_value_text.color = tokens["text"]
-        overview_eta_value_text.color = tokens["text"]
-        overview_ete_value_text.size = route_scaled(18, 13)
-        overview_eta_value_text.size = route_scaled(18, 13)
         distance_label = f"{route_nm:.0f} NM" if route_nm else "—"
         flight_phase = "Cruise monitor ready" if route_nm else "Awaiting route setup"
 
-        planned_fuel = fuel_plan.get("planned_fuel_kg") if isinstance(fuel_plan, dict) else None
-        trip_fuel = (fuel_plan.get("corrected_trip_fuel_kg") or fuel_plan.get("trip_fuel_kg")) if isinstance(fuel_plan, dict) else None
+        fuel_plan = state.takeoff_last_result.get("fuel_plan") or {}
+        planned_fuel = fuel_plan.get("planned_fuel_kg") or fuel_plan.get("block_fuel_kg")
+        trip_fuel = fuel_plan.get("corrected_trip_fuel_kg") or fuel_plan.get("trip_fuel_kg")
         planned_fuel_label = f"{planned_fuel/1000:.1f} t" if isinstance(planned_fuel, (int, float)) else "—"
         fuel_burn_label = f"{trip_fuel/1000:.1f} t trip" if isinstance(trip_fuel, (int, float)) else "—"
 
@@ -10966,7 +10174,7 @@ def main(page: ft.Page):
                 height=110,
                 padding=12,
                 border_radius=18,
-                bgcolor=tokens["subpanel"],
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     spacing=4,
@@ -10979,107 +10187,38 @@ def main(page: ft.Page):
                 ),
             )
 
-        def overview_airport_card_background_src(code: str, title: str) -> Optional[str]:
-            title_key = "origin" if title.lower().startswith("origin") else "destination"
-            return airport_card_background_src(code, title_key)
-
-        def point_card(title: str, code: str, target_tab_index: Optional[int] = None) -> ft.Control:
-            record = lookup_airport_record(code)
-            airport_name = record.get("name", "Airport not selected") if record else "Airport not selected"
-            weather = airport_weather_for_card(code)
-            background_src = overview_airport_card_background_src(code, title)
-            is_origin_card = title.lower().startswith("origin")
-            terminal_value = (state.departure_terminal if is_origin_card else state.arrival_terminal) or "—"
-            gate_value = (state.departure_gate if is_origin_card else state.arrival_gate) or "—"
-            point_size = route_scaled(280, 180)
-
-            background_layers: List[ft.Control] = [
-                ft.Container(expand=True, bgcolor=overview_glass_fill, blur=ft.Blur(12, 12, ft.BlurTileMode.CLAMP)),
-            ]
-            if background_src:
-                background_layers.extend([
-                    ft.Container(
-                        expand=True,
-                        image=ft.DecorationImage(
-                            src=background_src,
-                            fit=ft.BoxFit.COVER,
-                            opacity=0.42,
-                        ),
-                    ),
-                    ft.Container(
-                        expand=True,
-                        bgcolor=ft.Colors.with_opacity(0.18 if overview_daylight_mode else 0.28, ft.Colors.BLACK),
-                    ),
-                ])
-
-            card = ft.Container(
-                width=point_size,
-                height=point_size,
-                border_radius=route_scaled(20, 14),
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=overview_glass_fill,
-                blur=ft.Blur(12, 12, ft.BlurTileMode.CLAMP),
-                border=ft.border.all(1, overview_glass_border),
-                shadow=ft.BoxShadow(
-                    blur_radius=18,
-                    spread_radius=1,
-                    color=ft.Colors.with_opacity(0.10, ft.Colors.BLACK),
-                    offset=ft.Offset(0, 6),
-                ),
-                content=ft.Stack(
-                    expand=True,
+        def point_card(title: str, code: str, target_tab_index: Optional[int] = None, *, live=False) -> ft.Control:
+            record = live_airport_record(code) if live else lookup_airport_record(code)
+            airport_name = (record or {}).get("name") or ("Airport name unavailable" if code else "Airport not selected")
+            weather = airport_weather_for_card(code) if not live else {}
+            is_departure = title == "Departure"
+            terminal = (state.departure_terminal if is_departure else state.arrival_terminal) or "—"
+            gate = (state.departure_gate if is_departure else state.arrival_gate) or "—"
+            color, foreground = ("#FFE54D", "#211D0A") if is_departure else ("#7263E8", "#FFFFFF")
+            weather_label = f"{weather.get('temperature', '—')}  ·  {weather.get('condition', 'Weather unavailable')}"
+            stand_label = f"Terminal {terminal}  ·  Gate {gate}"
+            card = overview_glass_panel(
+                ft.Column(
+                    spacing=5,
                     controls=[
-                        *background_layers,
+                        ft.Text(title, size=12, weight=ft.FontWeight.W_600, color=overview_text_color, style=overview_text_style),
                         ft.Container(
-                            expand=True,
-                            padding=route_scaled(14, 10),
-                            content=ft.Column(
-                                spacing=route_scaled(6, 4),
-                                controls=[
-                                    ft.Row(
-                                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                        vertical_alignment=ft.CrossAxisAlignment.START,
-                                        controls=[
-                                            ft.Text(title, size=route_scaled(11, 9), color=tokens["muted"]),
-                                            ft.Column(
-                                                spacing=1,
-                                                horizontal_alignment=ft.CrossAxisAlignment.END,
-                                                controls=[
-                                                    ft.Text(
-                                                        str(weather.get("temperature", "—")),
-                                                        size=route_scaled(14, 10),
-                                                        weight=ft.FontWeight.W_800,
-                                                        color=tokens["text"],
-                                                    ),
-                                                    ft.Text(
-                                                        f"{weather.get('icon', '🌡️')} {weather.get('condition', 'Weather unavailable')}",
-                                                        size=route_scaled(11, 8),
-                                                        color=tokens["muted"],
-                                                        max_lines=1,
-                                                        overflow=ft.TextOverflow.ELLIPSIS,
-                                                    ),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                    ft.Text(code or "—", size=route_scaled(28, 20), weight=ft.FontWeight.W_900, color=tokens["text"]),
-                                    ft.Text(airport_name, size=route_scaled(13, 10), color=tokens["muted"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                                    ft.Container(
-                                        margin=ft.margin.only(top=route_scaled(4, 2)),
-                                        content=ft.Column(
-                                            tight=True,
-                                            spacing=2,
-                                            controls=[
-                                                ft.Text(f"Terminal: {terminal_value}", size=route_scaled(12, 9), color=tokens["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                                ft.Text(f"Gate: {gate_value}", size=route_scaled(12, 9), color=tokens["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                            ],
-                                        ),
-                                    ),
-                                ],
-                            ),
+                            width=74 if live else None,
+                            padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                            border_radius=5, bgcolor=color,
+                            content=ft.Text(code or "—", size=17, weight=ft.FontWeight.W_700, color=foreground),
                         ),
+                        ft.Text(airport_name, size=13, color=overview_text_color, style=overview_text_style,
+                                max_lines=2, overflow=ft.TextOverflow.ELLIPSIS, tooltip=airport_name),
+                        *([] if live else [
+                            ft.Text(weather_label, size=11, color=overview_text_color, style=overview_text_style,
+                                    max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, tooltip=weather_label),
+                            ft.Text(stand_label, size=11, color=overview_text_color, style=overview_text_style,
+                                    max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, tooltip=stand_label),
+                        ]),
                     ],
                 ),
+                padding=11,
             )
 
             if target_tab_index is None:
@@ -11095,23 +10234,17 @@ def main(page: ft.Page):
         # Flight status controls below will drive this percentage.
         OVERVIEW_FLIGHT_STATUSES = ["Gate", "Taxi Out", "Takeoff", "Cruise", "Landing", "Taxi In", "Gate"]
 
-        def overview_flight_duration_minutes() -> int:
-            try:
-                return max(1, int(float(state.overview_flight_time_minutes or 120)))
-            except Exception:
-                return 120
-
         def overview_progress_percent() -> float:
             idx = max(0, min(len(OVERVIEW_FLIGHT_STATUSES) - 1, int(state.overview_flight_status_index or 0)))
             if idx < 2:
                 return 0.0
             if idx >= 5:
                 return 100.0
-            start_ts = state.overview_takeoff_start_timestamp
-            if not state.overview_progress_running or not isinstance(start_ts, (int, float)):
+            duration_minutes = planned_overview_minutes()
+            if not duration_minutes:
                 return 0.0
-            elapsed_min = max(0.0, (time.time() - float(start_ts)) / 60.0)
-            return clamp((elapsed_min / overview_flight_duration_minutes()) * 100.0, 0.0, 100.0)
+            elapsed_min = overview_elapsed_seconds() / 60.0
+            return clamp((elapsed_min / duration_minutes) * 100.0, 0.0, 100.0)
 
         current_progress = overview_progress_percent()
         current_status = OVERVIEW_FLIGHT_STATUSES[max(0, min(len(OVERVIEW_FLIGHT_STATUSES) - 1, int(state.overview_flight_status_index or 0)))]
@@ -11181,30 +10314,24 @@ def main(page: ft.Page):
 
         def refresh_overview_progress_controls(update_page: bool = True):
             live_progress = overview_progress_percent()
-            duration_minutes = overview_flight_duration_minutes()
-            remaining_minutes = duration_minutes
+            duration_minutes = planned_overview_minutes()
+            remaining_minutes = max(0, duration_minutes - int(overview_elapsed_seconds() / 60.0))
             if int(state.overview_flight_status_index or 0) >= 5:
                 remaining_minutes = 0
-            elif (
-                bool(getattr(state, "overview_progress_running", False))
-                and isinstance(getattr(state, "overview_takeoff_start_timestamp", None), (int, float))
-            ):
-                elapsed_minutes = int(max(0.0, time.time() - float(state.overview_takeoff_start_timestamp)) / 60.0)
-                remaining_minutes = max(0, duration_minutes - elapsed_minutes)
 
             locked_eta = getattr(state, "overview_locked_eta_timestamp", None)
-            if isinstance(locked_eta, (int, float)):
-                live_eta_text = datetime.fromtimestamp(float(locked_eta)).strftime("%H:%M")
-            elif duration_minutes > 0:
-                live_eta_text = datetime.fromtimestamp(datetime.now().timestamp() + duration_minutes * 60).strftime("%H:%M")
-            else:
-                live_eta_text = "—"
+            live_eta_text = "—"
+            if has_complete_route and duration_minutes > 0:
+                start = state.overview_takeoff_start_timestamp
+                if int(state.overview_flight_status_index or 0) >= 5 and locked_eta is not None:
+                    eta = locked_eta
+                else:
+                    eta = (start if start is not None else time.time()) + duration_minutes * 60
+                live_eta_text = datetime.fromtimestamp(eta).strftime("%H:%M")
 
             overview_route_line_host.content = build_aircraft_progress_line(live_progress)
-            overview_ete_value_text.value = format_hours_to_hm(remaining_minutes / 60.0) if duration_minutes > 0 else "Awaiting route"
+            overview_ete_value_text.value = format_hours_to_hm(remaining_minutes / 60.0) if duration_minutes > 0 else "—"
             overview_eta_value_text.value = live_eta_text
-            overview_progress_percent_text.value = f"{live_progress:.0f}%"
-            overview_progress_percent_text.color = tokens["accent"]
 
             if overview_route_aircraft_marker is not None and len(overview_route_aircraft_points) >= 2:
                 aircraft_lat, aircraft_lon, aircraft_bearing = minimap_route_position_and_bearing(
@@ -11219,7 +10346,6 @@ def main(page: ft.Page):
                     overview_route_line_host,
                     overview_ete_value_text,
                     overview_eta_value_text,
-                    overview_progress_percent_text,
                 ):
                     safe_update_control(ctrl)
                 safe_update_control(overview_route_aircraft_marker)
@@ -11227,14 +10353,10 @@ def main(page: ft.Page):
         overview_progress_refresh_callback = refresh_overview_progress_controls
         refresh_overview_progress_controls(update_page=False)
 
-        route_line = ft.GestureDetector(
-            mouse_cursor=ft.MouseCursor.CLICK,
-            on_tap=lambda e: go_to_tab(6),
-            content=ft.Container(
-                height=route_scaled(48, 34),
-                padding=ft.padding.symmetric(horizontal=route_scaled(12, 8), vertical=route_scaled(3, 2)),
-                content=overview_route_line_host,
-            ),
+        route_line = ft.Container(
+            height=route_scaled(48, 34),
+            padding=ft.padding.symmetric(horizontal=route_scaled(12, 8), vertical=route_scaled(3, 2)),
+            content=overview_route_line_host,
         )
 
         def live_summary_status_label() -> str:
@@ -11255,7 +10377,7 @@ def main(page: ft.Page):
                 width=width,
                 padding=ft.padding.symmetric(horizontal=14, vertical=12),
                 border_radius=18,
-                bgcolor=tokens["subpanel"],
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     tight=True,
@@ -11273,7 +10395,7 @@ def main(page: ft.Page):
             return ft.Container(
                 padding=ft.padding.symmetric(horizontal=16, vertical=14),
                 border_radius=22,
-                bgcolor=ft.Colors.with_opacity(0.48, tokens["subpanel"]),
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     spacing=10,
@@ -11298,8 +10420,8 @@ def main(page: ft.Page):
                         ft.Row(
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                             controls=[
-                                ft.Text("Origin", size=10, color=tokens["muted"]),
-                                ft.Text("Destination", size=10, color=tokens["muted"]),
+                                ft.Text("Departure", size=10, color=tokens["muted"]),
+                                ft.Text("Arrival", size=10, color=tokens["muted"]),
                             ],
                         ),
                     ],
@@ -11308,78 +10430,40 @@ def main(page: ft.Page):
 
         def set_overview_status(new_index: int):
             new_index = max(0, min(len(OVERVIEW_FLIGHT_STATUSES) - 1, int(new_index)))
+            was_complete = int(state.overview_flight_status_index or 0) >= 5
             state.overview_flight_status_index = new_index
-            # Back before Takeoff means the aircraft is still at origin.
-            if new_index < 2:
+            if new_index < 2 or (was_complete and new_index < 5):
                 state.overview_takeoff_start_timestamp = None
                 state.overview_locked_eta_timestamp = None
                 state.overview_progress_running = False
+                state.overview_paused_elapsed_seconds = None
                 state.overview_calendar_completion_key = ""
-            # Reaching Takeoff arms the progress system, but does not start it.
-            # The aircraft starts moving only after pressing Play.
-            elif new_index in (2, 3, 4):
-                if state.overview_takeoff_start_timestamp is None:
-                    state.overview_progress_running = False
-            # Force complete progress after landing/arrival phases.
             elif new_index >= 5:
-                duration_sec = overview_flight_duration_minutes() * 60
+                duration_sec = planned_overview_minutes() * 60
                 finish_ts = time.time()
-                state.overview_takeoff_start_timestamp = finish_ts - duration_sec
-                state.overview_locked_eta_timestamp = finish_ts
+                elapsed_seconds = overview_elapsed_seconds()
+                if duration_sec:
+                    state.overview_takeoff_start_timestamp = finish_ts - duration_sec
+                state.overview_locked_eta_timestamp = finish_ts if duration_sec else None
                 state.overview_progress_running = False
+                state.overview_paused_elapsed_seconds = elapsed_seconds if not duration_sec and elapsed_seconds else None
             refresh_ui()
 
-        def play_overview_progress(e=None):
-            # Play starts the moving aircraft progress. If the flight is still at
-            # Gate or Taxi Out, jump to Takeoff first, then start the timer.
-            if int(state.overview_flight_status_index or 0) < 2:
-                state.overview_flight_status_index = 2
-            if int(state.overview_flight_status_index or 0) >= 5:
-                state.overview_flight_status_index = 2
-            if state.overview_takeoff_start_timestamp is None or not state.overview_progress_running:
-                start_ts = time.time()
+        def toggle_overview_progress(e=None):
+            if state.overview_progress_running:
+                state.overview_paused_elapsed_seconds = overview_elapsed_seconds()
+                state.overview_progress_running = False
+            else:
+                if not 2 <= int(state.overview_flight_status_index or 0) < 5:
+                    state.overview_flight_status_index = 2
+                start_ts = time.time() - overview_elapsed_seconds()
                 state.overview_takeoff_start_timestamp = start_ts
-                state.overview_locked_eta_timestamp = start_ts + overview_flight_duration_minutes() * 60
+                duration_minutes = planned_overview_minutes()
+                state.overview_locked_eta_timestamp = start_ts + duration_minutes * 60 if duration_minutes else None
+                state.overview_paused_elapsed_seconds = None
                 state.overview_calendar_completion_key = ""
-            elif not isinstance(getattr(state, "overview_locked_eta_timestamp", None), (int, float)):
-                state.overview_locked_eta_timestamp = float(state.overview_takeoff_start_timestamp) + overview_flight_duration_minutes() * 60
-            state.overview_progress_running = True
+                state.overview_progress_running = True
             refresh_ui()
-
-        def update_overview_flight_time(e=None):
-            raw = (overview_flight_time_tf.value or "").strip()
-            minutes = parse_flight_time_minutes(raw)
-            if minutes <= 0:
-                try:
-                    minutes = int(float(raw))
-                except Exception:
-                    minutes = overview_flight_duration_minutes()
-            state.overview_flight_time_minutes = max(1, int(minutes))
-            if not bool(getattr(state, "overview_progress_running", False)):
-                state.overview_locked_eta_timestamp = None
-            refresh_ui()
-
-        overview_flight_time_tf = ft.TextField(
-            label="Flight time",
-            value=format_hours_to_hm(overview_flight_duration_minutes() / 60.0),
-            width=132,
-            height=44,
-            text_size=12,
-            border_radius=12,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            on_submit=update_overview_flight_time,
-            on_blur=update_overview_flight_time,
-        )
-
-        def status_chip(label: str, active: bool = False) -> ft.Control:
-            return ft.Container(
-                padding=ft.padding.symmetric(horizontal=8, vertical=5),
-                border_radius=999,
-                bgcolor=ft.Colors.with_opacity(0.18 if active else 0.07, tokens["accent"] if active else tokens["muted"]),
-                border=ft.border.all(1, ft.Colors.with_opacity(0.28 if active else 0.10, tokens["accent"] if active else tokens["muted"])),
-                content=ft.Text(label, size=9, weight=ft.FontWeight.W_700 if active else ft.FontWeight.W_500, color=tokens["text"]),
-            )
 
         RAMP_STATUS_LABELS = {
             "departure": {
@@ -11600,7 +10684,7 @@ def main(page: ft.Page):
                 height=overview_card_height,
                 border_radius=20,
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=tokens["subpanel"],
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 shadow=ft.BoxShadow(
                     blur_radius=18,
@@ -11678,145 +10762,13 @@ def main(page: ft.Page):
         refresh_ramp_status_card(update_page=False)
         ramp_status_card = ramp_status_card_host
 
-        def flight_status_action_button(icon_value, tooltip: str, handler, active: bool = False) -> ft.Control:
-            return ft.IconButton(
-                icon=icon_value,
-                tooltip=tooltip,
-                on_click=handler,
-                bgcolor=tokens["accent"] if active else tokens["subpanel"],
-                icon_color=ft.Colors.WHITE if active else tokens["text"],
-                width=34,
-                height=34,
-                icon_size=18,
-            )
-
-        def flight_status_play_button() -> ft.Control:
-            is_running = bool(getattr(state, "overview_progress_running", False))
-            label = "LIVE" if is_running else "PLAY"
-            icon_value = ft.Icons.RADIO_BUTTON_CHECKED if is_running else ft.Icons.PLAY_ARROW
-            bg_color = tokens["accent"] if is_running else tokens["subpanel"]
-            border_color = ft.Colors.with_opacity(0.72 if is_running else 0.22, tokens["accent"] if is_running else ft.Colors.WHITE)
-            glow_color = ft.Colors.with_opacity(0.34 if is_running else 0.10, tokens["accent"] if is_running else ft.Colors.BLACK)
-
-            return ft.GestureDetector(
-                mouse_cursor=ft.MouseCursor.CLICK,
-                on_tap=play_overview_progress,
-                content=ft.Container(
-                    width=76,
-                    height=38,
-                    border_radius=999,
-                    alignment=ft.Alignment(0, 0),
-                    bgcolor=bg_color,
-                    border=ft.border.all(1, border_color),
-                    shadow=ft.BoxShadow(
-                        blur_radius=20 if is_running else 10,
-                        spread_radius=1 if is_running else 0,
-                        color=glow_color,
-                        offset=ft.Offset(0, 6),
-                    ),
-                    content=ft.Row(
-                        tight=True,
-                        spacing=7,
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.Icon(icon_value, size=15, color=ft.Colors.WHITE if is_running else tokens["text"]),
-                            ft.Text(label, size=10, weight=ft.FontWeight.W_900, color=ft.Colors.WHITE if is_running else tokens["text"]),
-                        ],
-                    ),
-                ),
-            )
-
-        flight_status_card = overview_glass_panel(
-            ft.Column(
-                spacing=12,
-                controls=[
-                    ft.Column(
-                        tight=True,
-                        spacing=2,
-                        controls=[
-                            ft.Text("Flight Status", size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                            ft.Text("Live route progress", size=10, color=tokens["muted"]),
-                        ],
-                    ),
-                    ft.Container(
-                        alignment=ft.Alignment(0, 0),
-                        padding=ft.padding.symmetric(horizontal=10, vertical=7),
-                        border_radius=999,
-                        bgcolor=ft.Colors.with_opacity(0.16, tokens["accent"]),
-                        border=ft.border.all(1, ft.Colors.with_opacity(0.30, tokens["accent"])),
-                        content=ft.Text(f"{current_progress:.0f}%", size=12, weight=ft.FontWeight.W_900, color=tokens["accent"]),
-                    ),
-                    ft.Container(
-                        padding=ft.padding.symmetric(horizontal=11, vertical=11),
-                        border_radius=16,
-                        bgcolor=ft.Colors.with_opacity(0.13, tokens["accent"]),
-                        border=ft.border.all(1, ft.Colors.with_opacity(0.28, tokens["accent"])),
-                        content=ft.Column(
-                            tight=True,
-                            spacing=4,
-                            controls=[
-                                ft.Text("Current phase", size=10, color=tokens["muted"]),
-                                ft.Text(live_summary_status_label(), size=18, weight=ft.FontWeight.W_900, color=tokens["accent"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                            ],
-                        ),
-                    ),
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        spacing=5,
-                        controls=[
-                            flight_status_action_button(ft.Icons.CHEVRON_LEFT, "Previous status", lambda e: set_overview_status(int(state.overview_flight_status_index or 0) - 1)),
-                            flight_status_play_button(),
-                            flight_status_action_button(ft.Icons.CHEVRON_RIGHT, "Next status", lambda e: set_overview_status(int(state.overview_flight_status_index or 0) + 1), active=True),
-                        ],
-                    ),
-                    ft.Row(
-                        wrap=True,
-                        spacing=5,
-                        run_spacing=5,
-                        controls=[status_chip(label, i == int(state.overview_flight_status_index or 0)) for i, label in enumerate(OVERVIEW_FLIGHT_STATUSES)],
-                    ),
-                    ft.Container(height=1, bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.WHITE)),
-                    overview_flight_time_tf,
-                    ft.Container(
-                        width=132,
-                        padding=ft.padding.symmetric(horizontal=10, vertical=6),
-                        border_radius=12,
-                        bgcolor=ft.Colors.with_opacity(0.08, tokens["accent"]),
-                        border=ft.border.all(1, ft.Colors.with_opacity(0.18, tokens["accent"])),
-                        content=ft.Column(
-                            tight=True,
-                            spacing=1,
-                            controls=[
-                                ft.Text("Progress", size=9, color=tokens["muted"]),
-                                overview_progress_percent_text,
-                            ],
-                        ),
-                    ),
-                ],
-            ),
-            width=overview_flight_width,
-            height=overview_card_height,
-        )
-
-        overview_aircraft_image = ft.Container(
-            width=route_scaled(370, 259),
-            height=route_scaled(150, 105),
-            padding=route_scaled(6, 4),
-            border_radius=route_scaled(18, 13),
-            bgcolor="#141519",
-            border=ft.border.all(0.6, ft.Colors.with_opacity(0.22, ft.Colors.WHITE)),
-            alignment=ft.Alignment(0, 0),
-            content=aircraft_livery_image(state.airline, state.aircraft, width=route_scaled(360, 252), height=route_scaled(138, 97)),
-        )
-
         def route_center_metric(label: str, value: str, subtitle: str = "") -> ft.Control:
             return ft.Container(
                 width=route_scaled(180, 126),
                 height=route_scaled(85, 60),
                 padding=route_scaled(10, 7),
                 border_radius=route_scaled(18, 13),
-                bgcolor=ft.Colors.with_opacity(0.56, tokens["subpanel"]),
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     spacing=route_scaled(3, 2),
@@ -11917,31 +10869,36 @@ def main(page: ft.Page):
             iata = str((record or {}).get("iata", "") or "").strip().upper()
             city_by_iata = {
                 "AMS": "Amsterdam, Netherlands", "ATH": "Athens, Greece", "ATL": "Atlanta, USA",
-                "AUH": "Abu Dhabi, UAE", "BAH": "Bahrain", "BCN": "Barcelona, Spain",
+                "AKL": "Auckland, New Zealand", "AUS": "Austin, USA", "AUH": "Abu Dhabi, UAE",
+                "BAH": "Bahrain", "BCN": "Barcelona, Spain", "BNA": "Nashville, USA",
                 "BER": "Berlin, Germany", "BKK": "Bangkok, Thailand", "BLR": "Bengaluru, India",
                 "BOG": "Bogota, Colombia", "BOM": "Mumbai, India", "BOS": "Boston, USA",
                 "CAI": "Cairo, Egypt", "CAN": "Guangzhou, China", "CDG": "Paris, France",
-                "CGK": "Jakarta, Indonesia", "CGN": "Cologne, Germany", "CUN": "Cancun, Mexico",
+                "CGK": "Jakarta, Indonesia", "CGN": "Cologne, Germany", "CKG": "Chongqing, China",
+                "CLT": "Charlotte, USA", "CUN": "Cancun, Mexico",
                 "DEL": "Delhi, India", "DEN": "Denver, USA", "DFW": "Dallas, USA",
                 "DOH": "Doha, Qatar", "DUB": "Dublin, Ireland", "DXB": "Dubai, UAE",
-                "EWR": "Newark, USA", "EZE": "Buenos Aires, Argentina", "FCO": "Rome, Italy",
+                "DTW": "Detroit, USA", "EWR": "Newark, USA", "EZE": "Buenos Aires, Argentina", "FCO": "Rome, Italy",
                 "FRA": "Frankfurt, Germany", "GRU": "Sao Paulo, Brazil", "HAM": "Hamburg, Germany",
-                "HEL": "Helsinki, Finland", "HKG": "Hong Kong", "HND": "Tokyo, Japan",
+                "HAN": "Hanoi, Vietnam", "HEL": "Helsinki, Finland", "HGH": "Hangzhou, China",
+                "HKG": "Hong Kong", "HND": "Tokyo, Japan",
                 "IAD": "Washington, USA", "IAH": "Houston, USA", "ICN": "Seoul, South Korea",
                 "IKA": "Tehran, Iran", "IST": "Istanbul, Turkiye", "JED": "Jeddah, Saudi Arabia",
-                "JFK": "New York, USA", "KIX": "Osaka, Japan", "KUL": "Kuala Lumpur, Malaysia",
+                "JFK": "New York, USA", "KIX": "Osaka, Japan", "KMG": "Kunming, China", "KUL": "Kuala Lumpur, Malaysia",
                 "KWI": "Kuwait City, Kuwait", "LAS": "Las Vegas, USA", "LAX": "Los Angeles, USA",
                 "LGW": "London, UK", "LHR": "London, UK", "LIM": "Lima, Peru",
-                "LIS": "Lisbon, Portugal", "MAD": "Madrid, Spain", "MAA": "Chennai, India",
-                "MCO": "Orlando, USA", "MEX": "Mexico City, Mexico", "MIA": "Miami, USA",
-                "MNL": "Manila, Philippines", "MRU": "Mauritius", "MUC": "Munich, Germany",
-                "NRT": "Tokyo, Japan", "ORD": "Chicago, USA", "OSL": "Oslo, Norway",
+                "LIS": "Lisbon, Portugal", "MAD": "Madrid, Spain", "MAA": "Chennai, India", "MAN": "Manchester, UK",
+                "MCI": "Kansas City, USA", "MCO": "Orlando, USA", "MEX": "Mexico City, Mexico", "MIA": "Miami, USA",
+                "MNL": "Manila, Philippines", "MRU": "Mauritius", "MSP": "Minneapolis, USA", "MUC": "Munich, Germany",
+                "NCL": "Newcastle, UK", "NKG": "Nanjing, China", "NRT": "Tokyo, Japan", "ORD": "Chicago, USA", "OSL": "Oslo, Norway",
                 "PEK": "Beijing, China", "PHL": "Philadelphia, USA", "PHX": "Phoenix, USA",
-                "PVG": "Shanghai, China", "RUH": "Riyadh, Saudi Arabia", "SEA": "Seattle, USA",
-                "SFO": "San Francisco, USA", "SHA": "Shanghai, China", "SIN": "Singapore",
-                "SVO": "Moscow, Russia", "TLV": "Tel Aviv, Israel", "TPE": "Taipei, Taiwan",
+                "PVG": "Shanghai, China", "RUH": "Riyadh, Saudi Arabia", "RZR": "Ramsar, Iran", "SEA": "Seattle, USA",
+                "SFO": "San Francisco, USA", "SHA": "Shanghai, China", "SIN": "Singapore", "STL": "St. Louis, USA",
+                "SVO": "Moscow, Russia", "SZX": "Shenzhen, China", "TAO": "Qingdao, China", "TBZ": "Tabriz, Iran",
+                "TFU": "Chengdu, China", "TLV": "Tel Aviv, Israel", "TPE": "Taipei, Taiwan",
                 "SYD": "Sydney, Australia", "VIE": "Vienna, Austria", "WAW": "Warsaw, Poland",
                 "YUL": "Montreal, Canada", "YVR": "Vancouver, Canada", "YYC": "Calgary, Canada",
+                "WUH": "Wuhan, China", "XIY": "Xi'an, China", "XMN": "Xiamen, China",
                 "YYZ": "Toronto, Canada", "ZRH": "Zurich, Switzerland",
             }
             if iata in city_by_iata:
@@ -11959,13 +10916,14 @@ def main(page: ft.Page):
                 "RK": "South Korea", "RP": "Philippines", "SA": "Argentina", "SB": "Brazil",
                 "SC": "Chile", "SK": "Colombia", "SP": "Peru", "UU": "Russia", "VA": "India",
                 "VE": "India", "VH": "Hong Kong", "VI": "India", "VO": "India", "VT": "Thailand",
-                "WI": "Indonesia", "WM": "Malaysia", "WS": "Singapore", "YS": "Australia", "ZB": "China", "ZP": "China",
-                "ZG": "China", "ZS": "China",
+                "NZ": "New Zealand", "VV": "Vietnam", "WI": "Indonesia", "WM": "Malaysia", "WS": "Singapore",
+                "YS": "Australia", "ZB": "China", "ZG": "China", "ZH": "China", "ZL": "China", "ZP": "China",
+                "ZS": "China", "ZU": "China",
             }
             airport_name = str((record or {}).get("name", "") or "").strip()
             city = re.sub(r"\b(International|Intl|Airport|Airfield|Regional|Brandenburg|Charles de Gaulle)\b", "", airport_name, flags=re.IGNORECASE)
-            city = re.sub(r"\s+", " ", city).strip(" -") or (iata or canonical or "Airport")
-            country = country_by_prefix.get(canonical[:2], "")
+            city = (record or {}).get("city") or re.sub(r"\s+", " ", city).strip(" -") or (iata or canonical or "Airport")
+            country = country_by_prefix.get(canonical[:2], "") or (record or {}).get("country", "")
             return f"{city}, {country}" if country else city
 
         def minimap_endpoint_marker(code: str, color: str) -> ft.Control:
@@ -11977,7 +10935,7 @@ def main(page: ft.Page):
             city_country = airport_city_country_label(canonical, record)
             background_src = airport_card_background_src(canonical, "airport")
             layers: List[ft.Control] = [
-                ft.Container(expand=True, bgcolor=ft.Colors.with_opacity(0.82, tokens["panel"])),
+                ft.Container(expand=True, bgcolor=surface_fill(tokens["panel"])),
             ]
             if background_src:
                 layers.extend(
@@ -12051,49 +11009,30 @@ def main(page: ft.Page):
                 ),
             )
 
-        def overview_airport_label(code: str, color: str) -> ft.Control:
-            canonical = normalize_airport_code(code) or (code or "").strip().upper()
-            record = lookup_airport_record(canonical)
-            weather = airport_weather_for_card(canonical)
-            label = str((record or {}).get("iata", "") or canonical or "-").strip().upper()
-            airport_name = str((record or {}).get("name", "Airport not selected") or "Airport not selected")
-            city_country = airport_city_country_label(canonical, record)
-            return ft.Container(
-                width=218,
-                height=78,
-                padding=ft.padding.symmetric(horizontal=12, vertical=10),
-                border_radius=17,
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=overview_glass_fill,
-                blur=ft.Blur(12, 12, ft.BlurTileMode.CLAMP),
-                border=ft.border.all(1, ft.Colors.with_opacity(0.18, ft.Colors.WHITE)),
-                shadow=ft.BoxShadow(
-                    blur_radius=18,
-                    spread_radius=1,
-                    color=ft.Colors.with_opacity(0.16, ft.Colors.BLACK),
-                    offset=ft.Offset(0, 8),
-                ),
-                content=ft.Column(
-                    tight=True,
-                    spacing=4,
-                    controls=[
-                        ft.Row(
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Text(label, size=17, weight=ft.FontWeight.W_900, color=tokens["text"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                ft.Container(
-                                    padding=ft.padding.symmetric(horizontal=8, vertical=4),
-                                    border_radius=999,
-                                    bgcolor=ft.Colors.with_opacity(0.16, color),
-                                    border=ft.border.all(1, ft.Colors.with_opacity(0.30, color)),
-                                    content=ft.Text(str(weather.get("temperature", "-")), size=10, weight=ft.FontWeight.W_900, color=tokens["text"]),
-                                ),
-                            ],
-                        ),
-                        ft.Text(city_country, size=10, weight=ft.FontWeight.W_800, color=tokens["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                        ft.Text(airport_name, size=9, color=tokens["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                    ],
+        def overview_endpoint_marker(coord: tuple[float, float], code: str, *, departure: bool) -> ft.Control:
+            label = "Departure" if departure else "Arrival"
+            color, ink = ("#FFE54D", "#211D0A") if departure else ("#7263E8", "#FFFFFF")
+            badge = ft.Container(
+                top=None if departure else 0,
+                bottom=0 if departure else None,
+                left=0,
+                right=0,
+                height=22,
+                alignment=ft.Alignment(0, 0),
+                bgcolor=color,
+                border_radius=5,
+                border=ft.border.all(1, ink),
+                content=ft.Text(f"{label} {code}", size=11, weight=ft.FontWeight.W_800, color=ink, no_wrap=True),
+            )
+            return ftm.Marker(
+                coordinates=ftm.MapLatitudeLongitude(*coord),
+                width=116,
+                height=64,
+                alignment=ft.Alignment(0, 0),
+                rotate=False,
+                tooltip=f"{label} {code}",
+                content=ft.Stack(
+                    controls=[badge, ft.Container(top=24, left=50, content=overview_airport_dot(color))],
                 ),
             )
 
@@ -12103,12 +11042,12 @@ def main(page: ft.Page):
             icon.rotate = math.radians(bearing - 90.0)
             return icon
 
-        def overview_route_map_control() -> ft.Control:
+        def overview_route_map_control(live_layers=None) -> ft.Control:
             nonlocal overview_route_aircraft_marker, overview_route_aircraft_points
             if ftm is None:
                 return ft.Container(
                     expand=True,
-                    bgcolor=ft.Colors.with_opacity(0.70, tokens["panel"]),
+                    bgcolor=surface_fill(tokens["panel"]),
                     alignment=ft.Alignment(0, 0),
                     content=ft.Text(
                         "flet-map is not installed, so the Overview map cannot render in this build.",
@@ -12118,7 +11057,11 @@ def main(page: ft.Page):
                     ),
                 )
 
-            if MAPTILER_API_KEY:
+            if live_layers is not None:
+                tile_url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+                map_attribution = "OpenStreetMap contributors"
+                attribution_url = "https://www.openstreetmap.org/copyright"
+            elif MAPTILER_API_KEY:
                 tile_url = f"https://api.maptiler.com/maps/satellite/{{z}}/{{x}}/{{y}}.jpg?key={MAPTILER_API_KEY}"
                 map_attribution = "MapTiler"
                 attribution_url = "https://www.maptiler.com/"
@@ -12128,23 +11071,27 @@ def main(page: ft.Page):
                 attribution_url = "https://www.esri.com/"
 
             layers = [
-                ftm.TileLayer(url_template=tile_url),
+                ftm.TileLayer(url_template=tile_url, **(
+                    {"user_agent_package_name": f"FlightManagementSystems/{FMS_VERSION}", "opacity": 0.88}
+                    if live_layers is not None else {}
+                )),
                 ftm.SimpleAttribution(
-                    text=ft.Text(map_attribution, size=7, color=ft.Colors.with_opacity(0.72, ft.Colors.WHITE)),
-                    bgcolor=ft.Colors.with_opacity(0.18, ft.Colors.BLACK),
+                    text=map_attribution,
+                    bgcolor=surface_fill(tokens["panel"]),
                     on_click=lambda e, url=attribution_url: e.page.launch_url(url),
                 ),
             ]
             center = ftm.MapLatitudeLongitude(25.0, 10.0)
             zoom = 2.45
+            rotation = 0.0
+            camera_key = "live fallback" if live_layers is not None else "normal"
             overview_map_clamp_state = {"active": False}
 
             def overview_vertical_latitude_limit(zoom_value: float) -> float:
-                try:
-                    zoom_number = float(zoom_value)
-                except Exception:
-                    zoom_number = 2.45
-                return max(54.0, min(84.5, 54.0 + max(0.0, zoom_number - 2.45) * 13.0))
+                viewport = max(1, float(page.height or 820) - SHELL_HEIGHT)
+                world = 256 * 2 ** float(zoom_value)
+                available = max(0, 1 - viewport / world)
+                return math.degrees(math.atan(math.sinh(math.pi * available)))
 
             async def clamp_overview_map_vertical_position(e):
                 if bool(overview_map_clamp_state.get("active")):
@@ -12160,8 +11107,11 @@ def main(page: ft.Page):
                     current_rotation = float(getattr(camera, "rotation", 0.0) or 0.0)
                 except Exception:
                     return
+                if not all(map(math.isfinite, (current_lat, current_lon, current_zoom, current_rotation))):
+                    return
                 max_latitude = overview_vertical_latitude_limit(current_zoom)
                 clamped_lat = max(-max_latitude, min(max_latitude, current_lat))
+                overview_cameras[camera_key] = (clamped_lat, current_lon, current_zoom, current_rotation)
                 if abs(clamped_lat - current_lat) < 0.0001:
                     return
                 overview_map_clamp_state["active"] = True
@@ -12178,7 +11128,9 @@ def main(page: ft.Page):
                 finally:
                     overview_map_clamp_state["active"] = False
 
-            if origin_coord and destination_coord:
+            if live_layers is not None:
+                layers.extend(live_layers)
+            elif origin_coord and destination_coord:
                 route_points = minimap_route_points(origin_coord, destination_coord)
                 overview_route_aircraft_points = route_points
                 mid_lat, mid_lon = minimap_center(origin_coord, destination_coord)
@@ -12203,40 +11155,6 @@ def main(page: ft.Page):
                         ]
                     )
                 )
-                layers.append(
-                    ftm.MarkerLayer(
-                        markers=[
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(origin_coord[0], origin_coord[1]),
-                                width=16,
-                                height=16,
-                                alignment=ft.Alignment(0, 0),
-                                content=overview_airport_dot(tokens["accent"]),
-                            ),
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(origin_coord[0], origin_coord[1]),
-                                width=230,
-                                height=82,
-                                alignment=ft.Alignment(-1.18, 0),
-                                content=overview_airport_label(origin_icao, tokens["accent"]),
-                            ),
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(destination_coord[0], destination_coord[1]),
-                                width=16,
-                                height=16,
-                                alignment=ft.Alignment(0, 0),
-                                content=overview_airport_dot("#50E3C2"),
-                            ),
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(destination_coord[0], destination_coord[1]),
-                                width=230,
-                                height=82,
-                                alignment=ft.Alignment(1.18, 0),
-                                content=overview_airport_label(destination_icao, "#50E3C2"),
-                            ),
-                        ]
-                    )
-                )
                 aircraft_lat, aircraft_lon, aircraft_bearing = minimap_route_position_and_bearing(
                     route_points,
                     overview_progress_percent() / 100.0,
@@ -12250,44 +11168,42 @@ def main(page: ft.Page):
                     tooltip="Current flight progress",
                     content=overview_route_aircraft_content(aircraft_bearing),
                 )
+                layers.append(ftm.MarkerLayer(
+                    markers=[
+                        overview_endpoint_marker(origin_coord, origin_icao, departure=True),
+                        overview_endpoint_marker(destination_coord, destination_icao, departure=False),
+                    ],
+                ))
                 layers.append(ftm.MarkerLayer(markers=[overview_route_aircraft_marker], rotate=False))
             elif origin_coord or destination_coord:
                 overview_route_aircraft_marker = None
                 overview_route_aircraft_points = []
                 available_coord = origin_coord or destination_coord
                 available_icao = origin_icao if origin_coord else destination_icao
-                center = ftm.MapLatitudeLongitude(available_coord[0], available_coord[1])
+                center = ftm.MapLatitudeLongitude(*available_coord)
                 zoom = 4.8
-                layers.append(
-                    ftm.MarkerLayer(
-                        markers=[
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(available_coord[0], available_coord[1]),
-                                width=16,
-                                height=16,
-                                alignment=ft.Alignment(0, 0),
-                                content=overview_airport_dot(tokens["accent"]),
-                            ),
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(available_coord[0], available_coord[1]),
-                                width=230,
-                                height=82,
-                                alignment=ft.Alignment(-1.18, 0),
-                                content=overview_airport_label(available_icao, tokens["accent"]),
-                            ),
-                        ]
-                    )
-                )
+                layers.append(ftm.MarkerLayer(
+                    markers=[overview_endpoint_marker(available_coord, available_icao, departure=bool(origin_coord))],
+                ))
+
+            viewport = max(1, float(page.height or 820) - SHELL_HEIGHT)
+            minimum_zoom = max(2.45, math.log2(viewport / 256))
+            if camera_key in overview_cameras:
+                lat, lon, zoom, rotation = overview_cameras[camera_key]
+                zoom = max(zoom, minimum_zoom)
+                limit = overview_vertical_latitude_limit(zoom)
+                center = ftm.MapLatitudeLongitude(max(-limit, min(limit, lat)), lon)
 
             return ftm.Map(
                 expand=True,
                 initial_center=center,
-                initial_zoom=zoom,
-                min_zoom=2.45,
-                max_zoom=10.0,
-                bgcolor="#020617",
+                initial_zoom=max(zoom, minimum_zoom),
+                initial_rotation=rotation,
+                min_zoom=minimum_zoom,
+                max_zoom=19.0 if live_layers is not None else 10.0,
+                bgcolor="#20242A" if live_layers is not None else "#020617",
                 keep_alive=True,
-                interaction_configuration=ftm.InteractionConfiguration(flags=ftm.InteractionFlag.ALL),
+                interaction_configuration=ftm.InteractionConfiguration(flags=ftm.InteractionFlag.ALL & ~ftm.InteractionFlag.ROTATE & ~ftm.InteractionFlag.FLING_ANIMATION),
                 on_position_change=clamp_overview_map_vertical_position,
                 layers=layers,
             )
@@ -12322,8 +11238,8 @@ def main(page: ft.Page):
             layers = [
                 ftm.TileLayer(url_template=tile_url),
                 ftm.SimpleAttribution(
-                    text=ft.Text(map_attribution, size=7, color=ft.Colors.with_opacity(0.72, ft.Colors.WHITE)),
-                    bgcolor=ft.Colors.with_opacity(0.22, ft.Colors.BLACK),
+                    text=map_attribution,
+                    bgcolor=surface_fill(tokens["panel"]),
                     on_click=lambda e, url=attribution_url: e.page.launch_url(url),
                 ),
             ]
@@ -12412,7 +11328,7 @@ def main(page: ft.Page):
                 height=440,
                 border_radius=20,
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=tokens["panel"],
+                bgcolor=surface_fill(tokens["panel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 shadow=ft.BoxShadow(
                     blur_radius=18,
@@ -12436,7 +11352,7 @@ def main(page: ft.Page):
                                 controls=[
                                     ft.Container(
                                         expand=True,
-                                        bgcolor=ft.Colors.with_opacity(0.46, tokens["panel"]),
+                                        bgcolor=surface_fill(tokens["panel"]),
                                         blur=ft.Blur(10, 10, ft.BlurTileMode.CLAMP),
                                     ),
                                     ft.Container(
@@ -12460,19 +11376,345 @@ def main(page: ft.Page):
                 ),
             )
 
-        def route_metric_item(label: str, value: str | ft.Control, subtitle: str = "") -> ft.Control:
+        def route_metric_item(label: str, value: ft.Text) -> ft.Control:
+            value.color = overview_text_color
+            value.style = overview_text_style
             return ft.Container(
-                width=150,
+                expand=True,
                 content=ft.Column(
                     tight=True,
-                    spacing=4,
+                    spacing=3,
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
-                        ft.Text(label, size=10, color=tokens["muted"], text_align=ft.TextAlign.CENTER),
-                        value if isinstance(value, ft.Control) else ft.Text(value, size=18, weight=ft.FontWeight.W_800, color=tokens["text"], text_align=ft.TextAlign.CENTER),
-                        ft.Text(subtitle, size=9, color=tokens["muted"], text_align=ft.TextAlign.CENTER, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        ft.Text(label, size=11, color=overview_text_color, style=overview_text_style, no_wrap=True),
+                        value,
                     ],
                 ),
+            )
+
+        def live_overview() -> ft.Control:
+            nonlocal live_render_callback
+            if ftm is None:
+                return overview_route_map_control()
+            aircraft_layer = ftm.MarkerLayer(markers=[], rotate=False)
+            selected_layer = ftm.MarkerLayer(markers=[], rotate=False)
+            airport_layer = ftm.MarkerLayer(markers=[])
+            route_layer = ftm.PolylineLayer(polylines=[])
+            live_map = overview_route_map_control([route_layer, airport_layer, aircraft_layer, selected_layer])
+            traffic_markers = {}
+            rendered_traffic = None
+            traffic_hidden = False
+            selected_marker = None
+            camera = (live_map.initial_center.latitude, live_map.initial_center.longitude, live_map.initial_zoom)
+            traffic_camera = None
+            camera_task = None
+            clamp_position = live_map.on_position_change
+            status = ft.Text("", size=11, color=overview_text_color, style=overview_text_style)
+            detail = ft.Column(spacing=6)
+            search_results = ft.Column(spacing=2, tight=True)
+            airports = ft.Column(spacing=GAP, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+            timing = ft.Row(spacing=3)
+            search = ft.TextField(
+                label="Find aircraft", hint_text="Callsign or pilot", dense=True,
+                border_radius=10, filled=True, bgcolor=tokens["input_bg"],
+            )
+            server = ft.Dropdown(hint_text="Server", dense=True, filled=True, bgcolor=tokens["input_bg"],
+                                 border_radius=10)
+
+            async def center_on_flight(zoom=None):
+                position = if_flight_position(state.if_selected_flight)
+                if position and live_map.page:
+                    await live_map.move_to(
+                        destination=ftm.MapLatitudeLongitude(*position), zoom=zoom,
+                        animation_duration=300, cancel_ongoing_animations=True,
+                    )
+
+            async def select_flight(flight_id, *, from_search):
+                selected = if_find_live_flight(flight_id)
+                if not selected:
+                    return
+                if_mark_activity()
+                if_clear_selection()
+                state.if_selected_flight = selected
+                search.value = ""
+                safe_update_control(search)
+                render()
+                page.run_task(refresh_live_plan)
+                if from_search:
+                    await center_on_flight(5.0)
+
+            def choose_flight(flight_id, *, from_search=False):
+                async def choose(e):
+                    await select_flight(flight_id, from_search=from_search)
+                return choose
+
+            async def toggle_follow(e):
+                flight_id = str(state.if_selected_flight.get("flightId") or "")
+                state.if_followed_flight_id = "" if state.if_followed_flight_id else flight_id
+                if_mark_activity()
+                render()
+                if state.if_followed_flight_id:
+                    await center_on_flight()
+
+            async def select_server(e):
+                session_id = e.control.value or ""
+                if not if_select_session(session_id):
+                    return
+                if_clear_selection()
+                state.if_live_flights = []
+                state.if_traffic_session = ""
+                render()
+                await refresh_live_traffic(mark_activity=True)
+
+            def render_search(e=None):
+                if e is not None:
+                    if_mark_activity()
+                query = (search.value or "").strip()
+                matches = [flight for flight in state.if_live_flights if if_flight_matches_query(flight, query)][:5] if query else []
+                search_results.controls = [
+                    ft.TextButton(
+                        content=ft.Text(if_flight_display_name(flight), max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        on_click=choose_flight(str(flight["flightId"]), from_search=True),
+                    ) for flight in matches
+                ]
+                if query and not matches:
+                    search_results.controls = [ft.Text("No matching aircraft", size=12, color=overview_text_color)]
+                if e is not None:
+                    safe_update_control(search_results)
+
+            def clear_selection(e):
+                if_clear_selection()
+                render()
+
+            def aircraft_marker(flight, position, selected=False):
+                flight_id = str(flight["flightId"])
+                size = 30 if selected else 21
+                return ftm.Marker(
+                    key=f"{'selected' if selected else 'live'}-{flight_id}",
+                    coordinates=ftm.MapLatitudeLongitude(*position), width=34, height=34,
+                    tooltip=if_flight_display_name(flight),
+                    content=ft.GestureDetector(
+                        mouse_cursor=ft.MouseCursor.CLICK, scale=1, on_tap=choose_flight(flight_id),
+                        content=ft.Container(
+                            alignment=ft.Alignment(0, 0), border_radius=18,
+                            content=ft.Image(src=if_aircraft_shape(flight, selected=selected), width=size, height=size,
+                                             rotate=math.radians(if_flight_heading(flight))),
+                        ),
+                    ),
+                )
+
+            def update_aircraft_marker(marker, flight, position, *, selected=False):
+                marker.coordinates = ftm.MapLatitudeLongitude(*position)
+                marker.tooltip = if_flight_display_name(flight)
+                image = marker.content.content.content
+                image.src = if_aircraft_shape(flight, selected=selected)
+                image.rotate = math.radians(if_flight_heading(flight))
+
+            def visible_traffic(flights):
+                lat, lon, zoom = camera
+                world = 256 * 2 ** zoom
+                width = float(page.width or 1000) / 2 + 40
+                height = max(0, float(page.height or 720) - SHELL_HEIGHT) / 2 + 40
+
+                def mercator(latitude):
+                    latitude = max(-85.05, min(85.05, latitude))
+                    return math.asinh(math.tan(math.radians(latitude))) / (2 * math.pi)
+
+                center_y = mercator(lat)
+                occupied = set()
+                for flight in flights:
+                    position = if_flight_position(flight)
+                    if not position:
+                        continue
+                    x = ((position[1] - lon + 180) % 360 - 180) * world / 360
+                    y = (mercator(position[0]) - center_y) * world
+                    if abs(x) > width or abs(y) > height:
+                        continue
+                    spacing = 23 if zoom < 10 else 12
+                    cell = (math.floor(x / spacing), math.floor(y / spacing))
+                    if cell not in occupied:
+                        occupied.add(cell)
+                        yield flight, position
+
+            def render_traffic(following):
+                nonlocal rendered_traffic, traffic_hidden, traffic_camera
+                unchanged = rendered_traffic is state.if_live_flights and traffic_camera == camera
+                if traffic_hidden == following and (following or unchanged):
+                    return False
+                traffic_hidden = following
+                if following:
+                    aircraft_layer.visible = False
+                    return True
+                aircraft_layer.visible = True
+                if unchanged:
+                    return True
+                rendered_traffic = state.if_live_flights
+                traffic_camera = camera
+                next_markers = {}
+                for flight, position in visible_traffic(rendered_traffic):
+                    flight_id = str(flight["flightId"])
+                    marker = traffic_markers.get(flight_id)
+                    if marker is None:
+                        marker = aircraft_marker(flight, position)
+                    else:
+                        update_aircraft_marker(marker, flight, position)
+                    next_markers[flight_id] = marker
+                traffic_markers.clear()
+                traffic_markers.update(next_markers)
+                aircraft_layer.markers = [traffic_markers[key] for key in sorted(traffic_markers)]
+                return True
+
+            async def redraw_after_pan():
+                await asyncio.sleep(0.10)
+                if live_render_callback is render_refresh and state.overview_live and state.selected_tab_index == 0:
+                    if render_traffic(False):
+                        aircraft_layer.update()
+
+            async def map_position_changed(e):
+                nonlocal camera, camera_task
+                center = e.camera.center
+                camera = (center.latitude, center.longitude, e.camera.zoom)
+                if camera_task is not None:
+                    camera_task.cancel()
+                camera_task = asyncio.create_task(redraw_after_pan())
+                await clamp_position(e)
+
+            live_map.on_position_change = map_position_changed
+
+            def render(update=True):
+                nonlocal selected_marker
+                flight = state.if_selected_flight
+                plan = state.if_selected_flight_plan
+                follow_id = state.if_followed_flight_id
+                traffic_changed = render_traffic(False)
+                position = if_flight_position(flight)
+                if position is None:
+                    selected_marker = None
+                elif selected_marker is None or selected_marker.key != f"selected-{flight['flightId']}":
+                    selected_marker = aircraft_marker(flight, position, selected=True)
+                else:
+                    update_aircraft_marker(selected_marker, flight, position, selected=True)
+                selected_layer.markers = [selected_marker] if selected_marker is not None else []
+
+                departure, arrival = flight_airports(flight, plan, state.if_selected_route_start_label, state.if_selected_route_end_label)
+                airports.controls = [point_card("Departure", departure, live=True), point_card("Arrival", arrival, live=True)] if flight else []
+                airport_layer.markers = []
+                for code, is_departure in ((departure, True), (arrival, False)):
+                    record = live_airport_record(code)
+                    if record:
+                        airport_layer.markers.append(overview_endpoint_marker(
+                            (record["lat"], record["lon"]), code, departure=is_departure,
+                        ))
+                points = state.if_selected_route_points
+                route_layer.polylines = [ftm.PolylineMarker(
+                    coordinates=[ftm.MapLatitudeLongitude(*point) for point in points],
+                    color=tokens["accent"], stroke_width=3,
+                )] if len(points) >= 2 else []
+                timing.controls = [
+                    route_metric_item(label, ft.Text(value, size=16, weight=ft.FontWeight.W_800, no_wrap=True))
+                    for label, value in zip(("ETD", "ETA", "Flight time", "ETE"), live_flight_timing(flight, plan))
+                ]
+                timing_panel.visible = bool(flight)
+                detail_panel.visible = bool(flight)
+                if flight:
+                    detail_heading.value = if_airline_name(flight)
+                    def measurement(key, unit):
+                        number = if_number(flight.get(key), fallback="")
+                        return f"{number} {unit}" if number else ""
+
+                    for control, value in zip(detail_values, (
+                        flight.get("callsign"), flight.get("username") or flight.get("displayName"),
+                        if_aircraft_name(flight), measurement("altitude", "ft"), measurement("speed", "kt"),
+                    )):
+                        control.value = value or "—"
+                    follow_button.content = "Stop following" if follow_id else "Follow"
+                status.value = state.if_last_error or (
+                    f"{'Following 1 of ' if follow_id else ''}{len(state.if_live_flights):,} aircraft on server · {state.if_last_traffic_refresh}"
+                    if state.if_traffic_session else "Connecting to Infinite Flight…"
+                )
+                server.options = if_session_options()
+                server.value = state.if_selected_session_id or None
+                server.visible = bool(server.options)
+                render_search()
+                if update:
+                    for control in (status, server, search_results, left_panel, timing_panel,
+                                    selected_layer, airport_layer, route_layer):
+                        safe_update_control(control)
+                    if traffic_changed and aircraft_layer.page:
+                        aircraft_layer.update()
+
+            async def render_refresh():
+                render()
+                if state.if_followed_flight_id:
+                    await center_on_flight()
+
+            search.on_change = render_search
+            server.on_select = select_server
+            flight_panel = ft.Container(
+                top=GAP, right=GAP, width=248,
+                content=overview_glass_panel(ft.Column(
+                    [
+                        server, search, search_results, status,
+                        ft.TextButton("Refresh traffic", on_click=refresh_live_clicked),
+                        ft.TextButton("Open Settings", on_click=lambda e: go_to_tab(10), visible=not bool(if_local_api_key())),
+                    ], tight=True, spacing=5,
+                ), padding=10),
+            )
+            detail_heading = ft.Text(size=14, expand=True, weight=ft.FontWeight.W_800,
+                                     color=overview_text_color, style=overview_text_style, max_lines=2)
+            detail_values = [ft.Text(size=12, color=overview_text_color, style=overview_text_style) for _ in range(5)]
+            follow_button = ft.FilledButton("Follow", on_click=toggle_follow)
+            detail.controls = [
+                ft.Row([detail_heading, ft.IconButton(
+                    ft.Icons.CLOSE, tooltip="Close flight details", on_click=clear_selection,
+                    width=26, height=26, padding=0, icon_size=17, icon_color="#211D0A", bgcolor="#F5F1E8",
+                )], spacing=4),
+                *[ft.Column([
+                    ft.Text(label, size=10, color=overview_text_color, style=overview_text_style),
+                    value,
+                ], spacing=1, tight=True) for label, value in zip(
+                    ("Callsign", "Pilot", "Aircraft type", "Altitude", "Ground speed"), detail_values,
+                )],
+                follow_button,
+            ]
+            detail_panel = overview_glass_panel(detail, padding=10)
+            left_panel = ft.Container(
+                top=GAP, bottom=GAP, left=GAP, width=airport_card_width,
+                content=ft.Column([airports, detail_panel], spacing=GAP, scroll=ft.ScrollMode.AUTO,
+                                  horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+            )
+            timing_panel = ft.Container(
+                left=0, right=0, bottom=35, alignment=ft.Alignment(0, 0),
+                content=overview_glass_panel(timing, width=metrics_width, padding=10),
+            )
+            live_render_callback = render_refresh
+            render(update=False)
+            return ft.Stack(expand=True, clip_behavior=ft.ClipBehavior.HARD_EDGE, controls=[
+                ft.Container(left=0, top=0, right=0, bottom=0, content=live_map),
+                left_panel, flight_panel, timing_panel,
+            ])
+
+        if state.overview_live:
+            overview_progress_refresh_callback = None
+            ramp_status_refresh_callback = None
+            asset = asset_abs_path_if_exists("live-map/index.html")
+            if os.name == "nt" and asset and not live_map_unavailable:
+                if live_map_process is None:
+                    page.run_task(show_live_map, asset.as_uri())
+                return ft.Container(expand=True, bgcolor="#101318")
+            return live_overview()
+
+        def overview_action(icon, tooltip: str, handler, primary: bool = False) -> ft.IconButton:
+            return ft.IconButton(
+                icon=icon,
+                tooltip=tooltip,
+                on_click=handler,
+                width=32,
+                height=32,
+                padding=0,
+                icon_size=17,
+                bgcolor=tokens["accent"] if primary else tokens["subpanel"],
+                icon_color=ft.Colors.WHITE if primary else tokens["text"],
             )
 
         progress_strip = ft.Container(
@@ -12482,311 +11724,636 @@ def main(page: ft.Page):
             content=route_line,
         )
 
-        def toggle_flight_hibernation_menu(e=None):
-            state.flight_hibernation_menu_open = not bool(getattr(state, "flight_hibernation_menu_open", False))
+        duration_minutes = planned_overview_minutes()
+        flight_time_text = ft.Text(
+            format_hours_to_hm(duration_minutes / 60.0) if duration_minutes else "—",
+            size=18, weight=ft.FontWeight.W_800, color=tokens["text"],
+            text_align=ft.TextAlign.CENTER, no_wrap=True,
+            tooltip="Planned duration from Dashboard or Fuel Planning",
+        )
+        status_index = int(state.overview_flight_status_index or 0)
+        is_playing = state.overview_progress_running
+        route_metrics_card = overview_glass_panel(
+            ft.Column(
+                spacing=6,
+                alignment=ft.MainAxisAlignment.CENTER,
+                controls=[
+                    ft.Row(
+                        spacing=2,
+                        controls=[
+                            route_metric_item("ETE", overview_ete_value_text),
+                            route_metric_item("ETA", overview_eta_value_text),
+                            route_metric_item("Flight time", flight_time_text),
+                        ],
+                    ),
+                    ft.Row(
+                        spacing=6,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            overview_action(ft.Icons.SKIP_PREVIOUS, "Previous phase", lambda e: set_overview_status(status_index - 1)),
+                            overview_action(ft.Icons.PAUSE if is_playing else ft.Icons.PLAY_ARROW,
+                                            "Pause flight progress" if is_playing else "Play flight progress",
+                                            toggle_overview_progress, primary=True),
+                            overview_action(ft.Icons.SKIP_NEXT, "Next phase", lambda e: set_overview_status(status_index + 1)),
+                        ],
+                    ),
+                ],
+            ),
+            height=bottom_card_height,
+            padding=6,
+        )
+        return ft.Stack(
+            expand=True, clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            controls=[
+                ft.Container(left=0, top=0, right=0, bottom=0, content=overview_route_map_control()),
+                ft.Container(
+                    top=GAP, left=GAP, width=airport_card_width,
+                    content=ft.Column(
+                        spacing=GAP, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                        controls=[point_card("Departure", origin_icao, 4), point_card("Arrival", destination_icao, 5)],
+                    ),
+                ),
+                ft.Container(
+                    left=0, right=0, bottom=35,
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Container(width=metrics_width, content=route_metrics_card),
+                ),
+            ],
+        )
+
+
+    def announcement_airport_label(code: str) -> str:
+        canonical = normalize_airport_code(code) or (code or "").strip().upper()
+        record = lookup_airport_record(canonical)
+        if not record:
+            return canonical
+        airport_name = str(record.get("name") or canonical).strip()
+        iata = str(record.get("iata") or "").strip().upper()
+        return f"{airport_name} ({iata})" if iata else airport_name
+
+    def announcement_temperature(weather: dict) -> str:
+        value = weather.get("temperature_c")
+        if value is not None:
+            try:
+                return str(int(round(float(value))))
+            except (TypeError, ValueError):
+                pass
+        match = re.search(r"-?\d+(?:\.\d+)?", str(weather.get("temperature") or ""))
+        return str(int(round(float(match.group(0))))) if match else ""
+
+    def announcement_sky_condition(condition: str) -> str:
+        label = (condition or "").strip()
+        lowered = label.lower()
+        if not label or "unavailable" in lowered:
+            return ""
+        if "clear" in lowered:
+            return "clear skies"
+        if "partly" in lowered:
+            return "partly cloudy skies"
+        if "overcast" in lowered:
+            return "overcast skies"
+        if "cloud" in lowered:
+            return "cloudy skies"
+        if "fog" in lowered:
+            return "foggy conditions"
+        if "thunder" in lowered:
+            return "thunderstorms"
+        if "snow" in lowered:
+            return "snow showers"
+        if "rain" in lowered or "drizzle" in lowered or "shower" in lowered:
+            return "rain showers"
+        return label.lower()
+
+    def announcement_time_to_arrival() -> str:
+        distance_to_go = parse_optional_float(landing_distance_to_go_tf.value or "")
+        ground_speed = parse_optional_float(landing_ground_speed_tf.value or "")
+        if distance_to_go is not None and ground_speed is not None and distance_to_go >= 0 and ground_speed > 0:
+            remaining_minutes = max(1, int(round((distance_to_go / ground_speed) * 60.0)))
+            return format_hours_to_hm(remaining_minutes / 60.0)
+        return header_banner_remaining_time_label() if planned_overview_minutes() else ""
+
+    def build_captain_announcement_card(phase: str, embedded: bool = False) -> ft.Control:
+        is_departure = phase == "departure"
+        state_field = "captain_departure_announcement_text" if is_departure else "captain_descent_announcement_text"
+        expanded_field = "takeoff_announcement_expanded" if is_departure else "descent_announcement_expanded"
+        title = "Takeoff Announcement" if is_departure else "Descent Announcement"
+        all_languages = supported_languages()
+        requested_language_order = ["English", "German", "Arabic", "Italian", "Spanish", "Farsi"]
+        language_order = [language for language in requested_language_order if language in all_languages]
+        language_order.extend(language for language in all_languages if language not in language_order)
+        if state.captain_announcement_language not in language_order:
+            state.captain_announcement_language = "English"
+
+        def toggle_expanded(e=None):
+            setattr(state, expanded_field, not bool(getattr(state, expanded_field, False)))
             refresh_ui()
 
-        def hibernation_menu_button(title: str, subtitle: str, icon_name: str, handler, disabled: bool = False) -> ft.Control:
-            icon_value = getattr(ft.Icons, str(icon_name or "").upper(), ft.Icons.CIRCLE)
-            foreground = tokens["muted"] if disabled else tokens["text"]
-            accent = tokens["muted"] if disabled else tokens["accent"]
-            surface = ft.Container(
-                height=58,
-                padding=ft.padding.symmetric(horizontal=12, vertical=8),
-                border_radius=15,
-                bgcolor=ft.Colors.with_opacity(0.15 if not disabled else 0.08, tokens["accent"] if not disabled else tokens["subpanel"]),
-                border=ft.border.all(1, ft.Colors.with_opacity(0.32 if not disabled else 0.14, tokens["accent"] if not disabled else ft.Colors.WHITE)),
-                content=ft.Row(
+        def set_status(message: str, color: Optional[str] = None):
+            status_text.value = message
+            status_text.color = color or tokens["muted"]
+
+        def set_language(language: str):
+            state.captain_announcement_language = language
+            state.captain_departure_announcement_text = ""
+            state.captain_descent_announcement_text = ""
+            state.captain_announcement_text = ""
+            refresh_ui()
+
+        def language_segment(language: str) -> ft.Control:
+            active = state.captain_announcement_language == language
+            return ft.Container(
+                expand=True,
+                content=ft.GestureDetector(
+                    mouse_cursor=ft.MouseCursor.CLICK,
+                    on_tap=lambda e, selected=language: set_language(selected),
+                    content=ft.Container(
+                        height=32,
+                        padding=ft.padding.symmetric(horizontal=3, vertical=6),
+                        border_radius=9,
+                        alignment=ft.Alignment(0, 0),
+                        bgcolor=ft.Colors.with_opacity(0.24 if active else 0.06, tokens["accent"] if active else tokens["subpanel"]),
+                        border=ft.border.all(1, ft.Colors.with_opacity(0.56 if active else 0.14, tokens["accent"] if active else ft.Colors.WHITE)),
+                        content=ft.Text(
+                            LANGUAGE_DISPLAY_LABELS.get(language, language),
+                            size=10,
+                            font_family=rtl_announcement_font if language in RTL_ANNOUNCEMENT_LANGUAGES else UI_FONT,
+                            weight=ft.FontWeight.W_800 if active else ft.FontWeight.W_600,
+                            color=tokens["text"],
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                    ),
+                ),
+            )
+
+        def output_text_control(text: str) -> ft.Control:
+            is_rtl = state.captain_announcement_language in RTL_ANNOUNCEMENT_LANGUAGES
+            return ft.Text(
+                text,
+                size=13,
+                font_family=rtl_announcement_font if is_rtl else UI_FONT,
+                rtl=is_rtl,
+                color=tokens["text"],
+                text_align=ft.TextAlign.RIGHT if is_rtl else ft.TextAlign.LEFT,
+                selectable=True,
+            )
+
+        async def generate(e=None):
+            language = state.captain_announcement_language if state.captain_announcement_language in all_languages else "English"
+            origin = normalize_airport_code(state.departure or takeoff_departure_icao_tf.value) or ""
+            destination = normalize_airport_code(state.arrival or landing_arrival_icao_tf.value) or ""
+            airline = (state.airline or "").strip()
+            aircraft_key = canonical_aircraft_name(state.aircraft) or (state.aircraft or "").strip()
+            aircraft_name = str(AIRCRAFT_LIBRARY.get(aircraft_key, {}).get("name") or state.aircraft or "").strip()
+            flight_number = (state.flight_number or "").strip()
+            state.captain_announcement_generating = True
+            generate_button.disabled = True
+            generation_progress.visible = True
+            set_status("Generating announcement…", tokens["accent"])
+            page.update()
+
+            try:
+                altitude_input = altitude_tf.value or ""
+                altitude_value = parse_optional_float(altitude_input)
+                altitude_label = f"{round(altitude_value):,}" if altitude_value is not None else ""
+                if is_departure:
+                    state.captain_announcement_cruise_altitude_ft = altitude_input
+                else:
+                    state.captain_announcement_current_altitude_ft = altitude_input
+                origin_weather = airport_weather_for_card(origin, fetch=False)
+                destination_weather = airport_weather_for_card(destination, fetch=False)
+
+                origin_temperature = announcement_temperature(origin_weather) if is_departure else ""
+                destination_temperature = announcement_temperature(destination_weather)
+                origin_condition = str(origin_weather.get("condition") or "").replace("Weather unavailable", "").strip()
+                destination_condition = str(destination_weather.get("condition") or "").replace("Weather unavailable", "").strip()
+                values = {
+                    "CAPTAIN NAME": state.dashboard_flight_plan.get("pilot_in_command") or (
+                        state.pilot_name if state.pilot_name != "Pilot" else ""
+                    ),
+                    "AIRLINE": airline,
+                    "AIRCRAFT TYPE": aircraft_name,
+                    "FLIGHT NUMBER": flight_number,
+                    "ORIGIN": announcement_airport_label(origin),
+                    "DESTINATION": announcement_airport_label(destination),
+                    "FLIGHT TIME": format_hours_to_hm(float(planned_overview_minutes()) / 60.0) if planned_overview_minutes() else "",
+                    "CRUISING ALTITUDE": altitude_label if is_departure else "",
+                    "CURRENT ALTITUDE": altitude_label if not is_departure else "",
+                    "TIME TO ARRIVAL": announcement_time_to_arrival(),
+                    "ORIGIN TEMPERATURE": origin_temperature,
+                    "ORIGIN WEATHER CONDITION": origin_condition.lower(),
+                    "ORIGIN SKY CONDITION": announcement_sky_condition(origin_condition),
+                    "DESTINATION TEMPERATURE": destination_temperature,
+                    "DESTINATION WEATHER CONDITION": destination_condition.lower(),
+                    "DESTINATION SKY CONDITION": announcement_sky_condition(destination_condition),
+                    "DESTINATION SKY / PRECIPITATION": announcement_sky_condition(destination_condition),
+                }
+                announcement = render_announcement(language, phase, values, allow_partial=True)
+                setattr(state, state_field, announcement)
+                state.captain_announcement_text = announcement
+                state.captain_announcement_phase = phase
+                output_surface.content = output_text_control(announcement)
+                set_status("Announcement ready.", tokens["accent"])
+            except Exception as ex:
+                setattr(state, state_field, "")
+                state.captain_announcement_text = ""
+                output_surface.content = ft.Container(height=24)
+                set_status(f"Could not generate: {ex}", "#FFB4B4")
+            finally:
+                state.captain_announcement_generating = False
+                generate_button.disabled = False
+                generation_progress.visible = False
+                page.update()
+
+        altitude_tf = ft.TextField(
+            label="Cruising altitude (ft)" if is_departure else "Current altitude (ft)",
+            value=(
+                state.captain_announcement_cruise_altitude_ft
+                if is_departure
+                else state.captain_announcement_current_altitude_ft or landing_current_alt_tf.value or ""
+            ),
+            hint_text="e.g. 35000" if is_departure else "e.g. 12000",
+            width=200,
+            height=48,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            border_radius=12,
+            filled=True,
+            bgcolor=tokens["input_bg"],
+            color=tokens["text"],
+            label_style=ft.TextStyle(color=tokens["muted"]),
+            hint_style=ft.TextStyle(color=tokens["muted"]),
+        )
+        status_text = ft.Text("", size=11, color=tokens["muted"])
+        generation_progress = ft.ProgressRing(
+            width=18,
+            height=18,
+            stroke_width=2,
+            color=tokens["accent"],
+            visible=bool(state.captain_announcement_generating),
+        )
+        generate_button = ft.ElevatedButton(
+            "Generate Speech",
+            icon=ft.Icons.MIC,
+            on_click=generate,
+            disabled=bool(state.captain_announcement_generating),
+            bgcolor=tokens["primary"],
+            color=tokens["on_primary"],
+        )
+        existing_text = str(getattr(state, state_field, "") or "")
+        output_surface = ft.Container(
+            padding=14,
+            border_radius=16,
+            bgcolor=surface_fill(tokens["subpanel"]),
+            border=ft.border.all(1, ft.Colors.with_opacity(0.18, ft.Colors.WHITE)),
+            content=output_text_control(existing_text) if existing_text else ft.Container(height=24),
+        )
+
+        missing_native_language = missing_native_language_for_airline(state.airline)
+        language_rows = [
+            ft.Row(
+                spacing=6,
+                controls=[language_segment(language) for language in language_order[index:index + 3]],
+            )
+            for index in range(0, len(language_order), 3)
+        ]
+        card_controls: List[ft.Control] = [ft.Column(spacing=7, controls=language_rows), altitude_tf]
+        if missing_native_language:
+            card_controls.append(ft.Text(f"{missing_native_language} template not supplied", size=10, color=tokens["muted"]))
+        card_controls.extend(
+            [
+                ft.Row(
                     spacing=10,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Container(
-                            width=28,
-                            height=28,
-                            border_radius=999,
-                            alignment=ft.Alignment(0, 0),
-                            bgcolor=ft.Colors.with_opacity(0.14, accent),
-                            content=ft.Icon(icon_value, size=17, color=accent),
-                        ),
-                        ft.Container(
-                            expand=True,
-                            content=ft.Column(
-                                tight=True,
-                                spacing=2,
-                                alignment=ft.MainAxisAlignment.CENTER,
-                                controls=[
-                                    ft.Text(title, size=12, weight=ft.FontWeight.W_900, color=foreground, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                    ft.Text(subtitle, size=9, color=tokens["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                ],
-                            ),
-                        ),
-                    ],
+                    controls=[generate_button, generation_progress],
                 ),
+                status_text,
+                output_surface,
+            ]
+        )
+        expanded = embedded or bool(getattr(state, expanded_field, False))
+        shell_controls: List[ft.Control] = []
+        if not embedded:
+            shell_controls.append(
+                ft.GestureDetector(
+                    mouse_cursor=ft.MouseCursor.CLICK,
+                    on_tap=toggle_expanded,
+                    content=ft.Container(
+                        height=32,
+                        content=ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            controls=[
+                                ft.Text(title, size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
+                                ft.Icon(
+                                    ft.Icons.KEYBOARD_ARROW_UP_ROUNDED if expanded else ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED,
+                                    size=22,
+                                    color=tokens["muted"],
+                                ),
+                            ],
+                        ),
+                    ),
+                )
             )
-            if disabled:
-                return surface
-            return ft.GestureDetector(
-                mouse_cursor=ft.MouseCursor.CLICK,
-                on_tap=handler,
-                content=surface,
-            )
-
-        flight_hibernation_action_button = ft.GestureDetector(
-            mouse_cursor=ft.MouseCursor.CLICK,
-            on_tap=toggle_flight_hibernation_menu,
-            content=ft.Container(
-                width=48,
-                height=48,
-                border_radius=999,
-                alignment=ft.Alignment(0, 0),
-                tooltip="Flight actions",
-                bgcolor=ft.Colors.with_opacity(0.18, tokens["accent"] if bool(getattr(state, "flight_hibernation_menu_open", False)) else tokens["subpanel"]),
-                border=ft.border.all(1, ft.Colors.with_opacity(0.34, tokens["accent"] if bool(getattr(state, "flight_hibernation_menu_open", False)) else ft.Colors.WHITE)),
-                content=ft.Icon(ft.Icons.MORE_VERT, size=23, color=tokens["text"]),
-            ),
-        )
-
-        flight_hibernation_menu = ft.Container(
-            width=250,
-            content=overview_glass_panel(
-                ft.Column(
-                    tight=True,
-                    spacing=10,
-                    controls=[
-                        ft.Text("Flight Actions", size=13, weight=ft.FontWeight.W_900, color=tokens["text"]),
-                        hibernation_menu_button(
-                            "Flight Hibernation",
-                            "Save this flight for next launch",
-                            "pause_circle",
-                            save_current_flight_hibernation,
-                        ),
-                        hibernation_menu_button(
-                            "Flight End",
-                            "Open flight summary",
-                            "flag",
-                            show_flight_end_summary,
-                        ),
-                        hibernation_menu_button(
-                            "Start New Flight",
-                            "Reset the current flight workspace",
-                            "restart_alt",
-                            lambda e: reset_active_flight_workspace(),
-                        ),
-                    ],
-                ),
-                width=250,
-                padding=12,
-                radius=18,
-            ),
-        )
-
-        route_metrics_card = overview_glass_panel(
-            ft.Row(
-                spacing=12,
-                alignment=ft.MainAxisAlignment.CENTER,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    route_metric_item("Distance", distance_label, distance_subtitle),
-                    route_metric_item("ETE", overview_ete_value_text, "Estimated flight time"),
-                    route_metric_item("ETA", overview_eta_value_text, "Route arrival"),
-                    flight_hibernation_action_button,
-                ],
-            ),
-            width=600,
-            height=106,
-            padding=12,
-            radius=18,
-        )
-
-        # Return the Overview page directly instead of wrapping it in build_tab_page().
-        # The previous wrapper could render as a blank gray layer on this new tab
-        # because OVERVIEW is not part of the existing background map.
+        if expanded:
+            if not embedded:
+                shell_controls.append(ft.Divider(height=10, opacity=0.15))
+            shell_controls.append(ft.Column(spacing=12, controls=card_controls))
         return ft.Container(
-            expand=True,
-            bgcolor=ft.Colors.TRANSPARENT,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            content=ft.Stack(
-                expand=True,
+            content=ft.Column(spacing=10, controls=shell_controls),
+            padding=0 if embedded else 16,
+            border_radius=0 if embedded else 20,
+            bgcolor=ft.Colors.TRANSPARENT if embedded else surface_fill(tokens["panel"]),
+            border=None if embedded else ft.border.all(1, tokens["card_border"]),
+            shadow=None if embedded else surface_shadow(0.72),
+        )
+
+    def build_operations_panel(
+        phase: str, warning_host: ft.Control, weight_limit: ft.Text, weight_status: ft.Text,
+        weight_controls: List[ft.Control],
+    ) -> ft.Control:
+        is_departure = phase == "departure"
+        announcement_title = "Takeoff Announcement" if is_departure else "Descent Announcement"
+        view_field = "takeoff_operations_view" if is_departure else "landing_operations_view"
+        panel_view = str(getattr(state, view_field, "menu") or "menu")
+        if panel_view not in ("menu", "warnings", "announcement"):
+            panel_view = "menu"
+            setattr(state, view_field, panel_view)
+
+        def select_view(view_name: str):
+            setattr(state, view_field, view_name)
+            if view_name == "announcement":
+                setattr(state, "takeoff_announcement_expanded" if is_departure else "descent_announcement_expanded", True)
+            refresh_ui()
+
+        weight_card = glass_card(
+            "Weight and Actions",
+            ft.Column(
+                weight_controls, spacing=8,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            ),
+        )
+        weight_limit.size = 14
+        weight_limit.no_wrap = True
+        weight_title = weight_card.content.controls[0]
+        weight_title.expand = True
+        weight_title.size = weight_limit.size
+        weight_title.weight = weight_limit.weight
+        weight_title.style = ft.TextStyle(height=1.0)
+        weight_title.max_lines = 2
+        weight_title.overflow = ft.TextOverflow.ELLIPSIS
+        weight_card.content.controls[0] = ft.Row(
+            [weight_title, weight_limit], spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        if panel_view == "menu":
+            operations_content = ft.Column(
+                expand=True, spacing=6, alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 controls=[
-                    ft.Container(
-                        expand=True,
-                        content=overview_route_map_control(),
+                    ft.OutlinedButton(
+                        "Warnings", icon=ft.Icons.WARNING_AMBER_ROUNDED, height=30,
+                        on_click=lambda e: select_view("warnings"),
                     ),
-                    ft.Container(
-                        left=overview_margin,
-                        top=overview_margin,
-                        width=280,
-                        height=280,
-                        content=point_card("Origin", origin_icao, 4),
+                    ft.OutlinedButton(
+                        announcement_title, icon=ft.Icons.RECORD_VOICE_OVER_ROUNDED, height=30,
+                        on_click=lambda e: select_view("announcement"),
                     ),
-                    ft.Container(
-                        right=overview_margin,
-                        top=overview_margin,
-                        width=280,
-                        height=280,
-                        content=point_card("Destination", destination_icao, 5),
+                    weight_status,
+                ],
+            )
+        else:
+            if panel_view == "warnings":
+                for item in warning_host.controls:
+                    if isinstance(item, ft.Text):
+                        item.color = tokens["muted"]
+                    elif isinstance(item.content, ft.Text):
+                        item.content.color = performance_warning_ink(item.content.data)
+            content = warning_host if panel_view == "warnings" else build_captain_announcement_card(phase, embedded=True)
+            operations_content = ft.Column(
+                [content], expand=True, scroll=ft.ScrollMode.AUTO,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
+
+        operations_card = glass_card("Warnings & Announcements", operations_content, expand=True)
+        if panel_view != "menu":
+            operations_card.content.controls[0] = ft.Row(
+                [
+                    ft.IconButton(
+                        ft.Icons.ARROW_BACK_ROUNDED, tooltip="Back to operations",
+                        width=28, height=28, padding=0, icon_size=17,
+                        on_click=lambda e: select_view("menu"),
                     ),
-                    ft.Container(
-                        left=overview_margin,
-                        bottom=overview_margin,
-                        width=370,
-                        height=150,
-                        content=overview_aircraft_image,
-                    ),
-                    ft.Container(
-                        left=0,
-                        right=0,
-                        bottom=overview_margin,
-                        alignment=ft.Alignment(0, 1),
-                        content=route_metrics_card,
-                    ),
-                    ft.Container(
-                        right=overview_margin,
-                        bottom=overview_margin,
-                        width=overview_flight_width,
-                        height=overview_card_height,
-                        content=flight_status_card,
-                    ),
-                    *(
-                        [
-                            ft.Container(
-                                left=0,
-                                right=0,
-                                bottom=overview_margin + 118,
-                                alignment=ft.Alignment(0.44, 1),
-                                content=flight_hibernation_menu,
-                            )
-                        ]
-                        if bool(getattr(state, "flight_hibernation_menu_open", False))
-                        else []
+                    ft.Text(
+                        "Warnings" if panel_view == "warnings" else announcement_title,
+                        size=14, weight=ft.FontWeight.W_700, color=tokens["text"],
+                        expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
                     ),
                 ],
-            ),
+                spacing=6,
+            )
+
+        weight_card.padding = ft.Padding.symmetric(horizontal=10, vertical=14)
+        weight_card.content.spacing = 7
+        operations_card.padding = 10
+        operations_card.content.spacing = 5
+        return ft.Column(
+            [weight_card, operations_card], spacing=GAP,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
 
+    def close_dashboard_airport_map():
+        nonlocal dashboard_airport_process, dashboard_airport_unavailable
+        process = dashboard_airport_process
+        dashboard_airport_process = None
+        dashboard_airport_unavailable = False
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    def set_live_map_visibility(show):
+        nonlocal live_map_visible
+        if live_map_child and live_map_visible != show:
+            ctypes.windll.user32.ShowWindow(ctypes.c_void_p(live_map_child), 4 if show else 0)
+            live_map_visible = show
+
+    def close_live_map():
+        nonlocal live_map_process, live_map_child, live_map_unavailable, live_render_callback
+        process = live_map_process
+        set_live_map_visibility(False)
+        live_map_process = None
+        live_map_child = None
+        live_map_unavailable = False
+        live_render_callback = None
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    async def show_live_map(url):
+        from tempfile import TemporaryDirectory
+
+        nonlocal live_map_process, live_map_unavailable, live_render_callback
+        if live_map_process or not state.is_logged_in or state.selected_tab_index != 0 or not state.overview_live:
+            return
+        with TemporaryDirectory(prefix="fms-live-map-", ignore_cleanup_errors=True) as directory:
+            bridge = Path(directory)
+            command = [sys.executable]
+            if not getattr(sys, "frozen", False):
+                command.append(str(Path(__file__).resolve()))
+            command += [
+                "--globe-webview", "--attach", "--slot", "live-map", "--url", url,
+                "--parent-title", page.title, "--storage-path", str(storage_dir / "Live Map Cache"),
+                "--live-map-bridge", directory,
+            ]
+            process = None
+            try:
+                process = subprocess.Popen(
+                    command, cwd=str(base_dir), creationflags=subprocess.CREATE_NO_WINDOW,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                live_map_process = process
+                await run_live_map_bridge(process, bridge)
+            except OSError:
+                pass
+            finally:
+                if live_map_process is process:
+                    close_live_map()
+                    if state.is_logged_in and state.selected_tab_index == 0 and state.overview_live:
+                        live_map_unavailable = True
+                        refresh_active_page()
+
+    async def run_live_map_bridge(process, bridge):
+        nonlocal live_render_callback, live_map_child
+        user32 = ctypes.windll.user32
+        find_child = user32.FindWindowExW
+        find_child.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p)
+        find_child.restype = ctypes.c_void_p
+        child = None
+        deadline = time.monotonic() + 12
+        snapshot_pending = True
+        was_active = False
+
+        async def snapshot_changed():
+            nonlocal snapshot_pending
+            snapshot_pending = True
+
+        live_render_callback = snapshot_changed
+        while live_map_process is process and process.poll() is None:
+            active = state.is_logged_in and state.selected_tab_index == 0 and state.overview_live
+            if active and not was_active:
+                snapshot_pending = True
+            was_active = active
+            if active and snapshot_pending:
+                payload = live_map_snapshot()
+                try:
+                    temp = bridge / "snapshot.tmp"
+                    temp.write_text(json.dumps(payload, ensure_ascii=True, allow_nan=False), encoding="utf-8")
+                    temp.replace(bridge / "snapshot.json")
+                    snapshot_pending = False
+                except OSError:
+                    pass
+            if not child:
+                parents = _enum_windows_by_title(page.title)
+                child = find_child(parents[0], None, None, LIVE_MAP_WINDOW) if parents else None
+                if not child and time.monotonic() >= deadline:
+                    return
+            if child:
+                live_map_child = child
+                show = active and page.window.visible is not False and not page.window.minimized
+                set_live_map_visibility(show and not (tutorial_dialog and tutorial_dialog.open))
+            actions_path = bridge / "actions.json"
+            try:
+                actions = json.loads(actions_path.read_text(encoding="utf-8"))
+                actions_path.unlink()
+            except (OSError, ValueError):
+                actions = []
+            if active:
+                for action in actions:
+                    handle_live_map_action(action)
+            await asyncio.sleep(0.12)
+
+    def dashboard_departure_icao():
+        code = normalize_airport_code(state.departure) or ""
+        airport = lookup_airport_record(code) or {}
+        icao = str(airport.get("icao") or code).upper()
+        return icao if re.fullmatch(r"[A-Z]{4}", icao) else ""
+
+    async def show_dashboard_airport_map(url):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory(prefix="fms-dashboard-", ignore_cleanup_errors=True) as directory:
+            await run_dashboard_airport_map(url, Path(directory) / "departure")
+
+    async def run_dashboard_airport_map(url, departure_file):
+        nonlocal dashboard_airport_process, dashboard_airport_unavailable
+        if dashboard_airport_process or dashboard_airport_unavailable or not state.is_logged_in or state.selected_tab_index != 1:
+            return
+        command = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            command.append(str(Path(__file__).resolve()))
+        command += [
+            "--globe-webview", "--attach", "--slot", "dashboard-airport", "--url", url,
+            "--parent-title", page.title, "--storage-path", str(storage_dir / "Airport Map Cache"),
+            "--departure-file", str(departure_file),
+        ]
+        try:
+            process = subprocess.Popen(
+                command, cwd=str(base_dir), creationflags=subprocess.CREATE_NO_WINDOW,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            dashboard_airport_unavailable = True
+            refresh_active_page()
+            return
+        dashboard_airport_process = process
+        user32 = ctypes.windll.user32
+        find_child = user32.FindWindowExW
+        find_child.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p)
+        find_child.restype = ctypes.c_void_p
+        deadline = time.monotonic() + 12
+        parent = child = None
+        shown = None
+        published_departure = None
+        while dashboard_airport_process is process and process.poll() is None:
+            departure = dashboard_departure_icao()
+            if departure != published_departure:
+                try:
+                    departure_file.write_bytes(f"{departure or '-'}\n".encode("ascii"))
+                    published_departure = departure
+                except OSError:
+                    pass
+            if not child:
+                parents = _enum_windows_by_title(page.title) if not parent else ()
+                parent = parents[0] if parents else parent
+                child = find_child(parent, None, None, DASHBOARD_MAP_WINDOW) if parent else None
+                if not child and time.monotonic() >= deadline:
+                    break
+            if child:
+                show = (
+                    page.window.visible is not False and not page.window.minimized
+                    and not (tutorial_dialog and tutorial_dialog.open)
+                    and not (dashboard_remarks_dialog and dashboard_remarks_dialog.open)
+                    and not any(isinstance(control, ft.Container) and control.visible for control in page.overlay)
+                )
+                if shown != show:
+                    user32.ShowWindow(ctypes.c_void_p(child), 4 if show else 0)
+                    shown = show
+            await asyncio.sleep(0.10)
+        if dashboard_airport_process is process:
+            close_dashboard_airport_map()
+            if state.is_logged_in and state.selected_tab_index == 1:
+                dashboard_airport_unavailable = True
+                refresh_active_page()
 
     def home_page():
-        occupied_pax = sum(1 for seat in seat_model.get("seats", []) if seat.get("occupied")) if seat_model.get("generated") else 0
-        configured_seats = len(seat_model.get("seats", [])) if seat_model.get("generated") else 0
-        pax_value = str(occupied_pax) if seat_model.get("generated") else "—"
-
-        home_card_bg = tokens["panel"]
-        home_tile_bg = tokens["subpanel"]
-        home_info_fill_bg = tokens["panel"]
-
-        home_origin_icao = (state.departure or takeoff_departure_icao_tf.value or "").strip().upper()
-        home_destination_icao = (state.arrival or landing_arrival_icao_tf.value or "").strip().upper()
-        home_origin_icao = normalize_airport_code(home_origin_icao) or home_origin_icao
-        home_destination_icao = normalize_airport_code(home_destination_icao) or home_destination_icao
-        home_route_nm = route_distance_nm(home_origin_icao, home_destination_icao) if home_origin_icao and home_destination_icao else None
-        home_ete_label = format_hours_to_hm(home_route_nm / 480.0) if home_route_nm else "—"
-        home_route_label = f"{home_origin_icao or '—'} → {home_destination_icao or '—'}"
-
-        def home_stat_tile(label: str, value: str, subtitle: str = "", width: int = 160) -> ft.Control:
-            return ft.Container(
-                width=width,
-                height=94,
-                padding=14,
-                border_radius=18,
-                bgcolor=home_tile_bg,
-                border=ft.border.all(1, tokens["card_border"]),
-                content=ft.Column(
-                    spacing=4,
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    controls=[
-                        ft.Text(label, size=11, color=tokens["muted"]),
-                        ft.Text(value or "—", size=20, weight=ft.FontWeight.W_800, color=tokens["text"], max_lines=1),
-                        ft.Text(subtitle, size=10, color=tokens["muted"], max_lines=1),
-                    ],
-                ),
-            )
-
-        def calendar_dt(entry: dict):
-            try:
-                return parse_calendar_entry_datetime(entry)
-            except Exception:
-                try:
-                    return datetime.strptime((entry.get("date") or "") + " " + (entry.get("time") or "00:00"), "%Y-%m-%d %H:%M")
-                except Exception:
-                    return datetime.max
-
-        now_dt = datetime.now()
-        planned_entries = [entry for entry in state.calendar_entries if not bool(entry.get("completed"))]
-        upcoming_entries = [entry for entry in planned_entries if calendar_dt(entry) >= now_dt.replace(hour=0, minute=0, second=0, microsecond=0)]
-        upcoming_entries.sort(key=calendar_dt)
-        next_entry = upcoming_entries[0] if upcoming_entries else None
-        today_str = now_dt.strftime("%Y-%m-%d")
-        today_entries = [entry for entry in state.calendar_entries if (entry.get("date") or "") == today_str]
-        completed_entries = [entry for entry in state.calendar_entries if bool(entry.get("completed"))]
-        completed_entries.sort(key=calendar_dt, reverse=True)
-        recent_completed = completed_entries[0] if completed_entries else None
-
-        def today_schedule_heading() -> str:
-            if not today_entries:
-                return "No flights scheduled"
-            routes = []
-            for entry in today_entries[:2]:
-                route = (entry.get("route") or f"{entry.get('origin', '—')} → {entry.get('destination', '—')}").strip()
-                airline = (entry.get("airline") or "").strip()
-                routes.append(f"{route} • {airline}" if airline else route)
-            if len(today_entries) > 2:
-                routes.append(f"+{len(today_entries) - 2} more")
-            return "  |  ".join(routes)
-
-        next_route = next_entry.get("route") if next_entry else "—"
-        next_airline = next_entry.get("airline") if next_entry else "No planned flight"
-        next_time = f"{next_entry.get('date', '')} {next_entry.get('time', '')}".strip() if next_entry else "—"
-
-        greeting_card = glass_card_with_background(
-            "Pilot Greeting",
-            ft.Column(
-                spacing=18,
-                controls=[
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.START,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
-                        controls=[
-                            ft.Column(
-                                tight=True,
-                                spacing=8,
-                                controls=[
-                                    ft.Text(f"Hello, {state.pilot_name}", size=32, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                                    ft.Text(now_local_str(), size=18, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                                ],
-                            ),
-                        ],
-                    ),
-                    ft.Row(
-                        wrap=True,
-                        spacing=12,
-                        run_spacing=12,
-                        controls=[
-                            home_stat_tile("Location", state.location_label if state.location_permission_enabled else "Not enabled", "city / area", width=230),
-                            home_stat_tile("Weather", f"{state.weather.icon} {state.weather.condition}" if state.weather.condition else "—", "live station", width=230),
-                        ],
-                    ),
-                    ft.Row(
-                        wrap=True,
-                        spacing=10,
-                        controls=[
-                            ft.ElevatedButton(
-                                "Enable Location" if not state.location_permission_enabled else "Refresh Location",
-                                on_click=enable_location_tracking,
-                                bgcolor=tokens["accent"],
-                                color=ft.Colors.WHITE,
-                            ),
-                            ft.OutlinedButton("Location Settings", on_click=open_device_location_settings),
-                            ft.OutlinedButton("Open Map", on_click=lambda e: go_to_tab(6)),
-                        ],
-                    ),
-                ],
-            ),
-            bgcolor_override=home_info_fill_bg,
-            height=375,
-        )
-
         def home_airline_code(airline_name: Optional[str]) -> str:
+            if airline_name and airline_name == canonical_airline_name(state.airline_record.get("name")):
+                code = state.airline_record.get("iata") or state.airline_record.get("icao")
+                if code:
+                    return code
             return AIRLINE_CALLSIGNS.get((airline_name or "").strip(), "--")
 
         def home_flight_number_suffix(value: Optional[str], airline_name: Optional[str]) -> str:
@@ -12804,7 +12371,7 @@ def main(page: ft.Page):
         def home_full_flight_number(suffix: Optional[str], airline_name: Optional[str]) -> str:
             code = home_airline_code(airline_name)
             number = (suffix or "").strip()
-            if code and code != "--":
+            if number and code and code != "--":
                 if number.upper().startswith(code.upper()):
                     return number
                 return f"{code}{number}".strip()
@@ -12826,530 +12393,607 @@ def main(page: ft.Page):
             color=tokens["text"],
             label_style=ft.TextStyle(color=tokens["muted"]),
             hint_style=ft.TextStyle(color=tokens["muted"]),
+            on_change=update_home_flight_number,
             on_submit=update_home_flight_number,
             on_blur=update_home_flight_number,
         )
 
-        def home_aircraft_option_values() -> List[str]:
-            if state.airline and state.airline != "Generic" and state.airline in AIRLINE_FLEETS:
-                fleet_keys: List[str] = []
-                for fleet_name in AIRLINE_FLEETS.get(state.airline, []):
-                    key = canonical_aircraft_name(fleet_name)
-                    if key and key in AIRCRAFT_LIBRARY and key not in fleet_keys:
-                        fleet_keys.append(key)
-                if fleet_keys:
-                    return fleet_keys
-            return sorted(all_library_aircraft_names(), key=aircraft_picker_sort_key)
-
-        def home_dropdown_menu_style() -> ft.MenuStyle:
-            return ft.MenuStyle(
-                bgcolor=ft.Colors.with_opacity(0.70, ft.Colors.BLACK),
-                elevation=12,
-                padding=ft.padding.symmetric(vertical=6),
-                side=ft.BorderSide(1, ft.Colors.with_opacity(0.16, ft.Colors.WHITE)),
-                shape=ft.RoundedRectangleBorder(radius=14),
-            )
-
-        def home_dropdown_logo_slot(content: ft.Control) -> ft.Container:
-            return ft.Container(
-                width=58,
-                height=32,
-                alignment=ft.Alignment(0, 0),
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                content=content,
-            )
-
-        def home_airline_option(name: str) -> ft.dropdown.Option:
-            logo = airline_logo_image(name, width=52, height=24, fallback_text=False, key_prefix="home-airline-dd-logo")
-            if not airline_logo_rel_path(name):
-                logo = ft.Text(home_airline_code(name), size=10, weight=ft.FontWeight.W_800, color=tokens["muted"], text_align=ft.TextAlign.CENTER)
-            return ft.dropdown.Option(
-                key=name,
-                text=name,
-                content=ft.Container(
-                    height=46,
-                    alignment=ft.Alignment(-1, 0),
-                    content=ft.Row(
-                        spacing=12,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            home_dropdown_logo_slot(logo),
-                            ft.Text(name, size=15, weight=ft.FontWeight.W_700, color=ft.Colors.WHITE, no_wrap=True),
-                        ],
-                    ),
-                ),
-            )
-
-        def home_aircraft_option(key: str) -> ft.dropdown.Option:
-            display = AIRCRAFT_LIBRARY.get(key, {}).get("name", key)
-            logo = manufacturer_logo_image(key, width=50, height=24, fallback_icon=False, key_prefix="home-aircraft-dd-logo")
-            return ft.dropdown.Option(
-                key=key,
-                text=display,
-                content=ft.Container(
-                    height=46,
-                    alignment=ft.Alignment(-1, 0),
-                    content=ft.Row(
-                        spacing=12,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            home_dropdown_logo_slot(logo),
-                            ft.Text(display, size=15, weight=ft.FontWeight.W_700, color=ft.Colors.WHITE, no_wrap=True),
-                        ],
-                    ),
-                ),
-            )
-
-        def on_home_airline_changed(e):
-            selected_airline = e.control.value or ""
-            suffix = home_flight_number_suffix(home_flight_number_tf.value or state.flight_number, state.airline)
-            state.flight_number = home_full_flight_number(suffix, selected_airline)
+        def select_home_airline(record):
+            previous = state.airline
+            suffix = home_flight_number_suffix(home_flight_number_tf.value or state.flight_number, previous)
+            state.airline_record = record or {}
+            name = canonical_airline_name(record["name"]) if record else ""
+            state.flight_number = home_full_flight_number(suffix, name)
             home_flight_number_tf.value = suffix
-            set_airline(selected_airline)
-
-        def on_home_aircraft_changed(e):
-            sync_aircraft_across_pages(e.control.value, update_page=False)
-            state.logo_refresh_nonce += 1
-            refresh_ui()
-
-        home_airline_dd = ft.Dropdown(
-            label="Airline",
-            value=state.airline or None,
-            options=[home_airline_option(name) for name in AIRLINES],
-            height=58,
-            expand=True,
-            menu_height=420,
-            menu_style=home_dropdown_menu_style(),
-            border_radius=14,
-            filled=True,
-            fill_color=ft.Colors.with_opacity(0.70, ft.Colors.BLACK),
-            bgcolor=ft.Colors.with_opacity(0.70, ft.Colors.BLACK),
-            color=tokens["text"],
-            border_color=ft.Colors.with_opacity(0.18, ft.Colors.WHITE),
-            focused_border_color=tokens["accent"],
-            hover_color=ft.Colors.with_opacity(0.08, ft.Colors.WHITE),
-            label_style=ft.TextStyle(color=tokens["muted"]),
-            text_style=ft.TextStyle(color=ft.Colors.WHITE, size=15, weight=ft.FontWeight.W_700),
-            content_padding=ft.padding.symmetric(horizontal=12, vertical=8),
-            on_select=on_home_airline_changed,
-        )
-
-        selected_airline_selector = ft.Container(
-            padding=14,
-            border_radius=20,
-            bgcolor=tokens["subpanel"],
-            border=ft.border.all(1, tokens["card_border"]),
-            content=ft.Row(
-                spacing=14,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Container(
-                        width=72,
-                        height=72,
-                        border_radius=18,
-                        alignment=ft.Alignment(0, 0),
-                        bgcolor=ft.Colors.with_opacity(0.10, tokens["accent"]),
-                        border=ft.border.all(1, ft.Colors.with_opacity(0.28, tokens["accent"])),
-                        content=airline_logo_image(state.airline, width=56, height=38, fallback_text=False, key_prefix="home-selector-logo") if state.airline else ft.Icon(ft.Icons.FLIGHT, size=30, color=tokens["accent"]),
-                    ),
-                    home_airline_dd,
-                ],
-            ),
-        )
-
-        info_card_bg = home_info_fill_bg
-        has_home_airline = bool((state.airline or "").strip())
-        has_home_aircraft = bool((state.aircraft or "").strip())
-        home_compact_info_height = 200
-        airline_info_controls = [selected_airline_selector]
-        if has_home_airline:
-            airline_info_controls.append(home_flight_number_tf)
-        airline_info_height = 260 if has_home_airline else home_compact_info_height
-
-        airline_info_card = glass_card(
-            "Airline Info",
-            ft.Column(
-                spacing=12,
-                controls=airline_info_controls,
-            ),
-            bgcolor_override=info_card_bg,
-            height=airline_info_height,
-        )
-
-        aircraft_options = home_aircraft_option_values()
-        home_aircraft_dd = ft.Dropdown(
-            label="Aircraft",
-            value=state.aircraft if state.aircraft in aircraft_options else None,
-            options=[home_aircraft_option(key) for key in aircraft_options],
-            height=58,
-            expand=True,
-            menu_height=420,
-            menu_style=home_dropdown_menu_style(),
-            border_radius=14,
-            filled=True,
-            fill_color=ft.Colors.with_opacity(0.70, ft.Colors.BLACK),
-            bgcolor=ft.Colors.with_opacity(0.70, ft.Colors.BLACK),
-            color=tokens["text"],
-            border_color=ft.Colors.with_opacity(0.18, ft.Colors.WHITE),
-            focused_border_color=tokens["accent"],
-            hover_color=ft.Colors.with_opacity(0.08, ft.Colors.WHITE),
-            label_style=ft.TextStyle(color=tokens["muted"]),
-            text_style=ft.TextStyle(color=ft.Colors.WHITE, size=15, weight=ft.FontWeight.W_700),
-            content_padding=ft.padding.symmetric(horizontal=12, vertical=8),
-            on_select=on_home_aircraft_changed,
-        )
-
-        selected_aircraft_selector = ft.Container(
-            padding=14,
-            border_radius=20,
-            bgcolor=tokens["subpanel"],
-            border=ft.border.all(1, tokens["card_border"]),
-            content=ft.Row(
-                spacing=14,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Container(
-                        width=72,
-                        height=72,
-                        border_radius=18,
-                        alignment=ft.Alignment(0, 0),
-                        bgcolor=ft.Colors.with_opacity(0.10, tokens["accent"]),
-                        border=ft.border.all(1, ft.Colors.with_opacity(0.28, tokens["accent"])),
-                        content=manufacturer_logo_image(state.aircraft, width=54, height=42, key_prefix="home-aircraft-manufacturer-logo"),
-                    ),
-                    home_aircraft_dd,
-                ],
-            ),
-        )
-
-        home_aircraft_image_panel = ft.Container(
-            width=666,
-            height=420,
-            padding=8,
-            border_radius=20,
-            bgcolor=ft.Colors.TRANSPARENT,
-            border=ft.border.all(0.7, ft.Colors.with_opacity(0.16, ft.Colors.WHITE)),
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            alignment=ft.Alignment(0, 0),
-            content=aircraft_livery_image("Generic", state.aircraft, width=650, height=400),
-        )
-
-        compact_info_height = home_compact_info_height
-        aircraft_info_height = 650 if has_home_aircraft else compact_info_height
-        aircraft_info_top = ft.Container(
-            padding=16,
-            bgcolor=info_card_bg,
-            border_radius=ft.border_radius.only(
-                top_left=20,
-                top_right=20,
-                bottom_left=0 if has_home_aircraft else 20,
-                bottom_right=0 if has_home_aircraft else 20,
-            ),
-            content=ft.Column(
-                spacing=16,
-                controls=[
-                    ft.Text("Aircraft Info", size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                    ft.Divider(height=10, opacity=0.15),
-                    selected_aircraft_selector,
-                ],
-            ),
-        )
-        aircraft_info_controls: List[ft.Control] = [aircraft_info_top]
-        if has_home_aircraft:
-            aircraft_info_controls.append(
-                ft.Container(
-                    padding=ft.padding.only(left=16, right=16, bottom=16, top=14),
-                    bgcolor=ft.Colors.with_opacity(0.32, info_card_bg),
-                    border_radius=ft.border_radius.only(bottom_left=20, bottom_right=20),
-                    content=home_aircraft_image_panel,
-                )
-            )
-        secondary_info_card = ft.Container(
-            content=ft.Column(spacing=0, controls=aircraft_info_controls),
-            border_radius=20,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=ft.Colors.TRANSPARENT,
-            border=ft.border.all(1, tokens["card_border"]),
-            shadow=ft.BoxShadow(
-                blur_radius=18,
-                spread_radius=1,
-                color=ft.Colors.with_opacity(0.10, ft.Colors.BLACK),
-                offset=ft.Offset(0, 6),
-            ),
-            height=aircraft_info_height,
-        )
-
-        unused_route_snapshot_card = glass_card(
-            "Route Snapshot",
-            ft.Column(
-                spacing=12,
-                controls=[
-                    ft.Text(home_route_label, size=24, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                    ft.Row(
-                        wrap=True,
-                        spacing=12,
-                        controls=[
-                            home_stat_tile("Distance", f"{home_route_nm:,.0f} NM" if home_route_nm else "—", "great circle", width=150),
-                            home_stat_tile("ETE", home_ete_label, "at 480 kt", width=150),
-                            home_stat_tile("PAX", pax_value, "seats loaded", width=150),
-                        ],
-                    ),
-                ],
-            ),
-            height=250,
-        )
-
-        readiness_items = [
-            ("Airline", bool(state.airline), current_airline_label()),
-            ("Aircraft", bool(state.aircraft), current_aircraft_label()),
-            ("Route", bool(home_origin_icao and home_destination_icao), home_route_label),
-            ("Seats", bool(configured_seats), f"{configured_seats} configured" if configured_seats else "not generated"),
-            ("Baggage", bool((bag_payload_weight_summary_text.value or "").find("—") < 0), "payload ready" if (bag_payload_weight_summary_text.value or "").find("—") < 0 else "not calculated"),
-        ]
-        readiness_controls = []
-        for label, done, detail in readiness_items:
-            readiness_controls.append(
-                ft.Row(
-                    spacing=10,
-                    controls=[
-                        ft.Icon(ft.Icons.CHECK_CIRCLE if done else ft.Icons.RADIO_BUTTON_UNCHECKED, size=18, color=tokens["accent"] if done else tokens["muted"]),
-                        ft.Text(label, width=78, size=12, color=tokens["text"], weight=ft.FontWeight.W_700),
-                        ft.Text(detail, size=12, color=tokens["muted"]),
-                    ],
-                )
-            )
-        readiness_card = glass_card(
-            "Flight Readiness",
-            ft.Column(spacing=10, controls=readiness_controls),
-            height=250,
-        )
-
-        next_flight_card = glass_card(
-            "Next Planned Flight",
-            ft.Column(
-                spacing=10,
-                controls=[
-                    ft.Text(next_route or "—", size=22, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                    ft.Text(next_airline or "—", size=13, color=tokens["muted"]),
-                    ft.Text(next_time or "—", size=13, color=tokens["muted"]),
-                ],
-            ),
-            height=190,
-        )
-
-        today_schedule_card = glass_card(
-            "Today Schedule",
-            ft.Column(
-                spacing=10,
-                controls=[
-                    ft.Text(today_schedule_heading(), size=20, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                    ft.Text("Next flight: " + (next_route if next_entry else "—"), size=12, color=tokens["muted"]),
-                ],
-            ),
-            height=190,
-        )
-
-        HOME_RAMP_STATUS_LABELS = {
-            "departure": {
-                "boarding": "Boarding",
-                "cargo_loading": "Cargo loading",
-                "catering": "Catering",
-                "fueling": "Fueling",
-                "cleaning": "Cleaning",
-                "gate_ready": "Gate ready",
-                "pushback": "Pushback",
-            },
-            "arrival": {
-                "aircraft_parked": "Aircraft parked",
-                "navigation_lights_off": "Navigation lights off",
-                "engine_shutdown": "Engine shutdown",
-                "beacon_lights_off": "Beacon lights off",
-                "jet_bridge_connected": "Jet bridge connected",
-                "deboarding": "Deboarding",
-                "cargo_unloading": "Cargo unloading",
-            },
-        }
-        HOME_RAMP_STATUS_ICONS = {
-            "boarding": "GROUP",
-            "cargo_loading": "LOCAL_SHIPPING",
-            "catering": "RESTAURANT",
-            "fueling": "LOCAL_GAS_STATION",
-            "cleaning": "CLEANING_SERVICES",
-            "gate_ready": "CHECK_CIRCLE_OUTLINE",
-            "pushback": "FLIGHT_TAKEOFF",
-            "aircraft_parked": "FLIGHT_LAND",
-            "navigation_lights_off": "LIGHTBULB_OUTLINE",
-            "engine_shutdown": "POWER_SETTINGS_NEW",
-            "beacon_lights_off": "LIGHT_MODE",
-            "jet_bridge_connected": "AIRLINE_SEAT_RECLINE_NORMAL",
-            "deboarding": "DIRECTIONS_WALK",
-            "cargo_unloading": "INVENTORY_2",
-        }
-
-        def ensure_home_ramp_status_data():
-            for phase_name in ("departure", "arrival"):
-                current = getattr(state, f"ramp_{phase_name}_statuses", None)
-                if not isinstance(current, dict):
-                    current = {}
-                    setattr(state, f"ramp_{phase_name}_statuses", current)
-                for item_key in HOME_RAMP_STATUS_LABELS[phase_name]:
-                    current.setdefault(item_key, "idle")
-
-        def home_active_ramp_phase() -> str:
-            phase = getattr(state, "ramp_status_phase", "departure")
-            if phase not in ("departure", "arrival"):
-                phase = "departure"
-                state.ramp_status_phase = phase
-            return phase
-
-        def set_home_ramp_phase(phase: str):
-            if phase in ("departure", "arrival"):
-                state.ramp_status_phase = phase
-                refresh_ui()
-
-        def reset_home_ramp_phase(e=None):
-            ensure_home_ramp_status_data()
-            phase = home_active_ramp_phase()
-            status_map = getattr(state, f"ramp_{phase}_statuses")
-            for key in HOME_RAMP_STATUS_LABELS[phase]:
-                status_map[key] = "idle"
-            refresh_ui()
-
-        def next_home_ramp_status_value(current_value: str) -> str:
-            if current_value == "idle":
-                return "progress"
-            if current_value == "progress":
-                return "done"
-            return "idle"
-
-        def home_ramp_icon(item_key: str) -> ft.Control:
-            icon_value = getattr(ft.Icons, HOME_RAMP_STATUS_ICONS.get(item_key, "CHECK_CIRCLE_OUTLINE"), None)
-            return ft.Icon(icon_value, size=15, color=tokens["accent"]) if icon_value else ft.Text("•", size=16, weight=ft.FontWeight.W_900, color=tokens["accent"])
-
-        def home_ramp_phase_chip(label: str, phase: str) -> ft.Control:
-            active = home_active_ramp_phase() == phase
-            return ft.GestureDetector(
-                mouse_cursor=ft.MouseCursor.CLICK,
-                on_tap=lambda e, target_phase=phase: set_home_ramp_phase(target_phase),
-                content=ft.Container(
-                    padding=ft.padding.symmetric(horizontal=11, vertical=7),
-                    border_radius=999,
-                    bgcolor=ft.Colors.with_opacity(0.20 if active else 0.06, tokens["accent"] if active else tokens["muted"]),
-                    border=ft.border.all(1, ft.Colors.with_opacity(0.34 if active else 0.12, tokens["accent"] if active else tokens["muted"])),
-                    content=ft.Text(label, size=10, weight=ft.FontWeight.W_800 if active else ft.FontWeight.W_600, color=tokens["text"]),
-                ),
-            )
-
-        def home_ramp_status_button(phase: str, item_key: str) -> ft.Control:
-            ensure_home_ramp_status_data()
-            status_map = getattr(state, f"ramp_{phase}_statuses")
-            current_value = status_map.get(item_key, "idle")
-            if current_value == "done":
-                label, status_color, fill_opacity, border_opacity = "COMPLETE", ft.Colors.GREEN_300, 0.18, 0.48
-            elif current_value == "progress":
-                label, status_color, fill_opacity, border_opacity = "IN PROGRESS", tokens["accent"], 0.18, 0.46
+            if record:
+                set_airline(name)
             else:
-                label, status_color, fill_opacity, border_opacity = "STANDBY", tokens["muted"], 0.07, 0.14
+                state.airline = ""
+                airline_dd.value = None
+                home_flight_number_tf.prefix = None
+                safe_update_control(home_flight_number_tf)
+                refresh_navigation_accent()
 
-            def cycle_status(e=None, target_phase=phase, target_key=item_key):
-                ensure_home_ramp_status_data()
-                target_map = getattr(state, f"ramp_{target_phase}_statuses")
-                target_map[target_key] = next_home_ramp_status_value(target_map.get(target_key, "idle"))
+        def select_home_aircraft(record):
+            state.aircraft_record = record or {}
+            state.aircraft = aircraft_value(record) if record else ""
+            if record:
+                sync_aircraft_across_pages(state.aircraft, update_page=False)
+                state.logo_refresh_nonce += 1
                 refresh_ui()
+            else:
+                sync_aircraft_across_pages(None, update_page=False)
+                aircraft_image_host.content = None
+                aircraft_image_host.visible = False
+                safe_update_control(aircraft_image_host)
+                refresh_navigation_accent()
 
-            return ft.GestureDetector(
-                mouse_cursor=ft.MouseCursor.CLICK,
-                on_tap=cycle_status,
-                content=ft.Container(
-                    width=112,
-                    height=28,
-                    border_radius=999,
-                    alignment=ft.Alignment(0, 0),
-                    bgcolor=ft.Colors.with_opacity(fill_opacity, status_color),
-                    border=ft.border.all(1, ft.Colors.with_opacity(border_opacity, status_color)),
-                    content=ft.Text(label, size=9, weight=ft.FontWeight.W_900, color=status_color, text_align=ft.TextAlign.CENTER),
-                ),
+        plan_dropdowns = {}
+
+        def airport_search(label, backing, current, update_airport):
+            def choose(record):
+                if record:
+                    remember_airport(record)
+                    queue_airport_media(record["code"])
+                backing.value = record["code"] if record else ""
+                update_airport()
+                if record:
+                    refresh_ui()
+
+            return aviation_autocomplete(
+                label, "airport", current or backing.value, choose, expand=True, dropdown=True,
+                commit_airport_code=True, floating_results=plan_dropdowns,
             )
 
-        def home_ramp_status_row(phase: str, item_key: str, label: str) -> ft.Control:
-            ensure_home_ramp_status_data()
-            status_map = getattr(state, f"ramp_{phase}_statuses")
-            item_status = status_map.get(item_key, "idle")
-            status_color = ft.Colors.GREEN_300 if item_status == "done" else tokens["accent"] if item_status == "progress" else ft.Colors.WHITE
+        departure_search = airport_search("Departure", takeoff_departure_icao_tf, state.departure, on_takeoff_departure_changed)
+        arrival_search = airport_search("Arrival", landing_arrival_icao_tf, state.arrival, on_landing_arrival_changed)
+        airline_search = aviation_autocomplete(
+            "Airline", "airline", state.airline, select_home_airline, expand=True, dropdown=True,
+            floating_results=plan_dropdowns,
+        )
+        aircraft_search = aviation_autocomplete(
+            "Aircraft", "aircraft", (state.aircraft_record.get("name") or current_aircraft_label()) if state.aircraft else "",
+            select_home_aircraft, expand=True, dropdown=True,
+            floating_results=plan_dropdowns,
+        )
+        heading_height = 22
+        form_spacing = 1
+        plan_spacing = 2
+        original_outline_height = 31
+        extra_outline_height = original_outline_height * 0.5
+        target_field_height = 43 + extra_outline_height
+
+        def fitting_field_height(viewport_height):
+            card_height = viewport_height - SHELL_HEIGHT - 4 * GAP - DASHBOARD_DATE_HEIGHT - DASHBOARD_ACTIONS_HEIGHT
+            # Reserve room for the card title, section headings, padding, and row gaps.
+            form_chrome_height = 50 + 4 * heading_height
+            return max(36, min(target_field_height, math.floor((card_height - form_chrome_height) / 8)))
+
+        plan_field_height = fitting_field_height(page.height or 821)
+        aircraft_section_height = 3 * plan_field_height + 2 * plan_spacing
+        dashboard_aircraft = (
+            aircraft_profile_image(state.aircraft, width=676, height=aircraft_section_height)
+            if state.aircraft else None
+        )
+        aircraft_image_host = ft.Container(
+            expand=True, height=aircraft_section_height, alignment=ft.Alignment(0, 0), content=dashboard_aircraft,
+        )
+
+        plan_fields = []
+
+        def size_plan_field(field, height):
+            field.height = height
+            field.content_padding = ft.Padding.symmetric(
+                horizontal=10, vertical=max(9, 9 + (height - 43) / 2),
+            )
+
+        def style_plan_field(field):
+            plan_fields.append(field)
+            size_plan_field(field, plan_field_height)
+            field.dense = True
+            field.text_size = 16
+            field.text_style = ft.TextStyle(font_family=UI_FONT, size=16, color=tokens["text"])
+            field.label_style = ft.TextStyle(font_family=UI_FONT, size=16, color=tokens["muted"])
+            field.hint_style = ft.TextStyle(font_family=UI_FONT, size=16, color=tokens["muted"])
+            field.suffix_style = ft.TextStyle(font_family=UI_FONT, size=15, color=tokens["muted"])
+            if field.prefix_style:
+                field.prefix_style = field.prefix_style.copy(font_family=UI_FONT, size=16)
+            return field
+
+        for picker in (departure_search, arrival_search, airline_search, aircraft_search):
+            style_plan_field(picker.controls[0])
+            picker.expand = None
+
+        def plan_field(label, key, *, suffix=None, hint=None, numeric=False, multiline=False, expand=True):
+            def store(e):
+                value = (field.value or "").strip()
+                if key == "flight_time":
+                    match = re.fullmatch(r"(\d{1,3}):([0-5]\d)", value)
+                    minutes = int(match[1]) * 60 + int(match[2]) if match else 0
+                    error = "Use hours and minutes, e.g. 06:30." if value and not minutes else None
+                    if error is None:
+                        state.overview_flight_time_minutes = minutes
+                else:
+                    error = "Enter a whole number." if numeric and value and not re.fullmatch(r"[0-9]+", value) else None
+                if error is None:
+                    if value:
+                        state.dashboard_flight_plan[key] = value
+                    else:
+                        state.dashboard_flight_plan.pop(key, None)
+                if field.tooltip != error:
+                    field.tooltip = error
+                    field.border_color = "#B3261E" if error else tokens["card_border"]
+                    safe_update_control(field)
+
+            field = ft.TextField(
+                label=label, value=(
+                    f"{planned_overview_minutes() // 60:02d}:{planned_overview_minutes() % 60:02d}"
+                    if key == "flight_time" and planned_overview_minutes()
+                    else state.dashboard_flight_plan.get(key, "")
+                ),
+                suffix=suffix, hint_text=hint, keyboard_type=ft.KeyboardType.NUMBER if numeric else ft.KeyboardType.TEXT,
+                border_radius=14, filled=True, bgcolor=tokens["input_bg"], color=tokens["text"],
+                dense=True, expand=expand, multiline=multiline, min_lines=2 if multiline else 1,
+                max_lines=3 if multiline else 1, on_change=store,
+            )
+            return style_plan_field(field)
+
+        def open_remarks(e):
+            nonlocal dashboard_remarks_dialog
+            entry = ft.TextField(
+                label="Remarks", value=state.dashboard_flight_plan.get("remarks", ""),
+                multiline=True, min_lines=4, max_lines=9, width=410,
+                text_style=ft.TextStyle(font_family=UI_FONT, size=16),
+                label_style=ft.TextStyle(font_family=UI_FONT, size=16),
+            )
+
+            def save_remarks(e):
+                remarks.value = entry.value or ""
+                remarks.on_change(e)
+                page.pop_dialog()
+                safe_update_control(remarks)
+
+            dashboard_remarks_dialog = ft.AlertDialog(
+                title=ft.Text("Flight plan remarks"), content=entry, modal=True,
+                actions=[ft.TextButton("Cancel", on_click=lambda e: page.pop_dialog()),
+                         ft.FilledButton("Save", on_click=save_remarks)],
+            )
+            show_alert(dashboard_remarks_dialog)
+
+        cabin_capacity = sum(seat_model.get("totals", {}).values()) if seat_model.get("generated") else 0
+        flight_time = plan_field("Flight time", "flight_time", hint="HH:MM")
+        remarks = plan_field("Remarks", "remarks")
+        pilot = plan_field("Pilot in command", "pilot_in_command")
+        route_fields = [
+            ("Dep. gate", takeoff_gate_tf), ("Dep. terminal", takeoff_terminal_tf),
+            ("Arr. gate", landing_gate_tf), ("Arr. terminal", landing_terminal_tf),
+        ]
+        gate_state_keys = {
+            "Departure gate": "departure_gate", "Departure terminal": "departure_terminal",
+            "Arrival gate": "arrival_gate", "Arrival terminal": "arrival_terminal",
+        }
+        gate_fields = []
+        for label, backing in route_fields:
+            field = ft.TextField(label=label, value=backing.value, expand=True, filled=True,
+                                 border_radius=14, bgcolor=tokens["input_bg"], color=tokens["text"],
+                                 tooltip=backing.label)
+            def save_gate(e, target=backing):
+                target.value = e.control.value
+                setattr(state, gate_state_keys[target.label], (target.value or "").strip())
+            field.on_change = save_gate
+            gate_fields.append(style_plan_field(field))
+
+        def plan_heading(title):
             return ft.Container(
-                height=36,
-                padding=ft.padding.only(left=9, right=8, top=4, bottom=4),
-                border_radius=14,
-                bgcolor=ft.Colors.with_opacity(0.12 if item_status == "done" else 0.08 if item_status == "progress" else 0.045, status_color),
-                border=ft.border.all(1, ft.Colors.with_opacity(0.30 if item_status in ("done", "progress") else 0.10, ft.Colors.GREEN_300 if item_status == "done" else tokens["accent"] if item_status == "progress" else tokens["card_border"])),
-                content=ft.Row(
-                    spacing=9,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Container(width=26, height=26, border_radius=9, alignment=ft.Alignment(0, 0), bgcolor=ft.Colors.with_opacity(0.10, tokens["accent"]), content=home_ramp_icon(item_key)),
-                        ft.Container(expand=True, content=ft.Text(label, size=12, weight=ft.FontWeight.W_700, color=tokens["text"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)),
-                        home_ramp_status_button(phase, item_key),
-                    ],
-                ),
+                height=heading_height,
+                content=ft.Text(title, size=12, weight=ft.FontWeight.W_700, color=tokens["muted"]),
             )
 
-        def home_ramp_status_card() -> ft.Control:
-            ensure_home_ramp_status_data()
-            phase = home_active_ramp_phase()
-            labels = HOME_RAMP_STATUS_LABELS[phase]
-            status_map = getattr(state, f"ramp_{phase}_statuses")
-            completed_count = sum(1 for key in labels if status_map.get(key) == "done")
-            progress_count = sum(1 for key in labels if status_map.get(key) == "progress")
-            active_label = "Departure ramp" if phase == "departure" else "Arrival ramp"
-            return glass_card_with_background(
-                "Ramp Status",
-                ft.Column(
-                    spacing=7,
-                    controls=[
-                        ft.Row(
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Text(f"{active_label} • {progress_count} in process • {completed_count}/{len(labels)} done", size=10, color=tokens["muted"]),
-                                ft.Row(spacing=6, controls=[home_ramp_phase_chip("Departure", "departure"), home_ramp_phase_chip("Arrival", "arrival")]),
-                            ],
-                        ),
-                        ft.Container(height=1, bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.WHITE)),
-                        ft.Row(
-                            spacing=8,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Container(expand=True, content=ft.Text("Checklist", size=10, color=tokens["muted"], weight=ft.FontWeight.W_700)),
-                                ft.Container(width=112, alignment=ft.Alignment(0, 0), content=ft.Text("Status", size=10, color=tokens["muted"], weight=ft.FontWeight.W_700)),
-                            ],
-                        ),
-                        ft.Column(spacing=6, controls=[home_ramp_status_row(phase, key, label) for key, label in labels.items()]),
-                        ft.Row(alignment=ft.MainAxisAlignment.END, controls=[ft.TextButton("Reset", on_click=reset_home_ramp_phase)]),
-                    ],
-                ),
-                height=440,
-                bgcolor_override=home_info_fill_bg,
+        dropdown_rows = {}
+        for label, results in plan_dropdowns.items():
+            results.expand = True
+            spacer = ft.Container(expand=True)
+            dropdown_rows[label] = ft.Row(
+                [spacer, results] if label == "Arrival" else [results, spacer],
+                left=0, right=0, spacing=6 if label in ("Departure", "Arrival") else 8,
+                vertical_alignment=ft.CrossAxisAlignment.START,
             )
+
+        def position_dropdowns(field_height):
+            route_top = heading_height + form_spacing
+            operator_top = 2 * heading_height + 2 * field_height + 4 * form_spacing
+            for label in ("Departure", "Arrival"):
+                dropdown_rows[label].top = route_top + field_height
+            dropdown_rows["Airline"].top = operator_top + field_height
+            dropdown_rows["Aircraft"].top = operator_top + 2 * field_height + plan_spacing
+
+        position_dropdowns(plan_field_height)
+
+        plan_form = ft.Column(
+            spacing=form_spacing, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            controls=[
+                plan_heading("Route"),
+                ft.Row([ft.Container(expand=True, content=departure_search),
+                        ft.Container(expand=True, content=arrival_search)],
+                       spacing=6, vertical_alignment=ft.CrossAxisAlignment.START),
+                ft.Row(gate_fields, spacing=6),
+                plan_heading("Operator and Aircraft"),
+                ft.Row([
+                    ft.Column([airline_search, aircraft_search, style_plan_field(home_flight_number_tf)],
+                              expand=True, spacing=plan_spacing, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                    aircraft_image_host,
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                plan_heading("Cruise and Timing"),
+                ft.Row([
+                    plan_field("Cruising speed", "cruise_speed", suffix="kt", numeric=True),
+                    plan_field("Cruising altitude", "cruise_altitude", suffix="ft", numeric=True),
+                    flight_time,
+                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.START),
+                plan_heading("Supplementary Information"),
+                ft.Row([
+                    plan_field("Seat capacity", "seat_capacity", hint=str(cabin_capacity) if cabin_capacity else None,
+                               numeric=True, expand=3),
+                    plan_field("Persons on board", "persons_on_board", numeric=True, expand=3),
+                    plan_field("Aircraft color and markings", "aircraft_markings", expand=5),
+                ], spacing=6),
+                ft.Row([pilot, remarks, ft.IconButton(ft.Icons.OPEN_IN_FULL, tooltip="Expand remarks",
+                                                      width=36, height=34, on_click=open_remarks)],
+                       spacing=6, vertical_alignment=ft.CrossAxisAlignment.START),
+            ],
+        )
+        plan_card = glass_card(
+            "Flight Plan",
+            ft.Stack(
+                expand=True, fit=ft.StackFit.EXPAND,
+                controls=[plan_form, *dropdown_rows.values()],
+            ),
+        )
+        plan_card.padding = 10
+        plan_card.content.controls[0].size = 17
+        plan_card.content.spacing = plan_spacing
+
+        def resize_flight_plan(e):
+            height = fitting_field_height(e.height)
+            if height == plan_fields[0].height:
+                return
+            for field in plan_fields:
+                size_plan_field(field, height)
+            position_dropdowns(height)
+            image_height = 3 * height + 2 * plan_spacing
+            aircraft_image_host.height = image_height
+            if dashboard_aircraft is not None:
+                dashboard_aircraft.height = image_height
+            safe_update_control(plan_card)
+
+        page.on_resize = resize_flight_plan
+
+        backdrop = airline_background(state.airline, AIRLINE_ACCENT)
+        date_surface = blend_hex_colors(backdrop.colors[0], tokens["bg"], SURFACE_OPACITY) if backdrop else tokens["bg"]
+        date_ink = max(("#111318", "#FFFFFF"), key=lambda color: contrast_ratio(color, date_surface))
+        for date_control in (dashboard_weekday_text, dashboard_date_text, dashboard_year_text):
+            date_control.color = date_ink
+            date_control.style = ft.TextStyle(
+                shadow=[
+                    ft.BoxShadow(color=ft.Colors.with_opacity(0.28, ft.Colors.BLACK),
+                                 offset=ft.Offset(-0.7, -0.7), blur_radius=0.7),
+                    ft.BoxShadow(color=ft.Colors.with_opacity(0.5, ft.Colors.WHITE),
+                                 offset=ft.Offset(0.9, 1.1), blur_radius=0.9),
+                ],
+            )
+        date_display = ft.Row(
+            [dashboard_weekday_text, dashboard_date_text, dashboard_year_text],
+            alignment=ft.MainAxisAlignment.CENTER, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=10,
+        )
+        flight_actions = ft.Row(
+            alignment=ft.MainAxisAlignment.END, vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=GAP,
+            controls=[
+                ft.FilledButton(
+                    "Pause", icon=ft.Icons.PAUSE_ROUNDED, width=108, height=40,
+                    tooltip="Save this flight to resume after the next login",
+                    style=ft.ButtonStyle(
+                        bgcolor=LIGHT["accent"], color=ft.Colors.WHITE,
+                        shape=ft.RoundedRectangleBorder(radius=10),
+                    ),
+                    on_click=save_current_flight_hibernation,
+                ),
+                ft.FilledButton(
+                    "End Flight", icon=ft.Icons.FLAG_ROUNDED, width=158, height=48,
+                    style=ft.ButtonStyle(
+                        bgcolor="#B3261E", color=ft.Colors.WHITE,
+                        shape=ft.RoundedRectangleBorder(radius=10),
+                        text_style=ft.TextStyle(size=14, weight=ft.FontWeight.W_700),
+                    ),
+                    on_click=show_flight_end_summary,
+                ),
+            ],
+        )
+        plan_host = ft.Container(
+            expand=True, content=plan_card,
+        )
+
+        map_path = asset_abs_path_if_exists("airport-map.html")
+        map_params = {"theme": "dark" if page.theme_mode == ft.ThemeMode.DARK else "light"}
+        departure_icao = dashboard_departure_icao()
+        if departure_icao:
+            map_params["icao"] = departure_icao
+        map_url = f"{map_path.as_uri()}#{urllib.parse.urlencode(map_params)}" if map_path else ""
+        embedded = os.name == "nt" and bool(map_url) and not dashboard_airport_unavailable
+        if embedded:
+            page.run_task(show_dashboard_airport_map, map_url)
+        airport_card = glass_card(
+            "Airport Map",
+            ft.Container(
+                expand=True, alignment=ft.Alignment(0, 0),
+                content=ft.Text("Loading airport map…", color=tokens["muted"]) if embedded else (
+                    ft.OutlinedButton("Open airport map", on_click=lambda e: page.launch_url(map_url))
+                    if map_url else ft.Text("Airport map unavailable.", color=tokens["muted"])
+                ),
+            ),
+        )
 
         return build_tab_page(
             "HOME",
+            ft.Container(
+                expand=True, padding=GAP,
+                content=ft.Column(
+                    expand=True, spacing=GAP, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    controls=[
+                        ft.Container(height=DASHBOARD_DATE_HEIGHT, content=date_display),
+                        ft.Row(
+                            [plan_host, ft.Container(expand=True, content=airport_card)],
+                            expand=True, spacing=GAP,
+                            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                        ),
+                        ft.Container(height=DASHBOARD_ACTIONS_HEIGHT, content=flight_actions),
+                    ],
+                ),
+            ),
+        )
+
+
+    def set_clock_source(phase: str, source: str):
+        is_departure = phase == "departure"
+        source = source if source in ("route", "device", "simulation") else "route"
+        if is_departure:
+            state.takeoff_clock_source = source
+            state.takeoff_clock_menu_open = False
+        else:
+            state.landing_clock_source = source
+            state.landing_clock_menu_open = False
+        save_settings_data()
+        refresh_header_texts()
+        refresh_active_page()
+
+    def build_phase_clock_content(phase: str) -> ft.Control:
+        is_departure = phase == "departure"
+        selected_source = getattr(state, "takeoff_clock_source" if is_departure else "landing_clock_source", "route")
+        analog_host = takeoff_analog_clock_host if is_departure else landing_analog_clock_host
+        date_text = takeoff_date_text if is_departure else landing_date_text
+        local_text = takeoff_route_time_text if is_departure else landing_route_time_text
+        utc_text = takeoff_time_text if is_departure else landing_time_text
+        source_text = takeoff_clock_source_text if is_departure else landing_clock_source_text
+
+        source_labels = [
+            ("route", "Route local"),
+            ("device", "My location"),
+            ("simulation", "Simulation"),
+        ]
+        clock = with_hover(ft.PopupMenuButton(
+            tooltip="Choose clock source",
+            padding=0,
+            bgcolor=surface_fill(tokens["panel"]),
+            content=ft.Column(
+                spacing=4,
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    analog_host,
+                    date_text,
+                    local_text,
+                    utc_text,
+                    ft.Row(
+                        tight=True,
+                        spacing=4,
+                        controls=[source_text, ft.Icon(ft.Icons.EXPAND_MORE, size=14, color=tokens["accent"])],
+                    ),
+                ],
+            ),
+            items=[
+                ft.PopupMenuItem(
+                    content=label,
+                    checked=key == selected_source,
+                    height=38,
+                    on_click=lambda e, source=key: set_clock_source(phase, source),
+                )
+                for key, label in source_labels
+            ],
+        ))
+
+        def fit_clock(width, height):
+            diameter = max(64, min(240, int(width) - 4, int(height) - 89))
+            if analog_host.width != diameter:
+                analog_host.width = analog_host.height = diameter
+                moment, _ = phase_clock_moment(phase)
+                analog_host.content = build_analog_clock_face(moment, diameter)
+                safe_update_control(analog_host)
+
+        fit_clock((page.width or 1344) * 0.28, estimated_performance_top_height() - 53)
+        return ft.Container(
+            expand=True, alignment=ft.Alignment(0, 0),
+            on_size_change=lambda e: fit_clock(e.width, e.height),
+            content=clock,
+        )
+
+    def checklist_page():
+        section_by_key = {section["key"]: section for section in CHECKLIST_SECTIONS}
+        selected_key = str(getattr(state, "checklist_section", "turn_on_aircraft") or "turn_on_aircraft")
+        if selected_key not in section_by_key:
+            selected_key = CHECKLIST_SECTIONS[0]["key"]
+            state.checklist_section = selected_key
+        selected_section = section_by_key[selected_key]
+        completed_indices = {
+            int(index)
+            for index in getattr(state, "checklist_completed", {}).get(selected_key, [])
+            if isinstance(index, int) or str(index).isdigit()
+        }
+
+        def section_progress(section: dict) -> tuple[int, int]:
+            indices = {
+                int(index)
+                for index in getattr(state, "checklist_completed", {}).get(section["key"], [])
+                if isinstance(index, int) or str(index).isdigit()
+            }
+            total = len(section["items"])
+            return len([index for index in indices if 0 <= index < total]), total
+
+        def choose_section(section_key: str):
+            state.checklist_section = section_key
+            refresh_active_page()
+
+        def set_item_complete(item_index: int, is_complete: bool):
+            current = {
+                int(index)
+                for index in getattr(state, "checklist_completed", {}).get(selected_key, [])
+                if isinstance(index, int) or str(index).isdigit()
+            }
+            if is_complete:
+                current.add(item_index)
+            else:
+                current.discard(item_index)
+            state.checklist_completed[selected_key] = sorted(current)
+            refresh_active_page()
+
+        def set_all_complete(is_complete: bool):
+            state.checklist_completed[selected_key] = list(range(len(selected_section["items"]))) if is_complete else []
+            refresh_active_page()
+
+        def move_section(delta: int):
+            current_index = next((index for index, section in enumerate(CHECKLIST_SECTIONS) if section["key"] == selected_key), 0)
+            next_index = max(0, min(len(CHECKLIST_SECTIONS) - 1, current_index + delta))
+            choose_section(CHECKLIST_SECTIONS[next_index]["key"])
+
+        section_buttons: List[ft.Control] = []
+        for section in CHECKLIST_SECTIONS:
+            done, total = section_progress(section)
+            is_selected = section["key"] == selected_key
+            is_complete = total > 0 and done == total
+            button_color = ft.Colors.GREEN_700 if is_complete else (tokens["accent"] if is_selected else tokens["subpanel"])
+            text_color = ft.Colors.WHITE if is_complete or is_selected else tokens["text"]
+            section_buttons.append(
+                ft.ElevatedButton(
+                    f"{section['title']}  {done}/{total}",
+                    icon=ft.Icons.CHECK_CIRCLE_ROUNDED if is_complete else ft.Icons.CHECKLIST_ROUNDED,
+                    height=44,
+                    bgcolor=button_color,
+                    color=text_color,
+                    on_click=lambda e, key=section["key"]: choose_section(key),
+                )
+            )
+
+        checklist_rows: List[ft.Control] = []
+        for item_index, (label, action) in enumerate(selected_section["items"]):
+            is_complete = item_index in completed_indices
+            checklist_rows.append(
+                ft.Container(
+                    height=64,
+                    padding=ft.padding.symmetric(horizontal=16, vertical=8),
+                    border_radius=14,
+                    bgcolor=tokens["pressed"] if is_complete else tokens["subpanel"],
+                    border=ft.border.all(1, ft.Colors.with_opacity(0.45 if is_complete else 1.0, tokens["accent"] if is_complete else tokens["card_border"])),
+                    shadow=surface_shadow(0.24, pressed=is_complete),
+                    content=ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[
+                            ft.Row(
+                                expand=True,
+                                spacing=12,
+                                controls=[
+                                    ft.Checkbox(
+                                        value=is_complete,
+                                        active_color=tokens["accent"],
+                                        on_change=lambda e, index=item_index: set_item_complete(index, bool(e.control.value)),
+                                    ),
+                                    ft.Text(label, size=14, weight=ft.FontWeight.W_700, color=tokens["text"]),
+                                ],
+                            ),
+                            ft.Text(
+                                action,
+                                size=13,
+                                weight=ft.FontWeight.W_800,
+                                color=ft.Colors.GREEN_400 if is_complete else tokens["accent"],
+                                text_align=ft.TextAlign.RIGHT,
+                            ),
+                        ],
+                    ),
+                )
+            )
+
+        completed_count = len(completed_indices)
+        total_count = len(selected_section["items"])
+        checklist_card = glass_card(
+            selected_section["title"],
+            ft.Column(
+                expand=True,
+                spacing=12,
+                controls=[
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        controls=[
+                            ft.Text(f"{completed_count} of {total_count} items complete", size=12, color=tokens["muted"]),
+                            ft.ProgressBar(
+                                width=300,
+                                value=(completed_count / total_count) if total_count else 0,
+                                color=ft.Colors.GREEN_400 if completed_count == total_count else tokens["accent"],
+                                bgcolor=tokens["pressed"],
+                            ),
+                        ],
+                    ),
+                    ft.Container(
+                        expand=True,
+                        content=ft.ListView(expand=True, spacing=10, controls=checklist_rows),
+                    ),
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        controls=[
+                            ft.OutlinedButton(
+                                "Back",
+                                icon=ft.Icons.CHEVRON_LEFT,
+                                disabled=selected_key == CHECKLIST_SECTIONS[0]["key"],
+                                on_click=lambda e: move_section(-1),
+                            ),
+                            ft.Row(
+                                spacing=10,
+                                controls=[
+                                    ft.OutlinedButton("Reset section", icon=ft.Icons.RESTART_ALT_ROUNDED, on_click=lambda e: set_all_complete(False)),
+                                    ft.ElevatedButton("Check all", icon=ft.Icons.DONE_ALL_ROUNDED, bgcolor=tokens["primary"], color=tokens["on_primary"], on_click=lambda e: set_all_complete(True)),
+                                    ft.OutlinedButton(
+                                        "Next",
+                                        icon=ft.Icons.CHEVRON_RIGHT,
+                                        disabled=selected_key == CHECKLIST_SECTIONS[-1]["key"],
+                                        on_click=lambda e: move_section(1),
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            expand=True,
+        )
+
+        return build_tab_page(
+            "CHECKLIST",
             ft.Container(
                 expand=True,
                 padding=18,
                 content=ft.Column(
                     expand=True,
-                    scroll=ft.ScrollMode.AUTO,
                     spacing=16,
                     controls=[
-                        ft.Row(
-                            spacing=14,
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                            controls=[
-                                ft.Column(width=520, spacing=14, controls=[ft.Container(width=520, height=375, content=greeting_card), ft.Container(width=520, content=next_flight_card)]),
-                                ft.Column(width=520, spacing=14, controls=[ft.Container(width=520, height=airline_info_height, content=airline_info_card), ft.Container(width=520, height=440, content=home_ramp_status_card())]),
-                                ft.Column(width=700, spacing=14, controls=[ft.Container(width=700, height=aircraft_info_height, content=secondary_info_card)]),
-                            ],
-                        ),
+                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=section_buttons),
+                        ft.Container(expand=True, content=checklist_card),
                     ],
                 ),
             ),
@@ -13357,109 +13001,311 @@ def main(page: ft.Page):
         )
 
 
+    PERFORMANCE_TOP_WIDTHS = (44, 26, 30)
+    PERFORMANCE_METRIC_SIZE = 27
 
-    def premium_summary_chip(label: str, value: str, width: int = 160) -> ft.Control:
+    def estimated_performance_top_height():
+        return round(((page.height or 821) - SHELL_HEIGHT - 4 * GAP - 28) * 3 / 5)
+
+    def aligned_planning_row(*panels, widths, expand=None):
+        return ft.Row(
+            expand=expand, spacing=GAP,
+            vertical_alignment=ft.CrossAxisAlignment.STRETCH if expand else ft.CrossAxisAlignment.START,
+            controls=[ft.Container(expand=width, content=panel) for panel, width in zip(panels, widths)],
+        )
+
+    def performance_page(top_row, results_row, professional_panels):
+        def route_airport(code):
+            canonical = normalize_airport_code(code)
+            airport = lookup_airport_record(canonical) or {}
+            return airport.get("iata") or canonical or "—"
+
+        route = f"{route_airport(state.departure)} - {route_airport(state.arrival)}" if state.departure or state.arrival else ""
+        summary = "  ·  ".join(part for part in (
+            state.airline, current_aircraft_label() if state.aircraft else "", state.flight_number, route,
+        ) if part)
+
+        def open_professional_details(e):
+            show_alert(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Professional details"),
+                content=ft.Column(
+                    professional_panels, width=min(850, (page.width or 984) - 100),
+                    height=min(590, (page.height or 681) - 180),
+                    spacing=GAP, scroll=ft.ScrollMode.AUTO,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                ),
+                actions=[ft.TextButton("Done", on_click=lambda e: page.pop_dialog())],
+            ))
+
         return ft.Container(
-            width=width,
-            padding=ft.padding.symmetric(horizontal=12, vertical=10),
-            border_radius=16,
-            bgcolor=ft.Colors.with_opacity(0.34, tokens["subpanel"]),
-            border=ft.border.all(1, ft.Colors.with_opacity(0.28, ft.Colors.WHITE)),
+            expand=True, padding=GAP,
             content=ft.Column(
-                tight=True,
-                spacing=4,
+                spacing=GAP, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 controls=[
-                    ft.Text(label, size=11, color=tokens["muted"]),
-                    ft.Text(value or "—", size=14, weight=ft.FontWeight.W_700, color=tokens["text"]),
+                    ft.Container(
+                        height=28, padding=ft.Padding.symmetric(horizontal=4),
+                        content=ft.Row([
+                            ft.Text(
+                                summary, expand=True, size=20, weight=ft.FontWeight.W_700,
+                                color=tokens["text"], no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
+                                tooltip=summary or None,
+                            ),
+                            *([ft.OutlinedButton(
+                                "Professional details", height=28, on_click=open_professional_details,
+                            )] if professional_panels else []),
+                        ]),
+                    ),
+                    top_row,
+                    results_row,
                 ],
             ),
         )
 
-    def apply_airport_weather_glass_style(controls: List[ft.Control]):
-        glass_fill = ft.Colors.with_opacity(0.30, tokens["input_bg"])
-        glass_border = ft.Colors.with_opacity(0.34, ft.Colors.WHITE)
-        for ctrl in controls:
-            try:
-                ctrl.filled = True
-            except Exception:
-                pass
-            try:
-                ctrl.bgcolor = glass_fill
-            except Exception:
-                pass
-            try:
-                ctrl.fill_color = glass_fill
-            except Exception:
-                pass
-            try:
-                ctrl.border_color = glass_border
-            except Exception:
-                pass
-            try:
-                ctrl.focused_border_color = ft.Colors.with_opacity(0.78, tokens["accent"])
-            except Exception:
-                pass
-            try:
-                ctrl.color = tokens["text"]
-            except Exception:
-                pass
-            try:
-                ctrl.label_style = ft.TextStyle(color=tokens["muted"])
-            except Exception:
-                pass
-            try:
-                ctrl.hint_style = ft.TextStyle(color=tokens["muted"])
-            except Exception:
-                pass
+    def compact_performance_input(field, height=40):
+        field.height = height
+        field.text_size = 13
+        field.label_style = ft.TextStyle(size=12, color=tokens["muted"])
+        field.content_padding = ft.Padding.symmetric(horizontal=8, vertical=7)
+        return field
 
+    flag_catalog_file = asset_abs_path_if_exists("flags/country.json")
+    flag_catalog = json.loads(flag_catalog_file.read_text(encoding="utf-8")) if flag_catalog_file else []
+    flag_codes = {entry["name"].casefold(): entry["code"] for entry in flag_catalog}
+    flag_names = {entry["code"]: entry["name"] for entry in flag_catalog}
+    region_catalog_file = asset_abs_path_if_exists("airport_regions.json")
+    airport_regions = json.loads(region_catalog_file.read_text(encoding="utf-8")) if region_catalog_file else {}
+
+    def performance_airport_weather(role, raw_metar, status, fetch_weather):
+        airport_code = normalize_airport_code(getattr(state, role)) or ""
+        record = lookup_airport_record(airport_code) or {}
+        airport_name = record.get("name") or (
+            "Airport name unavailable" if airport_code else "Select an airport on Dashboard"
+        )
+        region_code = record.get("region_code") or (record.get("source_record") or {}).get("iso_region", "")
+        region_name = airport_regions.get(region_code, "")
+        queue_airport_media(airport_code)
+        observation = airport_weather_cache.get(airport_code, {}).get("report") or {}
+        _, condition = metar_condition(observation)
+        temperature = observation.get("temp")
+        temperature_label = f"{temperature:.0f}°C" if isinstance(temperature, (int, float)) else "—"
+        direction = observation.get("wdir")
+        direction_label = f"{direction:03.0f}°" if isinstance(direction, (int, float)) else "—"
+        if direction == "VRB":
+            direction_label = "VRB"
+        wind_speed = observation.get("wspd")
+        wind_gust = observation.get("wgst")
+        wind_label = f"{direction_label}  ·  {wind_speed:.0f} kt" if isinstance(wind_speed, (int, float)) else "Wind unavailable"
+        weather_icons = {
+            "Clear": ft.Icons.WB_SUNNY,
+            "Partly cloudy": ft.Icons.FILTER_DRAMA,
+            "Cloudy": ft.Icons.CLOUD,
+            "Overcast": ft.Icons.CLOUD,
+            "Rain": ft.Icons.WATER_DROP,
+            "Drizzle": ft.Icons.WATER_DROP,
+            "Fog": ft.Icons.FOGGY,
+            "Mist": ft.Icons.FOGGY,
+            "Haze": ft.Icons.FOGGY,
+            "Thunderstorms": ft.Icons.THUNDERSTORM,
+            "Snow": ft.Icons.AC_UNIT,
+            "Freezing precipitation": ft.Icons.AC_UNIT,
+        }
+        windy = isinstance(wind_speed, (int, float)) and wind_speed >= 19
+        if windy and condition in ("Clear", "Partly cloudy", "Cloudy", "Overcast", "Weather unavailable"):
+            condition = "Windy"
+        weather_icon = ft.Icons.AIR if condition == "Windy" else weather_icons.get(condition, ft.Icons.DEVICE_THERMOSTAT)
+
+        country = (record.get("country") or "").strip().casefold()
+        country_code = flag_codes.get(country, country)
+        flag_path = asset_rel_path_if_exists(f"flags/{country_code}.svg") if re.fullmatch(r"[a-z]{2}", country_code) else None
+        latitude, longitude = record.get("lat"), record.get("lon")
+        coordinates = ""
+        if isinstance(latitude, (int, float)) and isinstance(longitude, (int, float)):
+            coordinates = f"{abs(latitude):.3f}°{'N' if latitude >= 0 else 'S'}  ·  {abs(longitude):.3f}°{'E' if longitude >= 0 else 'W'}"
+
+        airport_code_text = ft.Text(
+            airport_code or "—", weight=ft.FontWeight.W_800, color=tokens["text"],
+            no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS, style=ft.TextStyle(height=1.0),
+        )
+        airport_name_text = ft.Text(
+            airport_name, weight=ft.FontWeight.W_500, color=tokens["text"],
+            max_lines=2, overflow=ft.TextOverflow.ELLIPSIS, tooltip=airport_name,
+            style=ft.TextStyle(height=1.15),
+        )
+        airport_tile = glass_card(
+            "Airport",
+            ft.Column(
+                expand=True, spacing=6,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                controls=[
+                    ft.Column(
+                        [
+                            airport_code_text, airport_name_text,
+                            *([ft.Text(region_name, size=13, color=tokens["muted"], no_wrap=True,
+                                       overflow=ft.TextOverflow.ELLIPSIS, tooltip=region_name,
+                                       style=ft.TextStyle(height=1.1))] if region_name else []),
+                        ],
+                        expand=True, spacing=4,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                    *([ft.Row([
+                        ft.Icon(ft.Icons.LOCATION_ON_OUTLINED, size=15, color=tokens["accent"]),
+                        ft.Text(coordinates, size=12, color=tokens["muted"], no_wrap=True),
+                    ], spacing=6)] if coordinates else []),
+                ],
+            ),
+            expand=True,
+        )
+        if flag_path:
+            flag = ft.Image(
+                src=flag_path, width=27, height=20, fit=ft.BoxFit.CONTAIN,
+                semantics_label=f"{flag_names.get(country_code, country_code.upper())} flag",
+            )
+            airport_tile.content.controls[0] = ft.Row(
+                [airport_tile.content.controls[0], ft.Container(
+                    content=flag, border_radius=3, clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                    tooltip=flag.semantics_label,
+                )],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            )
+
+        temperature_text = ft.Text(
+            temperature_label, weight=ft.FontWeight.W_800, color=tokens["text"], no_wrap=True,
+        )
+        condition_icon = ft.Icon(weather_icon, color=tokens["accent"], tooltip=condition)
+        gust = isinstance(wind_gust, (int, float)) and wind_gust > 0
+        pressure = observation.get("altim")
+        dew_point = observation.get("dewp")
+        details = []
+        if isinstance(pressure, (int, float)):
+            pressure_hpa = pressure * 33.8639 if pressure < 100 else pressure
+            details.append(f"QNH {pressure_hpa:.0f} hPa")
+        if isinstance(dew_point, (int, float)):
+            details.append(f"Dew {dew_point:.0f}°C")
+
+        weather_tile = glass_card(
+            "Weather",
+            ft.Column(
+                expand=True, spacing=6,
+                controls=[
+                    ft.Column(
+                        [
+                            ft.Row([temperature_text, condition_icon], spacing=8),
+                            ft.Text(condition, size=16, weight=ft.FontWeight.W_500, color=tokens["text"]),
+                        ],
+                        expand=True, spacing=2, alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.AIR, size=16, color=tokens["accent"]),
+                            ft.Text(wind_label, size=14, color=tokens["text"], no_wrap=True),
+                            *([ft.Text(f"Gust {wind_gust:.0f} kt", size=12, weight=ft.FontWeight.W_600,
+                                       color=tokens["text"], no_wrap=True)] if gust else []),
+                        ],
+                        spacing=6,
+                    ),
+                    *([ft.Text("  ·  ".join(details), size=12, color=tokens["muted"], no_wrap=True)]
+                      if details else []),
+                ],
+            ),
+            expand=True,
+        )
+        observed_at = re.search(r"\b\d{2}(\d{2})(\d{2})Z\b", observation.get("rawOb") or "")
+        if observed_at:
+            weather_tile.content.controls[0] = ft.Row(
+                [
+                    weather_tile.content.controls[0],
+                    ft.Text(f"{observed_at[1]}:{observed_at[2]}Z", size=11, color=tokens["muted"],
+                            tooltip="METAR observation time in UTC"),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            )
+
+        raw = (raw_metar.value or "").strip()
+        report_station = re.search(r"\b([A-Z0-9]{4})\s+\d{6}Z\b", raw)
+        report = raw if report_station and report_station[1] == airport_code else ""
+        pending = role in performance_metar_requests
+        if report:
+            metar_content = ft.Column(
+                expand=True, scroll=ft.ScrollMode.AUTO,
+                controls=[ft.Text(report, selectable=True, size=14, color=tokens["text"])],
+            )
+        else:
+            fetch_style = button_style(tokens, primary=True)
+            accent = tokens["accent"]
+            fetch_style.bgcolor = {
+                ft.ControlState.DEFAULT: accent,
+                ft.ControlState.HOVERED: blend_hex_colors(accent, tokens["text"], 0.12),
+                ft.ControlState.PRESSED: blend_hex_colors(accent, tokens["text"], 0.20),
+                ft.ControlState.DISABLED: blend_hex_colors(accent, tokens["panel"], 0.16),
+            }
+            fetch_style.color = LIGHT["text"] if page.theme_mode == ft.ThemeMode.DARK else ft.Colors.WHITE
+            metar_content = ft.Container(
+                expand=True, alignment=ft.Alignment(0, 0),
+                content=ft.FilledButton(
+                    "Fetching METAR…" if pending else "Fetch METAR",
+                    icon=ft.Icons.DOWNLOAD_OUTLINED, on_click=fetch_weather,
+                    disabled=pending or not re.fullmatch(r"[A-Z0-9]{4}", airport_code),
+                    style=fetch_style,
+                ),
+            )
+
+        metar_tile = glass_card("METAR", metar_content, expand=True)
+        metar_tile.padding = 10
+        metar_tile.content.spacing = 5
+        if report:
+            metar_tile.content.controls[0] = ft.Row(
+                [metar_tile.content.controls[0], ft.IconButton(
+                    ft.Icons.REFRESH, tooltip="Refresh METAR", on_click=fetch_weather, disabled=pending,
+                    width=30, height=30, padding=0, icon_size=18,
+                )],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            )
+        message = "Refreshing METAR…" if report and pending else status.value
+        if message:
+            metar_tile.content.controls.append(ft.Text(message, size=12, color=tokens["muted"]))
+
+        def airport_weather_height(width, height):
+            # Keep the tiles square when space permits and reserve room for METAR on wide screens.
+            return min(round((width - GAP) / 2), round(height) - GAP - 82)
+
+        def size_airport_weather_text(width, height):
+            tile_width = (width - GAP) / 2
+            size_cap = max(42, round((height - 110) * 0.5))
+            airport_code_text.size = min(64, size_cap, max(39, round(tile_width * 0.22)))
+            airport_name_text.size = min(23, max(16, round(tile_width * 0.065)))
+            temperature_text.size = min(68, size_cap, max(42, round(tile_width * 0.23)))
+            condition_icon.size = min(40, max(27, round(tile_width * 0.14)))
+
+        width_share = PERFORMANCE_TOP_WIDTHS[0] / sum(PERFORMANCE_TOP_WIDTHS)
+        estimated_width = ((page.width or 1344) - 4 * GAP) * width_share
+        initial_height = airport_weather_height(estimated_width, estimated_performance_top_height())
+        size_airport_weather_text(estimated_width, initial_height)
+        airport_weather_row = ft.Container(
+            height=initial_height,
+            content=ft.Row(
+                [airport_tile, weather_tile], spacing=GAP,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            ),
+        )
+
+        def fit_airport_weather(e):
+            airport_weather_row.height = airport_weather_height(e.width, e.height)
+            size_airport_weather_text(e.width, airport_weather_row.height)
+            safe_update_control(airport_weather_row)
+
+        return ft.Container(
+            on_size_change=fit_airport_weather,
+            content=ft.Column(
+                [airport_weather_row, metar_tile], spacing=GAP,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            ),
+        )
 
     def takeoff_view():
         professional_info = bool(getattr(state, "professional_info_enabled", False))
-        apply_airport_weather_glass_style([
-            takeoff_departure_icao_tf,
-            takeoff_gate_tf,
-            takeoff_terminal_tf,
-            takeoff_elevation_tf,
-            takeoff_oat_tf,
-            takeoff_qnh_tf,
-            takeoff_wind_dir_tf,
-            takeoff_wind_speed_tf,
-            takeoff_wind_gust_tf,
-            takeoff_raw_metar_tf,
-        ])
-        takeoff_airport_code_for_background = (takeoff_departure_icao_tf.value or state.departure or "").strip().upper()
-        airport_weather_card = airport_background_glass_card(
-            "Airport and Weather",
-            ft.Column(
-                spacing=14,
-                controls=[
-                    ft.Row(
-                        wrap=True,
-                        spacing=12,
-                        run_spacing=12,
-                        controls=[
-                            premium_summary_chip("Airline", current_airline_label(), width=160),
-                            premium_summary_chip("Aircraft", current_aircraft_label(), width=170),
-                            premium_summary_chip("Departure", (takeoff_departure_icao_tf.value or state.departure or '—').strip().upper() or '—', width=140),
-                        ],
-                    ),
-                    ft.Row(wrap=True, spacing=12, controls=[takeoff_departure_icao_tf, takeoff_gate_tf, takeoff_terminal_tf, takeoff_elevation_tf, takeoff_oat_tf, takeoff_qnh_tf]),
-                    ft.Row(wrap=True, spacing=12, controls=[takeoff_wind_dir_tf, takeoff_wind_speed_tf, takeoff_wind_gust_tf]),
-                    ft.Row(
-                        wrap=True,
-                        spacing=10,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.ElevatedButton("Fetch METAR", on_click=do_fetch_takeoff_metar, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                            takeoff_metar_status_text,
-                        ],
-                    ),
-                    takeoff_raw_metar_tf,
-                ],
-            ),
-            airport_code=takeoff_airport_code_for_background,
-            fallback_key="origin",
-            height=470,
+        airport_weather_card = performance_airport_weather(
+            "departure", takeoff_raw_metar_tf, takeoff_metar_status_text, do_fetch_takeoff_metar,
         )
 
         runway_config_card = glass_card(
@@ -13474,58 +13320,66 @@ def main(page: ft.Page):
             height=205,
         )
 
-        takeoff_alerts_card = glass_card(
-            "Warnings",
-            ft.Column(
-                spacing=8,
-                alignment=ft.MainAxisAlignment.CENTER,
-                controls=[takeoff_warning_host],
-            ),
-            height=170,
-        )
-
         live_clock_card = glass_card(
             "Local Clock",
-            ft.Column(
-                spacing=12,
-                alignment=ft.MainAxisAlignment.CENTER,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    takeoff_date_text,
-                    takeoff_time_text,
-                ],
-            ),
-            height=170,
+            build_phase_clock_content("departure"),
         )
 
-        weight_actions_card = glass_card(
-            "Weight and Actions",
-            ft.Column(
-                spacing=12,
+        takeoff_status_text.size = 11
+        takeoff_operations_card = build_operations_panel(
+            "departure", takeoff_warning_host, takeoff_mtow_value_text, takeoff_status_text,
+            [
+                compact_performance_input(takeoff_weight_tf, height=36),
+                ft.Row(
+                    wrap=True,
+                    spacing=8,
+                    controls=[
+                        ft.ElevatedButton("Compute", on_click=do_compute_takeoff, bgcolor=tokens["primary"], color=tokens["on_primary"]),
+                        ft.OutlinedButton("Reset", on_click=do_reset_takeoff),
+                        ft.OutlinedButton("Save", on_click=do_save_takeoff_log),
+                    ],
+                ),
+            ],
+        )
+
+        for metric in (
+            takeoff_vs_text, takeoff_v1_text, takeoff_vr_text, takeoff_v2_text, takeoff_block_fuel_text,
+            takeoff_climb_initial_text, takeoff_climb_enroute_text, takeoff_climb_high_text,
+        ):
+            metric.size = PERFORMANCE_METRIC_SIZE
+            metric.style = ft.TextStyle(height=1.05)
+
+        climb_performance_card = glass_card_with_background(
+            "Climb Performance",
+            ft.Row(
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.START,
                 controls=[
-                    takeoff_weight_tf,
-                    takeoff_mtow_value_text,
-                    ft.Divider(height=8, opacity=0.10),
-                    ft.Row(
-                        wrap=True,
-                        spacing=10,
-                        controls=[
-                            ft.ElevatedButton("Compute", on_click=do_compute_takeoff, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                            ft.OutlinedButton("Reset", on_click=do_reset_takeoff),
-                            ft.OutlinedButton("Save", on_click=do_save_takeoff_log),
-                        ],
+                    ft.Container(
+                        expand=2,
+                        content=ft.Column(
+                            spacing=5,
+                            controls=[takeoff_vs_text, takeoff_v1_text, takeoff_vr_text, takeoff_v2_text],
+                        ),
                     ),
-                    takeoff_status_text,
+                    ft.VerticalDivider(width=1, opacity=0.18),
+                    ft.Container(
+                        expand=3,
+                        content=ft.Column(
+                            spacing=5,
+                            controls=[takeoff_climb_initial_text, takeoff_climb_enroute_text, takeoff_climb_high_text],
+                        ),
+                    ),
                 ],
             ),
-            height=310,
-        )
-
-        speeds_card = glass_card_with_background(
-            "Performance Speeds",
-            ft.Column(spacing=12, controls=[takeoff_vs_text, takeoff_v1_text, takeoff_vr_text, takeoff_v2_text]),
-            height=300,
             bg_key="takeoff_performance_speeds",
+        )
+        climb_performance_card.content.controls[0] = ft.Row(
+            [
+                climb_performance_card.content.controls[0],
+                ft.Text("Climb rates (fpm)", size=12, color=tokens["muted"]),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         )
 
         distances_card = glass_card(
@@ -13550,194 +13404,98 @@ def main(page: ft.Page):
             height=300,
         )
 
-        takeoff_climb_card = glass_card(
-            "Climb Estimates",
-            ft.Column(spacing=12, controls=[takeoff_climb_initial_text, takeoff_climb_enroute_text, takeoff_climb_high_text]),
-            height=270,
-        )
 
+        fuel_overview = aligned_planning_row(
+            ft.Column(
+                [
+                    ft.Text("Planned fuel", size=13, weight=ft.FontWeight.W_700, color=tokens["muted"]),
+                    takeoff_block_fuel_text,
+                ],
+                spacing=2,
+            ),
+            ft.Column(
+                [
+                    aligned_planning_row(
+                        compact_performance_input(takeoff_route_distance_tf),
+                        compact_performance_input(takeoff_fuel_passengers_tf), widths=(1, 1),
+                    ),
+                    aligned_planning_row(
+                        compact_performance_input(takeoff_fuel_baggage_tf),
+                        compact_performance_input(takeoff_fuel_cargo_tf), widths=(1, 1),
+                    ),
+                ],
+                spacing=6,
+            ),
+            widths=(43, 57),
+        )
         fuel_card = glass_card(
             "Fuel Planning",
             ft.Column(
-                spacing=14,
+                expand=True, spacing=5,
                 controls=[
-                    ft.Row(
-                        wrap=True,
-                        spacing=18,
-                        run_spacing=18,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    fuel_overview,
+                    ft.Column(
+                        expand=True, scroll=ft.ScrollMode.AUTO, spacing=4,
                         controls=[
-                            ft.Container(
-                                width=560,
-                                content=ft.Column(
-                                    spacing=12,
-                                    controls=[
-                                        takeoff_fuel_aircraft_text,
-                                        takeoff_fuel_engine_text,
-                                        takeoff_fuel_assumptions_text,
-                                        ft.Text(
-                                            "Enter route distance, passengers, baggage, and cargo. Taxi fuel is fixed in the model.",
-                                            size=12,
-                                            color=tokens["muted"],
-                                        ),
-                                        ft.Row(
-                                            wrap=True,
-                                            spacing=12,
-                                            controls=[takeoff_route_distance_tf, takeoff_fuel_passengers_tf, takeoff_fuel_baggage_tf, takeoff_fuel_cargo_tf],
-                                        ),
-                                        ft.Row(
-                                            wrap=True,
-                                            spacing=10,
-                                            controls=[
-                                                ft.ElevatedButton("Compute Fuel", on_click=do_compute_fuel, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                                takeoff_fuel_status_text,
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ),
-                            ft.Container(
-                                width=360,
-                                content=ft.Column(
-                                    spacing=8,
-                                    controls=[
-                                        takeoff_trip_fuel_text,
-                                        takeoff_block_fuel_text,
-                                        takeoff_ete_text,
-                                        takeoff_burn_rate_text,
-                                        takeoff_fuel_breakdown_text,
-                                        takeoff_recommended_tow_text,
-                                    ],
-                                ),
-                            ),
+                            takeoff_trip_fuel_text,
+                            takeoff_ete_text,
+                            takeoff_fuel_status_text,
+                            takeoff_fuel_limits_text,
+                            takeoff_fuel_burn_text,
+                            takeoff_fuel_breakdown_text,
+                            takeoff_recommended_tow_text,
+                            takeoff_fuel_aircraft_text,
+                            takeoff_fuel_engine_text,
+                            takeoff_fuel_assumptions_text,
                         ],
                     ),
                 ],
             ),
         )
 
-        top_right_controls: List[ft.Control] = []
-        if professional_info:
-            top_right_controls.append(runway_config_card)
-        top_right_controls.append(
-            ft.Row(
-                wrap=True,
-                spacing=16,
-                run_spacing=16,
-                vertical_alignment=ft.CrossAxisAlignment.START,
-                controls=[
-                    ft.Container(width=330, content=takeoff_alerts_card),
-                    ft.Container(width=330, content=live_clock_card),
-                ],
-            )
+        fuel_card.content.controls[0] = ft.Row(
+            [
+                fuel_card.content.controls[0],
+                ft.ElevatedButton(
+                    "Compute Fuel", on_click=do_compute_fuel, height=30,
+                    bgcolor=tokens["primary"], color=tokens["on_primary"],
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         )
+        fuel_card.content.spacing = 6
 
-        top_right_stack = ft.Column(
-            spacing=16,
-            controls=top_right_controls,
-        )
-
-        takeoff_performance_controls: List[ft.Control] = [
-            ft.Container(width=280, content=weight_actions_card),
-            ft.Container(width=300, content=speeds_card),
-            ft.Container(width=260, content=takeoff_climb_card),
-        ]
-        if professional_info:
-            takeoff_performance_controls.extend(
-                [
-                    ft.Container(width=260, content=distances_card),
-                    ft.Container(width=260, content=atmosphere_card),
-                ]
-            )
-
-        performance_cards_row = ft.Row(
+        diagnostic_cards_row = ft.Row(
             wrap=True,
-            spacing=16,
-            run_spacing=16,
+            spacing=GAP,
+            run_spacing=GAP,
             vertical_alignment=ft.CrossAxisAlignment.START,
-            controls=takeoff_performance_controls,
+            controls=[
+                ft.Container(width=260, content=distances_card),
+                ft.Container(width=260, content=atmosphere_card),
+            ],
         )
 
-        return ft.Container(
-            expand=True,
-            padding=18,
-            content=ft.Column(
-                expand=True,
-                scroll=ft.ScrollMode.AUTO,
-                spacing=16,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                controls=[
-                    ft.Row(
-                        wrap=True,
-                        spacing=16,
-                        run_spacing=16,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
-                        controls=[
-                            ft.Container(width=760, content=airport_weather_card),
-                            ft.Container(width=760, content=top_right_stack),
-                        ],
-                    ),
-                    performance_cards_row,
-                    fuel_card,
-                ],
+        return performance_page(
+            aligned_planning_row(
+                airport_weather_card, takeoff_operations_card, live_clock_card, widths=PERFORMANCE_TOP_WIDTHS, expand=3,
             ),
+            aligned_planning_row(climb_performance_card, fuel_card, widths=(46, 54), expand=2),
+            [runway_config_card, diagnostic_cards_row] if professional_info else [],
         )
 
 
     def landing_view():
         professional_info = bool(getattr(state, "professional_info_enabled", False))
-        apply_airport_weather_glass_style([
-            landing_arrival_icao_tf,
-            landing_gate_tf,
-            landing_terminal_tf,
-            landing_elevation_tf,
-            landing_oat_tf,
-            landing_qnh_tf,
-            landing_wind_dir_tf,
-            landing_wind_speed_tf,
-            landing_wind_gust_tf,
-            landing_raw_metar_tf,
-        ])
-        landing_airport_code_for_background = (landing_arrival_icao_tf.value or state.arrival or "").strip().upper()
-        airport_weather_card = airport_background_glass_card(
-            "Airport and Weather",
-            ft.Column(
-                spacing=14,
-                controls=[
-                    ft.Row(
-                        wrap=True,
-                        spacing=12,
-                        run_spacing=12,
-                        controls=[
-                            premium_summary_chip("Airline", current_airline_label(), width=160),
-                            premium_summary_chip("Aircraft", current_aircraft_label(), width=170),
-                            premium_summary_chip("Arrival", (landing_arrival_icao_tf.value or state.arrival or '—').strip().upper() or '—', width=140),
-                        ],
-                    ),
-                    ft.Row(wrap=True, spacing=12, controls=[landing_arrival_icao_tf, landing_gate_tf, landing_terminal_tf, landing_elevation_tf, landing_oat_tf, landing_qnh_tf]),
-                    ft.Row(wrap=True, spacing=12, controls=[landing_wind_dir_tf, landing_wind_speed_tf, landing_wind_gust_tf]),
-                    ft.Row(
-                        wrap=True,
-                        spacing=10,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.ElevatedButton("Fetch METAR", on_click=do_fetch_landing_metar, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                            landing_metar_status_text,
-                        ],
-                    ),
-                    landing_raw_metar_tf,
-                ],
-            ),
-            airport_code=landing_airport_code_for_background,
-            fallback_key="destination",
-            height=470,
+        airport_weather_card = performance_airport_weather(
+            "arrival", landing_raw_metar_tf, landing_metar_status_text, do_fetch_landing_metar,
         )
 
         landing_aircraft_chip = ft.Container(
             width=230,
             padding=12,
             border_radius=16,
-            bgcolor=tokens["subpanel"],
+            bgcolor=surface_fill(tokens["subpanel"]),
             border=ft.border.all(1, tokens["card_border"]),
             content=ft.Column(
                 tight=True,
@@ -13762,54 +13520,40 @@ def main(page: ft.Page):
             height=280,
         )
 
-        landing_alerts_card = glass_card(
-            "Warnings",
-            ft.Column(
-                spacing=8,
-                alignment=ft.MainAxisAlignment.CENTER,
-                controls=[landing_warning_host],
-            ),
-            height=170,
-        )
-
         landing_local_clock_card = glass_card(
             "Local Clock",
-            ft.Column(
-                spacing=12,
-                alignment=ft.MainAxisAlignment.CENTER,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[landing_date_text, landing_time_text],
-            ),
-            height=170,
+            build_phase_clock_content("descent"),
         )
 
-        landing_weight_actions_card = glass_card(
-            "Weight and Actions",
-            ft.Column(
-                spacing=12,
-                controls=[
-                    landing_weight_tf,
-                    landing_mlw_value_text,
-                    ft.Divider(height=8, opacity=0.10),
-                    ft.Row(
-                        wrap=True,
-                        spacing=10,
-                        controls=[
-                            ft.ElevatedButton("Compute", on_click=do_compute_landing, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                            ft.OutlinedButton("Reset", on_click=do_reset_landing),
-                            ft.OutlinedButton("Save", on_click=do_save_landing_log),
-                        ],
-                    ),
-                    landing_status_text,
-                ],
-            ),
-            height=310,
+        landing_status_text.size = 11
+        landing_operations_card = build_operations_panel(
+            "descent", landing_warning_host, landing_mlw_value_text, landing_status_text,
+            [
+                compact_performance_input(landing_weight_tf, height=36),
+                ft.Row(
+                    wrap=True,
+                    spacing=8,
+                    controls=[
+                        ft.ElevatedButton("Compute", on_click=do_compute_landing, bgcolor=tokens["primary"], color=tokens["on_primary"]),
+                        ft.OutlinedButton("Reset", on_click=do_reset_landing),
+                        ft.OutlinedButton("Save", on_click=do_save_landing_log),
+                    ],
+                ),
+            ],
         )
+
+        for metric in (landing_vs_text, landing_vref_text, landing_vapp_text):
+            metric.size = PERFORMANCE_METRIC_SIZE
+            metric.style = ft.TextStyle(height=1.05)
+        landing_additive_text.color = tokens["muted"]
+        landing_vs_calc_result_text.size = 22
 
         landing_speeds_card = glass_card_with_background(
             "Approach Speeds",
-            ft.Column(spacing=12, controls=[landing_vs_text, landing_vref_text, landing_vapp_text, landing_weight_ratio_text]),
-            height=300,
+            ft.Column(
+                spacing=5,
+                controls=[landing_vs_text, landing_vref_text, landing_vapp_text, landing_additive_text, landing_weight_ratio_text],
+            ),
             bg_key="landing_performance_speeds",
         )
 
@@ -13851,221 +13595,92 @@ def main(page: ft.Page):
         landing_vs_calc_card = glass_card(
             "V/S Calculator",
             ft.Column(
-                spacing=12,
+                spacing=8,
                 controls=[
-                    ft.Row(wrap=True, spacing=12, controls=[landing_vs_calc_alt_tf, landing_vs_calc_ete_tf]),
-                    ft.Row(
-                        wrap=True,
-                        spacing=10,
-                        controls=[
-                            ft.ElevatedButton("Calc V/S", on_click=do_calc_landing_vs, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ],
+                    aligned_planning_row(
+                        compact_performance_input(landing_vs_calc_alt_tf),
+                        compact_performance_input(landing_vs_calc_ete_tf), widths=(1, 1),
                     ),
+                    ft.ElevatedButton("Calc V/S", on_click=do_calc_landing_vs,
+                                      bgcolor=tokens["primary"], color=tokens["on_primary"]),
                     landing_vs_calc_result_text,
                 ],
             ),
         )
 
-        top_right_controls: List[ft.Control] = []
-        if professional_info:
-            top_right_controls.append(runway_config_card)
-        top_right_controls.append(
-            ft.Row(
-                wrap=True,
-                spacing=16,
-                run_spacing=16,
-                vertical_alignment=ft.CrossAxisAlignment.START,
-                controls=[
-                    ft.Container(width=330, content=landing_alerts_card),
-                    ft.Container(width=330, content=landing_local_clock_card),
-                ],
-            )
-        )
-
-        top_right_stack = ft.Column(
-            spacing=16,
-            controls=top_right_controls,
-        )
-
-        landing_performance_controls: List[ft.Control] = [
-            ft.Container(width=280, content=landing_weight_actions_card),
-            ft.Container(width=300, content=landing_speeds_card),
-        ]
-        if professional_info:
-            landing_performance_controls.extend(
-                [
-                    ft.Container(width=260, content=landing_distance_card),
-                    ft.Container(width=260, content=landing_wind_card),
-                    ft.Container(width=260, content=landing_descent_card),
-                ]
-            )
-
-        performance_cards_row = ft.Row(
-            wrap=True,
-            spacing=16,
-            run_spacing=16,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-            controls=landing_performance_controls,
-        )
-
-        return ft.Container(
-            expand=True,
-            padding=18,
-            content=ft.Column(
-                expand=True,
-                scroll=ft.ScrollMode.AUTO,
-                spacing=16,
-                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                controls=[
-                    ft.Row(
-                        wrap=True,
-                        spacing=16,
-                        run_spacing=16,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
-                        controls=[
-                            ft.Container(width=760, content=airport_weather_card),
-                            ft.Container(width=760, content=top_right_stack),
-                        ],
-                    ),
-                    performance_cards_row,
-                    ft.Row(
-                        wrap=True,
-                        spacing=16,
-                        run_spacing=16,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
-                        controls=[
-                            ft.Container(width=600, content=landing_vs_calc_card),
-                        ],
-                    ),
-                ],
+        return performance_page(
+            aligned_planning_row(
+                airport_weather_card, landing_operations_card, landing_local_clock_card, widths=PERFORMANCE_TOP_WIDTHS, expand=3,
             ),
+            aligned_planning_row(landing_speeds_card, landing_vs_calc_card, widths=(1, 1), expand=2),
+            [
+                runway_config_card,
+                aligned_planning_row(landing_descent_card, landing_distance_card, landing_wind_card, widths=(1, 1, 1)),
+            ] if professional_info else [],
         )
 
 
     def baggage_view():
-        def baggage_input_panel():
-            return ft.Container(
-                width=390,
-                padding=18,
-                border_radius=22,
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=ft.Colors.TRANSPARENT if card_background_src("baggage") else tokens["panel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                image=ft.DecorationImage(src=card_background_src("baggage"), fit=ft.BoxFit.COVER, opacity=0.32) if card_background_src("baggage") else None,
-                content=ft.Column(
-                    spacing=14,
-                    controls=[
-                        ft.Text("Baggage", size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                        ft.Divider(height=8, opacity=0.12),
-                        ft.Text("Passenger baggage inputs", size=12, color=tokens["muted"]),
-                        bag_pax_tf,
-                        bag_carry_on_tf,
-                        bag_checked_kg_per_pax_tf,
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
+        bag_pax_tf.read_only = bool(seat_model.get("generated"))
+        bag_pax_tf.label = "Filled passengers" if bag_pax_tf.read_only else "Passenger count"
+
+        outline_style = button_style(tokens) if page.theme_mode == ft.ThemeMode.DARK else None
+
+        def section_title(title):
+            return ft.Text(title, size=14, weight=ft.FontWeight.W_600, color=tokens["text"])
+
+        return glass_card(
+            "Baggage",
+            ft.Column(
+                expand=True, scroll=ft.ScrollMode.AUTO, spacing=12,
+                controls=[
+                    ft.Text("Passenger baggage inputs", size=12, color=tokens["muted"]),
+                    bag_pax_tf,
+                    bag_carry_on_tf,
+                    bag_checked_kg_per_pax_tf,
+                    ft.Divider(height=8, opacity=0.12),
+                    section_title("Cargo"),
+                    ft.Text("Add extra cargo mass carried in the hold.", size=12, color=tokens["muted"]),
+                    cargo_weight_tf,
+                    ft.Container(
+                        padding=14, border_radius=16,
+                        bgcolor=surface_fill(tokens["subpanel"]),
+                        border=ft.border.all(1, tokens["card_border"]),
+                        content=ft.Column(
+                            tight=True, spacing=6,
                             controls=[
-                                ft.ElevatedButton("Calculate", on_click=do_baggage_calc, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                ft.OutlinedButton("Reset", on_click=reset_baggage_form),
+                                ft.Text("Cargo note", size=12, color=tokens["muted"]),
+                                ft.Text("This value is added to baggage weight to create total payload.", size=12, color=tokens["text"]),
                             ],
                         ),
-                        bag_status_text,
-                    ],
-                ),
-            )
-
-        def cargo_input_panel():
-            return ft.Container(
-                width=390,
-                padding=18,
-                border_radius=22,
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=ft.Colors.TRANSPARENT if card_background_src("cargo") else tokens["panel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                image=ft.DecorationImage(src=card_background_src("cargo"), fit=ft.BoxFit.COVER, opacity=0.32) if card_background_src("cargo") else None,
-                content=ft.Column(
-                    spacing=14,
-                    controls=[
-                        ft.Text("Cargo", size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                        ft.Divider(height=8, opacity=0.12),
-                        ft.Text("Add extra cargo mass carried in the hold.", size=12, color=tokens["muted"]),
-                        cargo_weight_tf,
-                        ft.Container(
-                            padding=14,
-                            border_radius=16,
-                            bgcolor=tokens["subpanel"],
-                            border=ft.border.all(1, tokens["card_border"]),
-                            content=ft.Column(
-                                spacing=6,
-                                controls=[
-                                    ft.Text("Cargo note", size=12, color=tokens["muted"]),
-                                    ft.Text("This value is added to baggage weight to create total payload.", size=12, color=tokens["text"]),
-                                ],
-                            ),
+                    ),
+                    ft.Row(wrap=True, spacing=10, controls=[
+                        ft.ElevatedButton("Calculate", on_click=do_baggage_calc,
+                                          bgcolor=tokens["primary"], color=tokens["on_primary"]),
+                        ft.OutlinedButton("Reset", on_click=reset_baggage_form, style=outline_style),
+                    ]),
+                    bag_status_text,
+                    ft.Divider(height=8, opacity=0.12),
+                    section_title("Calculated Weight"),
+                    bag_baggage_weight_summary_text,
+                    bag_cargo_weight_summary_text,
+                    bag_payload_weight_summary_text,
+                    ft.Container(
+                        padding=14, border_radius=16,
+                        bgcolor=surface_fill(tokens["subpanel"]),
+                        border=ft.border.all(1, tokens["card_border"]),
+                        content=ft.Column(
+                            spacing=6,
+                            controls=[
+                                ft.Text("Breakdown", size=12, color=tokens["muted"]),
+                                bag_carry_on_result_text,
+                                bag_checked_result_text,
+                            ],
                         ),
-                    ],
-                ),
-            )
-
-        def payload_result_panel():
-            return ft.Container(
-                width=440,
-                padding=18,
-                border_radius=22,
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                bgcolor=ft.Colors.TRANSPARENT if card_background_src("calculated_weight") else tokens["panel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                image=ft.DecorationImage(src=card_background_src("calculated_weight"), fit=ft.BoxFit.COVER, opacity=0.32) if card_background_src("calculated_weight") else None,
-                content=ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Text("Calculated Weight", size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
-                        ft.Divider(height=8, opacity=0.12),
-                        bag_baggage_weight_summary_text,
-                        bag_cargo_weight_summary_text,
-                        ft.Divider(height=8, opacity=0.12),
-                        bag_payload_weight_summary_text,
-                        ft.Container(
-                            padding=14,
-                            border_radius=16,
-                            bgcolor=tokens["subpanel"],
-                            border=ft.border.all(1, tokens["card_border"]),
-                            content=ft.Column(
-                                spacing=6,
-                                controls=[
-                                    ft.Text("Breakdown", size=12, color=tokens["muted"]),
-                                    bag_carry_on_result_text,
-                                    bag_checked_result_text,
-                                ],
-                            ),
-                        ),
-                    ],
-                ),
-            )
-
-        return ft.Container(
-            expand=True,
-            bgcolor=ft.Colors.TRANSPARENT,
-            padding=18,
-            content=ft.Column(
-                scroll=ft.ScrollMode.AUTO,
-                spacing=16,
-                controls=[
-                    ft.Row(
-                        wrap=True,
-                        spacing=16,
-                        run_spacing=16,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
-                        controls=[
-                            baggage_input_panel(),
-                            cargo_input_panel(),
-                            payload_result_panel(),
-                        ],
                     ),
                 ],
             ),
         )
-
 
 
     def active_maptiler_tile_url() -> tuple[str, str, str]:
@@ -14079,489 +13694,37 @@ def main(page: ft.Page):
                 style["label"],
             )
         return (
-            "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-            "© OpenStreetMap contributors, © CARTO",
-            "Fallback Dark",
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            "Tiles © Esri",
+            "Satellite",
         )
 
-
-    def map_view():
-        origin_icao = (state.departure or takeoff_departure_icao_tf.value or "").strip().upper()
-        destination_icao = (state.arrival or landing_arrival_icao_tf.value or "").strip().upper()
-        origin_icao = normalize_airport_code(origin_icao) or origin_icao
-        destination_icao = normalize_airport_code(destination_icao) or destination_icao
-        if origin_icao:
-            state.departure = origin_icao
-        if destination_icao:
-            state.arrival = destination_icao
-        origin_coord = resolve_airport_coordinates(origin_icao)
-        destination_coord = resolve_airport_coordinates(destination_icao)
-        route_nm = route_distance_nm(origin_icao, destination_icao)
-
-        def midpoint_coordinates(origin: tuple[float, float], destination: tuple[float, float]) -> tuple[float, float]:
-            return ((origin[0] + destination[0]) / 2.0, (origin[1] + destination[1]) / 2.0)
-
-        def default_route_zoom(distance_nm: Optional[float]) -> float:
-            if distance_nm is None:
-                return 2.5
-            if distance_nm < 200:
-                return 7.0
-            if distance_nm < 500:
-                return 6.0
-            if distance_nm < 1000:
-                return 5.0
-            if distance_nm < 2000:
-                return 4.2
-            if distance_nm < 3500:
-                return 3.7
-            if distance_nm < 5500:
-                return 3.1
-            return 2.5
-
-        def estimate_map_flight_time_hours(distance_nm_value: Optional[float]) -> Optional[float]:
-            if not distance_nm_value:
-                return None
-            fuel_plan = state.takeoff_last_result.get("fuel_plan", {}) if state.takeoff_last_result else {}
-            ete_from_plan = fuel_plan.get("ete_hours")
-            if isinstance(ete_from_plan, (int, float)) and ete_from_plan > 0:
-                return float(ete_from_plan)
-            try:
-                cruise_gs = float((takeoff_cruise_gs_tf.value or "").strip())
-            except Exception:
-                cruise_gs = 0.0
-            if cruise_gs <= 0:
-                cruise_gs = resolve_takeoff_fuel_config(takeoff_aircraft_dd.value or state.aircraft).cruise_gs_kt_default
-            return (distance_nm_value / cruise_gs) if cruise_gs > 0 else None
-
-        def build_airport_marker(label: str, icao: str, color: str) -> ft.Control:
-            marker_box_width = 170
-            marker_box_height = 64
-            dot_size = 18
-            pill_width = 78
-            pill_height = 30
-            center_x = marker_box_width / 2
-            center_y = marker_box_height / 2
-            pill_left = int(center_x + 12)
-            pill_top = int(center_y - (pill_height / 2))
-            dot_left = int(center_x - (dot_size / 2))
-            dot_top = int(center_y - (dot_size / 2))
-
-            return ft.Container(
-                width=marker_box_width,
-                height=marker_box_height,
-                tooltip=f"{label} {icao}",
-                bgcolor=ft.Colors.TRANSPARENT,
-                content=ft.Stack(
-                    width=marker_box_width,
-                    height=marker_box_height,
-                    controls=[
-                        ft.Container(
-                            left=dot_left,
-                            top=dot_top,
-                            width=dot_size,
-                            height=dot_size,
-                            border_radius=999,
-                            bgcolor=color,
-                            border=ft.border.all(3, ft.Colors.WHITE),
-                            shadow=ft.BoxShadow(
-                                blur_radius=10,
-                                spread_radius=0,
-                                color=ft.Colors.with_opacity(0.25, ft.Colors.BLACK),
-                                offset=ft.Offset(0, 3),
-                            ),
-                        ),
-                        ft.Container(
-                            left=pill_left,
-                            top=pill_top,
-                            width=pill_width,
-                            height=pill_height,
-                            alignment=ft.Alignment(0, 0),
-                            padding=ft.padding.symmetric(horizontal=10, vertical=5),
-                            border_radius=999,
-                            bgcolor=tokens["panel"],
-                            border=ft.border.all(1, tokens["card_border"]),
-                            content=ft.Text(
-                                icao,
-                                size=11,
-                                weight=ft.FontWeight.W_700,
-                                color=tokens["text"],
-                                text_align=ft.TextAlign.CENTER,
-                                no_wrap=True,
-                            ),
-                        ),
-                    ],
-                ),
-            )
-
-        flight_time_hours = estimate_map_flight_time_hours(route_nm)
-        flight_time_label = format_hours_to_hm(flight_time_hours) if flight_time_hours is not None else "Awaiting route"
-        route_label = f"{origin_icao or '—'} → {destination_icao or '—'}"
-        distance_label = f"{route_nm:.0f} NM" if route_nm is not None else "Awaiting airports"
-        camera_status = ft.Text(
-            f"Route overview: {route_label} • {distance_label} • Flight time {flight_time_label}",
-            color=tokens["muted"],
-        )
-
-        def mapcn_route_query() -> str:
-            params: Dict[str, object] = {
-                "route_ready": "1" if origin_coord and destination_coord else "0",
-                "airline": state.airline or "Airline not selected",
-                "aircraft": state.aircraft or takeoff_aircraft_dd.value or "Aircraft not selected",
-                "flight_time": flight_time_label if flight_time_label != "Awaiting route" else "",
-            }
-            if origin_coord and destination_coord:
-                origin_record = AIRPORT_LIBRARY.get(origin_icao, {})
-                destination_record = AIRPORT_LIBRARY.get(destination_icao, {})
-                params.update(
-                    {
-                        "dep_code": origin_icao,
-                        "dep_name": origin_record.get("name", origin_icao),
-                        "dep_lng": origin_coord[1],
-                        "dep_lat": origin_coord[0],
-                        "arr_code": destination_icao,
-                        "arr_name": destination_record.get("name", destination_icao),
-                        "arr_lng": destination_coord[1],
-                        "arr_lat": destination_coord[0],
-                    }
-                )
-            return urllib.parse.urlencode(params)
-
-        def mapcn_local_url() -> Optional[str]:
-            web_map_index = base_dir / "globe-gl-test-web" / "dist" / "index.html"
-            if not web_map_index.exists():
-                return None
-            query = mapcn_route_query()
-            base_url = web_map_index.as_uri()
-            return f"{base_url}#{query}" if query else base_url
-
-        def ensure_mapcn_webview():
-            url = mapcn_local_url()
-            if not url:
-                close_mapcn_webview()
-                return False
-
-            existing = getattr(state, "mapcn_webview_process", None)
-            if existing is not None:
-                try:
-                    if existing.poll() is None:
-                        if getattr(state, "mapcn_webview_url", None) == url:
-                            return True
-                        close_mapcn_webview()
-                except Exception:
-                    pass
-                setattr(state, "mapcn_webview_process", None)
-
-            if getattr(sys, "frozen", False):
-                command = [sys.executable, "--globe-webview", "--attach", "--url", url, "--parent-title", page.title]
-            else:
-                command = [
-                    sys.executable,
-                    str(Path(__file__).resolve()),
-                    "--globe-webview",
-                    "--attach",
-                    "--url",
-                    url,
-                    "--parent-title",
-                    page.title,
-                ]
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            try:
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(base_dir),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=creationflags,
-                )
-                setattr(state, "mapcn_webview_process", process)
-                setattr(state, "mapcn_webview_url", url)
-                return True
-            except Exception:
-                return False
-
-        ensure_mapcn_webview()
-
-        return ft.Container(
-            expand=True,
-            bgcolor="#020617",
-            alignment=ft.Alignment(0, 0),
-            content=ft.Stack(
-                expand=True,
-                controls=[
-                    ft.Container(expand=True, bgcolor="#020617"),
-                    ft.Container(
-                        expand=True,
-                        alignment=ft.Alignment(0, 0),
-                        content=ft.Column(
-                            tight=True,
-                            spacing=16,
-                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.ProgressRing(width=42, height=42, stroke_width=3, color=tokens["accent"]),
-                                ft.Text(
-                                    "Loading the map",
-                                    size=18,
-                                    weight=ft.FontWeight.W_800,
-                                    color=tokens["text"],
-                                ),
-                            ],
-                        ),
-                    ),
-                ],
-            ),
-        )
-
-        state.map_style = "dataviz-v4-dark"
-        tile_url, map_attribution, active_map_label = active_maptiler_tile_url()
-        map_layers = [
-            ftm.TileLayer(
-                url_template=tile_url,
-            ),
-            ftm.SimpleAttribution(
-                text=map_attribution,
-                on_click=lambda e: e.page.launch_url("https://carto.com/"),
-            ),
-        ]
-
-        map_note = None
-        initial_center = ftm.MapLatitudeLongitude(30.0, 20.0)
-        initial_zoom = 2.5
-        route_center = None
-
-        marker_layer_supported = all(hasattr(ftm, attr) for attr in ["MarkerLayer", "Marker", "MapLatitudeLongitude"])
-        polyline_layer_supported = hasattr(ftm, "PolylineLayer") and hasattr(ftm, "MapLatitudeLongitude")
-        polyline_marker_supported = hasattr(ftm, "PolylineMarker")
-        legacy_polyline_supported = hasattr(ftm, "Polyline")
-        dashed_pattern_supported = hasattr(ftm, "DashedStrokePattern")
-
-        if origin_coord and destination_coord:
-            mid_lat, mid_lon = midpoint_coordinates(origin_coord, destination_coord)
-            route_center = ftm.MapLatitudeLongitude(mid_lat, mid_lon)
-            initial_center = route_center
-            initial_zoom = default_route_zoom(route_nm)
-
-            if polyline_layer_supported:
-                route_coordinates = [
-                    ftm.MapLatitudeLongitude(origin_coord[0], origin_coord[1]),
-                    ftm.MapLatitudeLongitude(destination_coord[0], destination_coord[1]),
-                ]
-                if polyline_marker_supported:
-                    polyline_kwargs = {
-                        "coordinates": route_coordinates,
-                        "color": tokens["accent"],
-                        "stroke_width": 4,
-                    }
-                    if dashed_pattern_supported:
-                        polyline_kwargs["stroke_pattern"] = ftm.DashedStrokePattern(segments=[50, 20])
-                    map_layers.append(
-                        ftm.PolylineLayer(
-                            polylines=[
-                                ftm.PolylineMarker(**polyline_kwargs)
-                            ]
-                        )
-                    )
-                elif legacy_polyline_supported:
-                    legacy_polyline_kwargs = {
-                        "coordinates": route_coordinates,
-                        "stroke_width": 4,
-                        "color": tokens["accent"],
-                    }
-                    if dashed_pattern_supported:
-                        legacy_polyline_kwargs["stroke_pattern"] = ftm.DashedStrokePattern(segments=[50, 20])
-                    map_layers.append(
-                        ftm.PolylineLayer(
-                            polylines=[
-                                ftm.Polyline(**legacy_polyline_kwargs)
-                            ]
-                        )
-                    )
-                else:
-                    map_note = "This installed flet-map build can show the basemap, but not the route line overlay."
-            else:
-                map_note = "This installed flet-map build is missing the route overlay layers."
-
-            if marker_layer_supported:
-                midpoint_summary = ft.Container(
-                    width=320,
-                    padding=16,
-                    border_radius=18,
-                    bgcolor=tokens["panel"],
-                    border=ft.border.all(1, tokens["card_border"]),
-                    shadow=ft.BoxShadow(
-                        blur_radius=16,
-                        spread_radius=0,
-                        color=ft.Colors.with_opacity(0.16, ft.Colors.BLACK),
-                        offset=ft.Offset(0, 5),
-                    ),
-                    content=ft.Column(
-                        spacing=5,
-                        controls=[
-                            ft.Text(
-                                f"Route: {route_label}",
-                                size=12,
-                                weight=ft.FontWeight.W_800,
-                                color=tokens["text"],
-                                no_wrap=True,
-                            ),
-                            ft.Text(f"Distance: {distance_label}", size=11, color=tokens["text"], no_wrap=True),
-                            ft.Text(f"Flight time: {flight_time_label}", size=11, color=tokens["text"], no_wrap=True),
-                        ],
-                    ),
-                )
-                map_layers.append(
-                    ftm.MarkerLayer(
-                        markers=[
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(origin_coord[0], origin_coord[1]),
-                                width=170,
-                                height=64,
-                                alignment=ft.Alignment(0, 0),
-                                content=build_airport_marker("Origin", origin_icao, tokens["accent"]),
-                            ),
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(destination_coord[0], destination_coord[1]),
-                                width=170,
-                                height=64,
-                                alignment=ft.Alignment(0, 0),
-                                content=build_airport_marker("Destination", destination_icao, tokens["text"]),
-                            ),
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(mid_lat, mid_lon),
-                                width=320,
-                                height=92,
-                                alignment=ft.Alignment(0, 1),
-                                content=midpoint_summary,
-                            ),
-                        ]
-                    )
-                )
-            elif map_note is None:
-                map_note = "This installed flet-map build can show the route line, but not the route markers."
-        elif origin_coord or destination_coord:
-            available_icao = origin_icao if origin_coord else destination_icao
-            available_coord = origin_coord if origin_coord else destination_coord
-            initial_center = ftm.MapLatitudeLongitude(available_coord[0], available_coord[1])
-            initial_zoom = 5.0
-            map_note = "Only one airport is available. Set both departure and arrival to draw the full route."
-            if marker_layer_supported:
-                map_layers.append(
-                    ftm.MarkerLayer(
-                        markers=[
-                            ftm.Marker(
-                                coordinates=ftm.MapLatitudeLongitude(available_coord[0], available_coord[1]),
-                                width=170,
-                                height=64,
-                                alignment=ft.Alignment(0, 0),
-                                content=build_airport_marker("Airport", available_icao, tokens["accent"]),
-                            )
-                        ]
-                    )
-                )
-        else:
-            map_note = "Set departure and arrival ICAO codes on the Takeoff and Landing pages to draw the active route."
-
-        map_min_zoom = 2.5
-        initial_zoom = max(float(initial_zoom or map_min_zoom), map_min_zoom)
-        map_kwargs = dict(
-            expand=True,
-            initial_center=initial_center,
-            initial_zoom=initial_zoom,
-            interaction_configuration=ftm.InteractionConfiguration(flags=ftm.InteractionFlag.ALL),
-            layers=map_layers,
-        )
-        try:
-            world_map = ftm.Map(**map_kwargs, min_zoom=map_min_zoom)
-        except TypeError:
-            # Older flet-map builds may not support min_zoom. Keep the safe
-            # initial/world-view zoom values so the map does not intentionally
-            # zoom beyond the visible world boundary.
-            world_map = ftm.Map(**map_kwargs)
-
-        async def go_route(e):
-            if route_center is not None:
-                await world_map.center_on(point=route_center, zoom=default_route_zoom(route_nm))
-                camera_status.value = f"Route centered: {route_label} • {distance_label} • Flight time {flight_time_label}"
-            elif origin_coord:
-                await world_map.center_on(point=ftm.MapLatitudeLongitude(origin_coord[0], origin_coord[1]), zoom=5.0)
-                camera_status.value = f"Centered on {origin_icao}"
-            elif destination_coord:
-                await world_map.center_on(point=ftm.MapLatitudeLongitude(destination_coord[0], destination_coord[1]), zoom=5.0)
-                camera_status.value = f"Centered on {destination_icao}"
-            else:
-                camera_status.value = "Set a departure and arrival to center on the active route."
-            page.update()
-
-        async def go_berlin(e):
-            await world_map.center_on(point=ftm.MapLatitudeLongitude(52.52, 13.405), zoom=6)
-            camera_status.value = "Centered on Berlin"
-            page.update()
-
-        async def go_tehran(e):
-            await world_map.center_on(point=ftm.MapLatitudeLongitude(35.6892, 51.3890), zoom=6)
-            camera_status.value = "Centered on Tehran"
-            page.update()
-
-        async def world_view(e):
-            await world_map.zoom_to(map_min_zoom)
-            camera_status.value = "World view"
-            page.update()
-
-        return ft.Container(
-            expand=True,
-            padding=18,
-            content=ft.Column(
-                expand=True,
-                spacing=12,
-                controls=[
-                    glass_card(
-                        "Map",
-                        ft.Column(
-                            spacing=12,
-                            controls=[
-                                ft.Text(
-                                    "Dark command-center map. Route markers and route lines stay active.",
-                                    size=12,
-                                    color=tokens["muted"],
-                                ),
-                                ft.Row(
-                                    wrap=True,
-                                    spacing=10,
-                                    controls=[
-                                        ft.ElevatedButton("Route view", on_click=go_route, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                        ft.OutlinedButton("World view", on_click=world_view),
-                                    ],
-                                ),
-                                camera_status,
-                                ft.Text(
-                                    (map_note or f"Active map style: {active_map_label}." + (" Add MAPTILER_API_KEY to enable MapTiler tiles." if not MAPTILER_API_KEY else "")),
-                                    size=12,
-                                    color=tokens["muted"],
-                                ),
-                            ],
-                        ),
-                    ),
-                    ft.Container(
-                        expand=True,
-                        border_radius=18,
-                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                        border=ft.border.all(1, tokens["card_border"]),
-                        content=world_map,
-                    ),
-                ],
-            ),
-        )
 
     def calendar_entry_card(entry: dict):
         is_completed = bool(entry.get("completed"))
         status_text = "Completed" if is_completed else "Planned"
         status_color = ft.Colors.GREEN_700 if is_completed else tokens["accent"]
         bg_color = tokens["success_overlay"] if is_completed else tokens["subpanel"]
+        entry_id = str(entry.get("id") or "")
+        action_buttons: List[ft.Control] = [
+            ft.OutlinedButton("Edit", on_click=lambda e, target_id=entry_id: load_calendar_entry_for_edit(target_id)),
+            ft.OutlinedButton("Delete", on_click=lambda e, target_id=entry_id: delete_calendar_entry(target_id)),
+        ]
+        if not is_completed:
+            action_buttons.append(
+                ft.ElevatedButton(
+                    "Complete",
+                    icon=ft.Icons.CHECK_ROUNDED,
+                    on_click=lambda e, target_id=entry_id: complete_calendar_entry(target_id),
+                    bgcolor=tokens["primary"],
+                    color=tokens["on_primary"],
+                )
+            )
 
         return ft.Container(
             padding=16,
             border_radius=18,
-            bgcolor=bg_color,
+            bgcolor=surface_fill(bg_color),
             border=ft.border.all(1, tokens["card_border"]),
             content=ft.Column(
                 spacing=10,
@@ -14585,7 +13748,13 @@ def main(page: ft.Page):
                                 padding=ft.padding.symmetric(horizontal=10, vertical=6),
                                 border_radius=999,
                                 bgcolor=ft.Colors.with_opacity(0.12, status_color),
-                                content=ft.Text(status_text, color=status_color, size=10, weight=ft.FontWeight.W_700),
+                                content=ft.Row(
+                                    spacing=5,
+                                    controls=[
+                                        *([ft.Icon(ft.Icons.CHECK_CIRCLE_ROUNDED, size=13, color=status_color)] if is_completed else []),
+                                        ft.Text(status_text, color=status_color, size=10, weight=ft.FontWeight.W_700),
+                                    ],
+                                ),
                             ),
                         ],
                     ),
@@ -14594,18 +13763,15 @@ def main(page: ft.Page):
                         spacing=20,
                         controls=[
                             ft.Text(f"Flight time: {entry.get('flight_time', '—')}", size=11, color=tokens["text"]),
-                            ft.Text(f"Origin: {entry.get('origin', '—')}", size=11, color=tokens["text"]),
-                            ft.Text(f"Destination: {entry.get('destination', '—')}", size=11, color=tokens["text"]),
+                            ft.Text(f"Departure: {entry.get('origin', '—')}", size=11, color=tokens["text"]),
+                            ft.Text(f"Arrival: {entry.get('destination', '—')}", size=11, color=tokens["text"]),
                         ],
                     ),
                     ft.Text(f"Notes: {entry.get('notes', '—') or '—'}", size=11, color=tokens["muted"]),
                     ft.Row(
                         wrap=True,
                         spacing=8,
-                        controls=[
-                            ft.OutlinedButton("Edit", on_click=lambda e, entry_id=entry.get("id"): load_calendar_entry_for_edit(entry_id)),
-                            ft.OutlinedButton("Delete", on_click=lambda e, entry_id=entry.get("id"): delete_calendar_entry(entry_id)),
-                        ],
+                        controls=action_buttons,
                     ),
                 ],
             ),
@@ -14618,6 +13784,7 @@ def main(page: ft.Page):
         display_month = int(getattr(state, "calendar_display_month", datetime.now().month) or datetime.now().month)
         state.calendar_display_year = display_year
         state.calendar_display_month = display_month
+        entries_by_date = index_calendar_entries_by_date(state.calendar_entries)
 
         selected_date = (getattr(state, "calendar_selected_date", "") or "").strip()
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -14634,7 +13801,7 @@ def main(page: ft.Page):
                 year += 1
             state.calendar_display_month = month
             state.calendar_display_year = year
-            refresh_ui()
+            refresh_active_page()
 
         def choose_calendar_date(date_str: str):
             # Click a date once to select it and fill the planner date.
@@ -14647,16 +13814,16 @@ def main(page: ft.Page):
                 cal_date_tf.value = date_str
                 cal_form_message.value = f"Selected date: {date_str}"
             refresh_calendar_route_preview()
-            refresh_ui()
+            refresh_active_page()
 
         def clear_calendar_selected_date(e=None):
             if (getattr(state, "calendar_selected_date", "") or "").strip():
                 reset_calendar_form()
                 refresh_calendar_route_preview()
-                refresh_ui()
+                refresh_active_page()
 
         def flights_for_date(date_str: str) -> list[dict]:
-            return [entry for entry in state.calendar_entries if (entry.get("date") or "") == date_str]
+            return entries_by_date.get(date_str, [])
 
         def planner_compact_card() -> ft.Control:
             return glass_card(
@@ -14665,9 +13832,12 @@ def main(page: ft.Page):
                     spacing=12,
                     controls=[
                         ft.Row(wrap=True, spacing=10, controls=[cal_date_tf, cal_time_tf]),
-                        cal_airline_dd,
-                        cal_aircraft_dd,
-                        ft.Row(wrap=True, spacing=10, controls=[cal_origin_tf, cal_destination_tf]),
+                        planner_search("airline", "Airline", cal_airline_dd),
+                        planner_search("aircraft", "Aircraft", cal_aircraft_dd),
+                        ft.Row(wrap=True, spacing=10, controls=[
+                            planner_search("origin", "Departure", cal_origin_tf),
+                            planner_search("destination", "Arrival", cal_destination_tf),
+                        ]),
                         cal_flight_time_tf,
                         ft.Row(
                             wrap=True,
@@ -14676,8 +13846,8 @@ def main(page: ft.Page):
                                 ft.ElevatedButton(
                                     "Update flight" if state.calendar_editing_id else "Add flight",
                                     on_click=add_or_update_calendar_entry,
-                                    bgcolor=tokens["accent"],
-                                    color=ft.Colors.WHITE,
+                                    bgcolor=tokens["primary"],
+                                    color=tokens["on_primary"],
                                 ),
                                 ft.OutlinedButton("Clear", on_click=clear_calendar_form),
                             ],
@@ -14690,17 +13860,13 @@ def main(page: ft.Page):
         cal = pycalendar.Calendar(firstweekday=0)
         month_label = datetime(display_year, display_month, 1).strftime("%B %Y")
         month_dates = list(cal.itermonthdates(display_year, display_month))
-        calendar_week_count = max(5, len(month_dates) // 7)
-        calendar_board_height = 951 + max(0, calendar_week_count - 5) * 158
-
-        cell_w = 146
-        normal_cell_h = 152
-        expanded_cell_h = 152
+        calendar_board_height = 116 + (len(month_dates) // 7) * 122
+        cell_height = 116
 
         day_headers = ft.Row(
-            spacing=10,
+            spacing=6,
             controls=[
-                ft.Container(width=cell_w, alignment=ft.Alignment(0, 0), content=ft.Text(day, size=12, weight=ft.FontWeight.W_700, color=tokens["muted"]))
+                ft.Container(expand=True, alignment=ft.Alignment(0, 0), content=ft.Text(day, size=12, weight=ft.FontWeight.W_700, color=tokens["muted"]))
                 for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
             ],
         )
@@ -14728,7 +13894,7 @@ def main(page: ft.Page):
 
             day_text_color = tokens["text"] if is_current_month else tokens["muted"]
             compact_info = []
-            for entry in entries[:2]:
+            for entry in entries[:1]:
                 route_text = f"{entry.get('origin', '')} → {entry.get('destination', '')}".strip()
                 detail_text = " • ".join(
                     part for part in [
@@ -14753,30 +13919,15 @@ def main(page: ft.Page):
                         ),
                     )
                 )
-            if entry_count > 2:
-                compact_info.append(ft.Text(f"+{entry_count - 2} more", size=10, color=tokens["accent"], weight=ft.FontWeight.W_700))
-            if not compact_info:
-                compact_info.append(ft.Text("No flight", size=9, color=ft.Colors.with_opacity(0.65, tokens["muted"])))
-
-            detail_controls = []
-            if is_selected and entries:
-                detail_controls = [
-                    ft.Divider(height=3, opacity=0.10),
-                    ft.Text(f"{entry_count} flight{'s' if entry_count != 1 else ''} selected", size=9, color=tokens["accent"], weight=ft.FontWeight.W_700, no_wrap=True),
-                ]
-            elif is_selected:
-                detail_controls = [
-                    ft.Divider(height=3, opacity=0.10),
-                    ft.Text("No saved flight", size=9, color=tokens["muted"]),
-                ]
-
+            if entry_count > 1:
+                compact_info.append(ft.Text(f"+{entry_count - 1} more", size=10, color=tokens["accent"], weight=ft.FontWeight.W_700))
             date_cells.append(
                 ft.Container(
-                    width=cell_w,
-                    height=expanded_cell_h if is_selected else normal_cell_h,
-                    padding=10,
-                    border_radius=18,
-                    bgcolor=cell_bg,
+                    expand=True,
+                    height=cell_height,
+                    padding=7,
+                    border_radius=7,
+                    bgcolor=surface_fill(cell_bg),
                     border=ft.border.all(1.4, border_color),
                     ink=True,
                     on_click=lambda e, ds=date_str: choose_calendar_date(ds),
@@ -14791,7 +13942,6 @@ def main(page: ft.Page):
                                 ],
                             ),
                             *compact_info,
-                            *detail_controls,
                         ],
                     ),
                 )
@@ -14799,7 +13949,7 @@ def main(page: ft.Page):
 
         week_rows: list[ft.Control] = []
         for idx in range(0, len(date_cells), 7):
-            week_rows.append(ft.Row(spacing=10, vertical_alignment=ft.CrossAxisAlignment.START, controls=date_cells[idx:idx + 7]))
+            week_rows.append(ft.Row(spacing=6, vertical_alignment=ft.CrossAxisAlignment.START, controls=date_cells[idx:idx + 7]))
 
         calendar_board = glass_card_with_background(
             "Desk Calendar",
@@ -14811,7 +13961,7 @@ def main(page: ft.Page):
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         controls=[
                             ft.Row(
-                                spacing=10,
+                                spacing=6,
                                 controls=[
                                     ft.IconButton(icon=ft.Icons.CHEVRON_LEFT, on_click=lambda e: shift_calendar_month(-1), icon_color=tokens["text"]),
                                     ft.Text(month_label, size=26, weight=ft.FontWeight.W_800, color=tokens["text"]),
@@ -14820,13 +13970,7 @@ def main(page: ft.Page):
                             ),
                         ],
                     ),
-                    ft.Container(
-                        padding=ft.padding.symmetric(horizontal=12, vertical=6),
-                        border_radius=24,
-                        bgcolor=tokens["panel"],
-                        border=ft.border.all(1, tokens["card_border"]),
-                        content=ft.Column(spacing=6, controls=[day_headers, *week_rows]),
-                    ),
+                    ft.Column(spacing=6, controls=[day_headers, *week_rows]),
                 ],
             ),
             height=calendar_board_height,
@@ -14839,7 +13983,7 @@ def main(page: ft.Page):
                 ft.Container(
                     padding=18,
                     border_radius=18,
-                    bgcolor=tokens["subpanel"],
+                    bgcolor=surface_fill(tokens["subpanel"]),
                     border=ft.border.all(1, tokens["card_border"]),
                     content=ft.Text("No flights match the current filters yet.", color=tokens["muted"]),
                 )
@@ -14854,10 +13998,11 @@ def main(page: ft.Page):
                     ft.Row(wrap=True, spacing=12, controls=[cal_sort_dd, cal_status_filter_dd]),
                     ft.Container(
                         expand=True,
-                        content=ft.Column(
+                        content=ft.ListView(
                             expand=True,
                             spacing=12,
-                            scroll=ft.ScrollMode.AUTO,
+                            build_controls_on_demand=True,
+                            cache_extent=360,
                             controls=[*entry_controls, ft.Container(height=28)],
                         ),
                     ),
@@ -14867,21 +14012,18 @@ def main(page: ft.Page):
         )
 
         return ft.Container(
-            expand=True,
-            bgcolor=ft.Colors.TRANSPARENT,
-            padding=8,
+            expand=True, padding=GAP,
             content=ft.Column(
-                expand=True,
-                scroll=None,
-                spacing=16,
+                expand=True, scroll=ft.ScrollMode.AUTO,
                 controls=[
-                    ft.Row(
-                        spacing=16,
+                    ft.ResponsiveRow(
+                        spacing=GAP, run_spacing=GAP,
+                        breakpoints={"sm": 0, "lg": 1280},
                         vertical_alignment=ft.CrossAxisAlignment.START,
                         controls=[
-                            ft.Container(width=240, content=planner_compact_card()),
-                            ft.Container(width=1140, content=calendar_board),
-                            ft.Container(width=390, content=saved_flights_card),
+                            ft.Container(col={"sm": 3, "lg": 2.4}, content=planner_compact_card()),
+                            ft.Container(col={"sm": 9, "lg": 6.2}, content=calendar_board),
+                            ft.Container(col={"sm": 12, "lg": 3.4}, content=saved_flights_card),
                         ],
                     ),
                 ],
@@ -14889,7 +14031,8 @@ def main(page: ft.Page):
         )
 
 
-    def log_entry_row(entry: dict, stack_index: int = 0) -> ft.Control:
+
+    def log_entry_row(entry: dict, stack_index: int = 0, register_control: bool = True) -> ft.Control:
         entry_id = entry.get("id") or f"{entry.get('date', '')}-{entry.get('time', '')}-{entry.get('route', '')}"
         is_expanded = getattr(state, "log_expanded_id", None) == entry_id
         status_text = "Completed" if bool(entry.get("completed")) else "Planned"
@@ -14903,65 +14046,36 @@ def main(page: ft.Page):
         pass_muted = tokens["muted"]
         pass_line = tokens["card_border"]
 
-        def toggle_log_detail(e=None, item_id=entry_id):
-            if state.log_editing_detail_id == item_id:
+        def refresh_log_ticket(item_id: Optional[str]):
+            if not item_id:
                 return
+            registered = log_entry_control_registry.get(str(item_id))
+            if not registered:
+                return
+            host, source_entry, source_index = registered
+            replacement = log_entry_row(source_entry, source_index, register_control=False)
+            host.content = replacement.content
+            host.margin = replacement.margin
+            host.bgcolor = replacement.bgcolor
+            host.border = replacement.border
+            host.border_radius = replacement.border_radius
+            host.clip_behavior = replacement.clip_behavior
+            host.shadow = replacement.shadow
+            if getattr(host, "page", None):
+                host.update()
+
+        def toggle_log_detail(e=None, item_id=entry_id):
+            previous_id = getattr(state, "log_expanded_id", None)
             if getattr(state, "log_expanded_id", None) == item_id:
                 state.log_expanded_id = None
             else:
                 state.log_expanded_id = item_id
-            refresh_ui()
+            for refresh_id in dict.fromkeys([previous_id, item_id]):
+                refresh_log_ticket(refresh_id)
 
         def clean(value, fallback="—"):
             value = "" if value is None else str(value).strip()
             return value if value else fallback
-
-        def start_detail_edit(field_key: str):
-            state.log_expanded_id = entry_id
-            state.log_editing_detail_id = entry_id
-            state.log_editing_detail_field = field_key
-            refresh_ui()
-
-        def finish_detail_edit(field_key: str, new_value: str):
-            if state.log_editing_detail_id != entry_id or state.log_editing_detail_field != field_key:
-                return
-            new_value = (new_value or "").strip()
-
-            if field_key == "date" and new_value:
-                try:
-                    datetime.strptime(new_value, "%Y-%m-%d")
-                except ValueError:
-                    show_snack("Date must use YYYY-MM-DD.")
-                    return
-            if field_key in ("time", "arrival_time") and new_value:
-                try:
-                    datetime.strptime(new_value, "%H:%M")
-                except ValueError:
-                    show_snack("Time must use HH:MM.")
-                    return
-
-            if field_key in ("origin", "destination"):
-                stored_value = (normalize_airport_code(new_value) or new_value).strip().upper()
-                entry[field_key] = stored_value
-                origin_code = (normalize_airport_code(entry.get("origin")) or str(entry.get("origin") or "")).strip().upper()
-                destination_code = (normalize_airport_code(entry.get("destination")) or str(entry.get("destination") or "")).strip().upper()
-                if origin_code and destination_code:
-                    entry["route"] = f"{origin_code} -> {destination_code}"
-            else:
-                entry[field_key] = new_value
-
-            entry["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            entry_id_value = entry.get("id")
-            if entry_id_value:
-                for idx, item in enumerate(state.calendar_entries):
-                    if item.get("id") == entry_id_value:
-                        state.calendar_entries[idx] = entry
-                        break
-            sync_profile_from_calendar_completion()
-            save_calendar_entries()
-            state.log_editing_detail_id = None
-            state.log_editing_detail_field = None
-            refresh_ui()
 
         def estimate_arrival_time() -> str:
             saved_arrival_time = clean(entry.get("arrival_time"), "")
@@ -14997,99 +14111,78 @@ def main(page: ft.Page):
                 name = name.replace(word, "").strip()
             return name or clean(code)
 
-        def detail_line(
-            label: str,
-            value: str,
-            width: int = 220,
-            field_key: Optional[str] = None,
-            edit_value: Optional[str] = None,
-        ) -> ft.Control:
-            is_editing = (
-                bool(field_key)
-                and state.log_editing_detail_id == entry_id
-                and state.log_editing_detail_field == field_key
-            )
-            display_value = clean(value)
-            editable_value = clean(edit_value, display_value) if edit_value is not None else display_value
-            if is_editing:
-                edit_field = ft.TextField(
-                    value=editable_value,
-                    dense=True,
-                    text_size=13,
-                    border_radius=10,
-                    filled=True,
-                    bgcolor=tokens["input_bg"],
-                    color=tokens["text"],
-                    autofocus=True,
-                    multiline=width >= 400,
-                    min_lines=1,
-                    max_lines=3 if width >= 400 else 1,
-                )
-
-                def submit_edit(e=None, key=field_key, control=edit_field):
-                    finish_detail_edit(key, control.value or "")
-
-                edit_field.on_submit = submit_edit
-                edit_field.on_blur = submit_edit
-                value_control: ft.Control = edit_field
-            else:
-                value_control = ft.Text(
-                    display_value,
-                    size=13,
-                    weight=ft.FontWeight.W_700,
-                    color=tokens["text"],
-                    max_lines=2,
-                    overflow=ft.TextOverflow.ELLIPSIS,
-                )
-
-            detail_body = ft.Container(
-                width=width,
+        def detail_line(label: str, value: str) -> ft.Control:
+            return ft.Container(
+                width=220,
                 padding=ft.padding.symmetric(horizontal=12, vertical=10),
                 border_radius=16,
-                bgcolor=tokens["subpanel"],
-                border=ft.border.all(1, tokens["accent"] if is_editing else tokens["card_border"]),
+                bgcolor=surface_fill(tokens["subpanel"]),
+                border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     tight=True,
                     spacing=4,
                     controls=[
                         ft.Text(label, size=11, color=tokens["muted"]),
-                        value_control,
+                        ft.Text(clean(value), size=13, weight=ft.FontWeight.W_700,
+                                color=tokens["text"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
                     ],
                 ),
             )
-            if not field_key or is_editing:
-                return detail_body
-            return ft.GestureDetector(
-                mouse_cursor=ft.MouseCursor.CLICK,
-                on_tap=lambda e, key=field_key: start_detail_edit(key),
-                on_double_tap=lambda e, key=field_key: start_detail_edit(key),
-                content=detail_body,
+
+        def landing_performance_control() -> ft.Control:
+            saved_value = parse_landing_g(entry.get("landing_g"))
+            field = ft.TextField(
+                label="Landing performance",
+                suffix="G",
+                value=clean(entry.get("landing_g"), "") if saved_value is not None else "",
+                keyboard_type=ft.KeyboardType.NUMBER,
+                width=220,
+                border_radius=16,
+                filled=True,
+                bgcolor=tokens["input_bg"],
+            )
+            grade_text = ft.Text(size=12, weight=ft.FontWeight.W_700)
+            grade = ft.Container(
+                content=grade_text,
+                padding=ft.Padding.symmetric(horizontal=10, vertical=6),
+                border_radius=10,
+                visible=False,
             )
 
-        def barcode_visual(width: int = 250, height: int = 58) -> ft.Control:
-            bars = []
-            pattern = [3, 1, 2, 1, 5, 2, 1, 3, 1, 4, 2, 1, 3, 2, 5, 1, 1, 4, 2, 2, 1, 5, 3, 1, 2, 4]
-            for i, bar_width in enumerate(pattern):
-                bars.append(
-                    ft.Container(
-                        width=bar_width,
-                        height=height,
-                        bgcolor=pass_text if i % 3 != 1 else tokens["muted"],
-                    )
-                )
-            return ft.Container(
-                width=width,
-                height=height,
-                padding=ft.padding.symmetric(horizontal=8, vertical=6),
-                bgcolor=tokens["subpanel"],
-                border_radius=8,
-                border=ft.border.all(1, pass_line),
-                content=ft.Row(spacing=3, alignment=ft.MainAxisAlignment.CENTER, controls=bars),
-            )
+            def update_grade(e=None):
+                raw = (field.value or "").strip()
+                value = parse_landing_g(raw)
+                field.error_text = "Enter a number above 0 and up to 2.6." if raw and value is None else None
+                grade.visible = value is not None
+                if value is not None:
+                    grade_text.value, grade_text.color, grade.bgcolor = landing_g_grade(value)
+                if e is not None:
+                    field.update()
+                    grade.update()
 
-        def pass_info_block(label: str, value: str, width: int = 120) -> ft.Control:
+            def save_grade(e):
+                raw = (field.value or "").strip()
+                value = parse_landing_g(raw)
+                if (raw and value is None) or value == parse_landing_g(entry.get("landing_g")):
+                    return
+                if value is None:
+                    entry.pop("landing_g", None)
+                else:
+                    entry["landing_g"] = value
+                entry["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                save_calendar_entries()
+                if log_sort_dd.value in ("Lowest landing G", "Highest landing G"):
+                    refresh_active_page()
+
+            field.on_change = update_grade
+            field.on_submit = field.on_blur = save_grade
+            update_grade()
+            return ft.Row([field, grade], wrap=True, spacing=10, run_spacing=5)
+
+        def pass_info_block(label: str, value: str, width: Optional[int] = None) -> ft.Control:
             return ft.Container(
                 width=width,
+                expand=width is None,
                 content=ft.Column(
                     tight=True,
                     spacing=2,
@@ -15109,11 +14202,8 @@ def main(page: ft.Page):
         departure_date = clean(entry.get("date"))
         departure_time = clean(entry.get("time"))
         arrival_time = estimate_arrival_time()
-        notes = clean(entry.get("notes"))
         flight_number = clean(entry.get("flight_number"), clean(state.flight_number, "FMS —"))
         block_fuel_note = note_value("Block fuel")
-        ete_note = note_value("ETE")
-        metar_note = note_value("METAR")
 
         fuel_plan = state.takeoff_last_result.get("fuel_plan", {}) if isinstance(getattr(state, "takeoff_last_result", {}), dict) else {}
         planned_fuel = clean(entry.get("planned_fuel"), "")
@@ -15125,9 +14215,6 @@ def main(page: ft.Page):
         if not planned_fuel and block_fuel_note != "—":
             planned_fuel = block_fuel_note.replace("Block fuel", "").strip(" :")
 
-        fuel_ete = clean(entry.get("fuel_ete"), ete_note)
-        origin_weather = clean(entry.get("origin_weather"), metar_note)
-
         origin_name = airport_display_name(origin)
         destination_name = airport_display_name(destination)
         passenger_name = clean(state.pilot_name, "Pilot")
@@ -15137,6 +14224,28 @@ def main(page: ft.Page):
         expanded_code_size = 32
         code_size = expanded_code_size if is_expanded else collapsed_code_size
         city_size = 13 if is_expanded else 11
+
+        def airport_heading(label, code, name, time, *, arrival=False):
+            code_text = ft.Text(code, size=code_size, weight=ft.FontWeight.W_900, color=pass_text)
+            time_text = ft.Text(time, size=22 if is_expanded else 17, weight=ft.FontWeight.W_800, color=pass_text)
+            return ft.Container(
+                expand=True,
+                content=ft.Column(
+                    spacing=0,
+                    horizontal_alignment=ft.CrossAxisAlignment.END if arrival else ft.CrossAxisAlignment.START,
+                    controls=[
+                        ft.Text(label, size=10, color=pass_muted, weight=ft.FontWeight.W_700),
+                        ft.Row(
+                            [time_text, code_text] if arrival else [code_text, time_text],
+                            spacing=10,
+                            alignment=ft.MainAxisAlignment.END if arrival else ft.MainAxisAlignment.START,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        ft.Text(name.upper(), size=city_size, weight=ft.FontWeight.W_700,
+                                color=pass_muted, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                    ],
+                ),
+            )
 
         perforation = ft.Container(
             width=16,
@@ -15177,10 +14286,10 @@ def main(page: ft.Page):
                 ft.Row(
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     controls=[
-                        pass_info_block("Passenger", passenger_name.upper(), 150),
-                        pass_info_block("Flight", flight_number.upper(), 105),
-                        pass_info_block("Aircraft", aircraft.upper(), 170),
-                        pass_info_block("Date", departure_date, 120),
+                        pass_info_block("Passenger", passenger_name.upper()),
+                        pass_info_block("Flight", flight_number.upper()),
+                        pass_info_block("Aircraft", aircraft.upper()),
+                        pass_info_block("Date", departure_date),
                     ],
                 )
             ]
@@ -15202,14 +14311,11 @@ def main(page: ft.Page):
             else ft.Container(width=140, height=38)
         )
 
-        boarding_pass_header_bg_src = card_background_src("boarding_pass_header")
-
         header_left = ft.Container(
             height=header_height,
             expand=True,
             padding=ft.padding.only(left=22, top=(16 if is_expanded else 12), right=22, bottom=12),
-            bgcolor=pass_bg,
-            image=ft.DecorationImage(src=boarding_pass_header_bg_src, fit=ft.BoxFit.COVER, opacity=0.36) if boarding_pass_header_bg_src else None,
+            bgcolor=surface_fill(pass_bg),
             content=ft.Column(
                 spacing=(10 if is_expanded else 4),
                 alignment=ft.MainAxisAlignment.CENTER if not is_expanded else ft.MainAxisAlignment.START,
@@ -15219,17 +14325,7 @@ def main(page: ft.Page):
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         controls=[
-                            ft.Container(
-                                width=230,
-                                content=ft.Column(
-                                    spacing=0,
-                                    controls=[
-                                        ft.Text("FROM", size=10, color=pass_muted, weight=ft.FontWeight.W_700),
-                                        ft.Text(origin, size=code_size, weight=ft.FontWeight.W_900, color=pass_text),
-                                        ft.Text(origin_name.upper(), size=city_size, weight=ft.FontWeight.W_700, color=tokens["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                    ],
-                                ),
-                            ),
+                            airport_heading("DEPARTURE", origin, origin_name, departure_time),
                             ft.Container(
                                 width=150,
                                 alignment=ft.Alignment(0, 0),
@@ -15241,19 +14337,7 @@ def main(page: ft.Page):
                                     ],
                                 ),
                             ),
-                            ft.Container(
-                                width=230,
-                                alignment=ft.Alignment(1, 0),
-                                content=ft.Column(
-                                    horizontal_alignment=ft.CrossAxisAlignment.END,
-                                    spacing=0,
-                                    controls=[
-                                        ft.Text("TO", size=10, color=pass_muted, weight=ft.FontWeight.W_700),
-                                        ft.Text(destination, size=code_size, weight=ft.FontWeight.W_900, color=pass_text),
-                                        ft.Text(destination_name.upper(), size=city_size, weight=ft.FontWeight.W_700, color=tokens["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                    ],
-                                ),
-                            ),
+                            airport_heading("ARRIVAL", destination, destination_name, arrival_time, arrival=True),
                         ],
                     ),
                     *expanded_bottom_info,
@@ -15262,21 +14346,19 @@ def main(page: ft.Page):
         )
 
         stub_controls = [
-            ft.Text("B O A R D I N G   P A S S", size=(18 if is_expanded else 14), weight=ft.FontWeight.W_900, color=pass_text),
-            ft.Row(spacing=14, controls=[pass_info_block("FROM", origin, width=100), pass_info_block("TO", destination, width=100)]),
+            ft.Text("Boarding pass", size=16, weight=ft.FontWeight.W_800, color=pass_text),
+            ft.Row(spacing=14, controls=[pass_info_block("Departure", origin, width=100), pass_info_block("Arrival", destination, width=100)]),
         ]
         if is_expanded:
             stub_controls.extend([
-                ft.Row(spacing=14, controls=[pass_info_block("Departure", departure_time, width=100), pass_info_block("Arrival", arrival_time, width=100)]),
                 ft.Row(spacing=14, controls=[pass_info_block("Time", flight_time, width=100), pass_info_block("Gate", clean(entry.get("gate"), clean(state.departure_gate)), width=100)]),
             ])
 
         header_stub = ft.Container(
-            width=310,
+            width=252,
             height=header_height,
             padding=ft.padding.only(left=20, top=(16 if is_expanded else 12), right=20, bottom=12),
-            bgcolor=pass_stub_bg,
-            image=ft.DecorationImage(src=boarding_pass_header_bg_src, fit=ft.BoxFit.COVER, opacity=0.36) if boarding_pass_header_bg_src else None,
+            bgcolor=surface_fill(pass_stub_bg),
             content=ft.Column(
                 spacing=(10 if is_expanded else 6),
                 alignment=ft.MainAxisAlignment.CENTER,
@@ -15287,64 +14369,44 @@ def main(page: ft.Page):
         expanded_details = ft.Container(height=0)
         if is_expanded:
             aircraft_media_card = ft.Container(
-                width=320,
+                expand=2,
+                height=272,
                 padding=12,
                 border_radius=20,
-                bgcolor=tokens["subpanel"],
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
-                content=ft.Column(
-                    spacing=10,
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Container(
-                            width=296,
-                            height=136,
-                            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                            border_radius=16,
-                            bgcolor=tokens["panel"],
-                            alignment=ft.Alignment(0, 0),
-                            content=aircraft_livery_image(airline, aircraft, width=280, height=122),
-                        ),
-                        barcode_visual(width=280, height=60),
-                    ],
-                ),
+                alignment=ft.Alignment(0, 0),
+                content=aircraft_profile_image(aircraft, width=560, height=246),
             )
 
             expanded_details = ft.Container(
                 padding=ft.padding.only(left=20, right=20, top=16, bottom=20),
-                bgcolor=tokens["panel"],
+                bgcolor=surface_fill(tokens["panel"]),
                 border=ft.border.only(top=ft.BorderSide(1, tokens["card_border"])),
                 content=ft.Row(
                     spacing=18,
                     vertical_alignment=ft.CrossAxisAlignment.START,
                     controls=[
                         ft.Container(
-                            expand=True,
+                            expand=3,
                             content=ft.Column(
                                 spacing=14,
                                 controls=[
                                     ft.Text("Flight recorder details", size=14, weight=ft.FontWeight.W_600, color=tokens["text"]),
+                                    landing_performance_control(),
                                     ft.Row(
                                         wrap=True,
                                         spacing=12,
                                         run_spacing=12,
                                         controls=[
-                                            detail_line("Departure time", departure_time, field_key="time"),
-                                            detail_line("Estimated arrival", arrival_time, field_key="arrival_time"),
-                                            detail_line("Flight time", flight_time, field_key="flight_time"),
-                                            detail_line("Air pathway", route, field_key="route"),
-                                            detail_line("Airline", airline, field_key="airline"),
-                                            detail_line("Aircraft", aircraft, field_key="aircraft"),
-                                            detail_line("Origin", origin_name, field_key="origin", edit_value=origin),
-                                            detail_line("Destination", destination_name, field_key="destination", edit_value=destination),
-                                            detail_line("Passengers", clean(entry.get("passengers"), clean(getattr(takeoff_fuel_passengers_tf, "value", ""))), field_key="passengers"),
-                                            detail_line("Baggage weight", clean(entry.get("baggage_weight"), clean(getattr(takeoff_fuel_baggage_tf, "value", ""))), field_key="baggage_weight"),
-                                            detail_line("Cargo weight", clean(entry.get("cargo_weight"), clean(getattr(takeoff_fuel_cargo_tf, "value", ""))), field_key="cargo_weight"),
-                                            detail_line("Planned fuel", planned_fuel, field_key="planned_fuel"),
-                                            detail_line("Fuel ETE", fuel_ete, field_key="fuel_ete"),
-                                            detail_line("Origin weather / METAR", origin_weather, width=450, field_key="origin_weather"),
-                                            detail_line("Destination weather", clean(entry.get("destination_weather")), width=450, field_key="destination_weather"),
-                                            detail_line("Notes", notes, width=450, field_key="notes"),
+                                            detail_line("Flight time", flight_time),
+                                            detail_line("Air pathway", route),
+                                            detail_line("Airline", airline),
+                                            detail_line("Aircraft", aircraft),
+                                            detail_line("Passengers", clean(entry.get("passengers"), clean(getattr(takeoff_fuel_passengers_tf, "value", "")))),
+                                            detail_line("Baggage weight", clean(entry.get("baggage_weight"), clean(getattr(takeoff_fuel_baggage_tf, "value", "")))),
+                                            detail_line("Cargo weight", clean(entry.get("cargo_weight"), clean(getattr(takeoff_fuel_cargo_tf, "value", "")))),
+                                            detail_line("Planned fuel", planned_fuel),
                                         ],
                                     ),
                                 ],
@@ -15368,11 +14430,11 @@ def main(page: ft.Page):
             ],
         )
 
-        return ft.Container(
-            margin=ft.margin.only(top=(-8 if stack_index > 0 and not is_expanded else 0)),
-            border_radius=28,
+        ticket_control = ft.Container(
+            margin=ft.Margin.only(bottom=8),
+            border_radius=CARD_RADIUS,
             clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=pass_bg,
+            bgcolor=surface_fill(pass_bg),
             border=ft.border.all(1, pass_line),
             shadow=ft.BoxShadow(
                 blur_radius=18 if is_expanded else 12,
@@ -15383,18 +14445,22 @@ def main(page: ft.Page):
             on_click=toggle_log_detail,
             content=ticket_body,
         )
+        if register_control:
+            log_entry_control_registry[str(entry_id)] = (ticket_control, entry, stack_index)
+        return ticket_control
 
 
     def log_view():
         log_entries = get_completed_log_entries()
         summary = summarize_log_entries(log_entries)
+        log_entry_control_registry.clear()
         log_controls = [log_entry_row(entry, index) for index, entry in enumerate(log_entries)]
         if not log_controls:
             log_controls = [
                 ft.Container(
                     padding=18,
                     border_radius=18,
-                    bgcolor=tokens["subpanel"],
+                    bgcolor=surface_fill(tokens["subpanel"]),
                     border=ft.border.all(1, tokens["card_border"]),
                     content=ft.Text("Completed flights from the Calendar tab will appear here.", color=tokens["muted"]),
                 )
@@ -15405,7 +14471,7 @@ def main(page: ft.Page):
                 width=220,
                 padding=ft.padding.symmetric(horizontal=14, vertical=12),
                 border_radius=16,
-                bgcolor=tokens["subpanel"],
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     tight=True,
@@ -15452,7 +14518,13 @@ def main(page: ft.Page):
                         color=tokens["muted"],
                     ),
                     ft.Row(wrap=True, spacing=12, controls=[log_sort_dd]),
-                    ft.Column(spacing=0, tight=True, controls=log_controls),
+                    ft.ListView(
+                        height=680,
+                        spacing=0,
+                        build_controls_on_demand=True,
+                        cache_extent=450,
+                        controls=log_controls,
+                    ),
                 ],
             ),
         )
@@ -15543,12 +14615,11 @@ def main(page: ft.Page):
 
         def transparent_profile_stat_card(label: str, value: str, subtitle: str = "") -> ft.Control:
             return ft.Container(
-                width=250,
                 height=88,
                 padding=ft.padding.only(left=14, right=14, top=10, bottom=10),
-                border_radius=14,
-                bgcolor=ft.Colors.with_opacity(0.055, ft.Colors.WHITE),
-                border=ft.border.all(1, ft.Colors.with_opacity(0.10, ft.Colors.WHITE)),
+                border_radius=CARD_RADIUS,
+                bgcolor=surface_fill(tokens["subpanel"]),
+                border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     spacing=4,
                     controls=[
@@ -15560,12 +14631,11 @@ def main(page: ft.Page):
 
         def career_name_card() -> ft.Control:
             return ft.Container(
-                width=650,
                 height=96,
                 padding=ft.padding.only(left=18, right=18, top=12, bottom=12),
-                border_radius=18,
-                bgcolor=ft.Colors.with_opacity(0.075, ft.Colors.WHITE),
-                border=ft.border.all(1, ft.Colors.with_opacity(0.13, ft.Colors.WHITE)),
+                border_radius=CARD_RADIUS,
+                bgcolor=surface_fill(tokens["subpanel"]),
+                border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Row(
                     spacing=14,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -15598,8 +14668,8 @@ def main(page: ft.Page):
                 width=245,
                 height=118,
                 padding=16,
-                border_radius=18,
-                bgcolor=tokens["subpanel"],
+                border_radius=CARD_RADIUS,
+                bgcolor=surface_fill(tokens["subpanel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 content=ft.Column(
                     spacing=6,
@@ -15792,7 +14862,7 @@ def main(page: ft.Page):
                 height=720,
                 padding=22,
                 border_radius=24,
-                bgcolor=tokens["panel"],
+                bgcolor=surface_fill(tokens["panel"]),
                 border=ft.border.all(1, tokens["card_border"]),
                 shadow=ft.BoxShadow(blur_radius=32, spread_radius=2, color=ft.Colors.with_opacity(0.45, ft.Colors.BLACK)),
                 content=ft.Column(
@@ -15829,7 +14899,7 @@ def main(page: ft.Page):
                             spacing=10,
                             controls=[
                                 ft.TextButton("Cancel", on_click=close_dialog),
-                                ft.ElevatedButton("Save", on_click=save_profile, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
+                                ft.ElevatedButton("Save", on_click=save_profile, bgcolor=tokens["primary"], color=tokens["on_primary"]),
                             ],
                         ),
                     ],
@@ -15843,6 +14913,7 @@ def main(page: ft.Page):
                 content=modal_card,
             )
             modal_holder["control"] = modal
+            prepare_controls(modal)
             page.overlay.append(modal)
             page.update()
 
@@ -15875,83 +14946,33 @@ def main(page: ft.Page):
                         ],
                     ),
                     ft.Container(expand=True),
-                    ft.IconButton(icon=ft.Icons.SETTINGS, tooltip="Edit profile", on_click=open_profile_editor, bgcolor=tokens["subpanel"], icon_color=tokens["text"]),
+                    ft.IconButton(icon=ft.Icons.SETTINGS, tooltip="Edit profile", on_click=open_profile_editor, bgcolor=surface_fill(tokens["subpanel"]), icon_color=tokens["text"]),
                 ],
             ),
         )
 
-        career_stats_content = ft.Row(
-            wrap=True,
-            spacing=10,
-            run_spacing=10,
-            controls=[
-                career_name_card(),
-                transparent_profile_stat_card("Member since", member_since),
-                transparent_profile_stat_card("Total flight time", total_hours),
-                transparent_profile_stat_card("Online flights", str(online_flight_count)),
-                transparent_profile_stat_card("Total landings", str(total_landings)),
-                transparent_profile_stat_card("Violations", violations_value),
-                transparent_profile_stat_card("Favorite airline", favorite_airline_value),
-                transparent_profile_stat_card("Favorite aircraft", favorite_aircraft_value),
-                transparent_profile_stat_card("Countries visited", countries_visited_value),
-            ],
-        )
-
-        career_bg_src = card_background_src("career_statistics")
-        passport_dark = "#101826"
-        stats_card = ft.Container(
-            width=700,
-            height=730,
-            border_radius=34,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            bgcolor=passport_dark,
-            image=ft.DecorationImage(src=career_bg_src, fit=ft.BoxFit.COVER, opacity=0.24) if career_bg_src else None,
-            border=ft.border.all(1.5, ft.Colors.with_opacity(0.32, tokens["accent"])),
-            shadow=ft.BoxShadow(
-                blur_radius=40,
-                spread_radius=2,
-                color=ft.Colors.with_opacity(0.22, tokens["accent"]),
-                offset=ft.Offset(0, 10),
-            ),
-            content=ft.Stack(
-                expand=True,
+        career_stats = [
+            ("Member since", member_since),
+            ("Total flight time", total_hours),
+            ("Online flights", str(online_flight_count)),
+            ("Total landings", str(total_landings)),
+            ("Violations", violations_value),
+            ("Favorite airline", favorite_airline_value),
+            ("Favorite aircraft", favorite_aircraft_value),
+            ("Countries visited", countries_visited_value),
+        ]
+        stats_card = glass_card(
+            "Crew Passport",
+            ft.Column(
+                spacing=GAP, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 controls=[
-                    ft.Container(expand=True, bgcolor=ft.Colors.with_opacity(0.10, tokens["accent"])),
-                    ft.Container(left=0, top=0, bottom=0, width=46, bgcolor=ft.Colors.with_opacity(0.30, tokens["accent"])),
-                    ft.Container(left=54, top=26, bottom=26, width=1, bgcolor=ft.Colors.with_opacity(0.18, ft.Colors.WHITE)),
-                    ft.Container(
-                        expand=True,
-                        padding=ft.padding.only(left=72, right=24, top=22, bottom=22),
-                        content=ft.Column(
-                            spacing=12,
-                            controls=[
-                                ft.Row(
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                    controls=[
-                                        ft.Column(
-                                            tight=True,
-                                            spacing=2,
-                                            controls=[
-                                                ft.Text("FLIGHT MANAGEMENT SYSTEMS", size=11, weight=ft.FontWeight.W_800, color=ft.Colors.with_opacity(0.70, tokens["text"])),
-                                                ft.Text("CREW PASSPORT", size=24, weight=ft.FontWeight.W_900, color=tokens["text"]),
-                                            ],
-                                        ),
-                                        ft.Container(width=58, height=1),
-                                    ],
-                                ),
-                                ft.Container(height=1, bgcolor=ft.Colors.with_opacity(0.14, ft.Colors.WHITE)),
-                                career_stats_content,
-                                ft.Container(expand=True),
-                                ft.Row(
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    controls=[
-                                        ft.Text(f"ISSUED {member_since}", size=10, weight=ft.FontWeight.W_700, color=tokens["muted"]),
-                                        ft.Text("DIGITAL PASSPORT ID  •  FMS-OPS", size=10, weight=ft.FontWeight.W_700, color=tokens["muted"]),
-                                    ],
-                                ),
-                            ],
-                        ),
+                    career_name_card(),
+                    ft.ResponsiveRow(
+                        spacing=GAP, run_spacing=GAP,
+                        controls=[
+                            ft.Container(col=6, content=transparent_profile_stat_card(label, value))
+                            for label, value in career_stats
+                        ],
                     ),
                 ],
             ),
@@ -15964,7 +14985,7 @@ def main(page: ft.Page):
                 ft.Container(
                     padding=ft.padding.symmetric(horizontal=14, vertical=10),
                     border_radius=14,
-                    bgcolor=tokens["subpanel"],
+                    bgcolor=surface_fill(tokens["subpanel"]),
                     border=ft.border.all(1, tokens["card_border"]),
                     content=ft.Row(
                         wrap=True,
@@ -16009,7 +15030,7 @@ def main(page: ft.Page):
         return ft.Container(
             expand=True,
             bgcolor=ft.Colors.TRANSPARENT,
-            padding=18,
+            padding=GAP,
             content=ft.Column(
                 expand=True,
                 scroll=ft.ScrollMode.AUTO,
@@ -16019,16 +15040,15 @@ def main(page: ft.Page):
                         alignment=ft.MainAxisAlignment.END,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         controls=[
-                            ft.IconButton(icon=ft.Icons.SETTINGS, tooltip="Edit profile", on_click=open_profile_editor, bgcolor=tokens["subpanel"], icon_color=tokens["text"]),
+                            ft.IconButton(icon=ft.Icons.SETTINGS, tooltip="Edit profile", on_click=open_profile_editor, bgcolor=surface_fill(tokens["subpanel"]), icon_color=tokens["text"]),
                         ],
                     ),
-                    ft.Row(
-                        wrap=False,
-                        spacing=16,
+                    ft.ResponsiveRow(
+                        spacing=GAP, run_spacing=GAP,
                         vertical_alignment=ft.CrossAxisAlignment.START,
                         controls=[
-                            stats_card,
-                            ft.Container(expand=True, content=recent_card),
+                            ft.Container(col=7, content=stats_card),
+                            ft.Container(col=5, content=recent_card),
                         ],
                     ),
                 ],
@@ -16037,30 +15057,41 @@ def main(page: ft.Page):
 
 
     def seats_view():
-        selected_seat_aircraft = canonical_aircraft_name(state.aircraft) or state.aircraft
-        if selected_seat_aircraft:
-            apply_seat_template_defaults(selected_seat_aircraft)
+        if seat_model.get("generated"):
+            if not seat_model.get("seat_controls") or seat_map_host.data != seat_map_theme_key():
+                render_seat_map(restoring=True)
+                update_seat_summary(update_page=False)
+        else:
+            seat_map_host.content = empty_seat_map()
+        seat_passenger_load_host.content = build_passenger_load_panel()
+
+        outline_style = button_style(tokens) if page.theme_mode == ft.ThemeMode.DARK else None
+
+        async def reset_fill(e):
+            for field in seat_fill_fields.values():
+                field.value = "0"
+            page.update()
+
         control_panel = glass_card_with_background(
             "Cabin Control",
             ft.Column(
                 spacing=14,
                 controls=[
-                    ft.Text("Seat map and passenger load", size=12, color=tokens["muted"]),
                     ft.Row(
                         spacing=10,
                         controls=[
                             ft.Container(
-                                expand=1,
+                                expand=2,
                                 height=86,
                                 padding=ft.padding.symmetric(horizontal=14, vertical=12),
                                 border_radius=16,
-                                bgcolor=tokens["subpanel"],
+                                bgcolor=surface_fill(tokens["subpanel"]),
                                 border=ft.border.all(1, tokens["card_border"]),
                                 content=ft.Column(
                                     spacing=8,
                                     controls=[
                                         ft.Text(current_airline_label(), size=16, weight=ft.FontWeight.W_800, color=tokens["text"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                        ft.Text(current_aircraft_label(), size=16, weight=ft.FontWeight.W_800, color=tokens["text"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                        ft.Text(current_aircraft_label(), size=14, weight=ft.FontWeight.W_700, color=tokens["text"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
                                     ],
                                 ),
                             ),
@@ -16073,19 +15104,14 @@ def main(page: ft.Page):
                                     content=ft.Container(
                                         expand=True,
                                         height=86,
-                                        padding=ft.padding.symmetric(horizontal=14, vertical=12),
+                                        padding=6,
                                         border_radius=16,
-                                        bgcolor=tokens["subpanel"],
+                                        bgcolor=surface_fill(tokens["subpanel"]),
                                         border=ft.border.all(1, tokens["card_border"]),
                                         alignment=ft.Alignment(0, 0),
-                                        content=ft.Column(
-                                            tight=True,
-                                            spacing=6,
-                                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                            controls=[
-                                                ft.Text("Seat Belt", size=16, weight=ft.FontWeight.W_800, color=tokens["text"], text_align=ft.TextAlign.CENTER),
-                                                ft.Text("Sign", size=16, weight=ft.FontWeight.W_800, color=tokens["text"], text_align=ft.TextAlign.CENTER),
-                                            ],
+                                        content=ft.Text(
+                                            "Seat belt\nsign", size=12, weight=ft.FontWeight.W_800,
+                                            color=tokens["text"], text_align=ft.TextAlign.CENTER,
                                         ),
                                     ),
                                 ),
@@ -16097,8 +15123,8 @@ def main(page: ft.Page):
                     ft.Row(wrap=True, spacing=12, controls=[seat_first_tf, seat_business_tf]),
                     ft.Row(wrap=True, spacing=12, controls=[seat_premium_tf, seat_economy_tf]),
                     ft.Row(wrap=True, spacing=10, controls=[
-                        ft.ElevatedButton("Generate Seat Map", on_click=generate_seat_map, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ft.OutlinedButton("Clear Occupancy", on_click=clear_seat_occupancy),
+                        ft.ElevatedButton("Generate Seat Map", on_click=generate_seat_map, bgcolor=tokens["primary"], color=tokens["on_primary"]),
+                        ft.OutlinedButton("Clear Occupancy", on_click=clear_seat_occupancy, style=outline_style),
                     ]),
                     seat_status_text,
                     ft.Divider(height=8, opacity=0.10),
@@ -16106,25 +15132,29 @@ def main(page: ft.Page):
                     ft.Row(wrap=True, spacing=12, controls=[seat_fill_first_tf, seat_fill_business_tf]),
                     ft.Row(wrap=True, spacing=12, controls=[seat_fill_premium_tf, seat_fill_economy_tf]),
                     ft.Row(wrap=True, spacing=10, controls=[
-                        ft.ElevatedButton("Fill Seats", on_click=auto_fill_seats, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ft.OutlinedButton("Reset Fill", on_click=lambda e: (setattr(seat_fill_first_tf, "value", "0"), setattr(seat_fill_business_tf, "value", "0"), setattr(seat_fill_premium_tf, "value", "0"), setattr(seat_fill_economy_tf, "value", "0"), page.update())),
+                        ft.ElevatedButton("Fill Seats", on_click=auto_fill_seats, bgcolor=tokens["primary"], color=tokens["on_primary"]),
+                        ft.OutlinedButton("Reset Fill", on_click=reset_fill, style=outline_style),
                     ]),
                 ],
             ),
         )
         return ft.Container(
-            expand=True,
-            padding=18,
+            expand=True, padding=GAP,
             content=ft.Row(
-                expand=True,
-                spacing=16,
-                vertical_alignment=ft.CrossAxisAlignment.START,
+                expand=True, spacing=GAP, vertical_alignment=ft.CrossAxisAlignment.STRETCH,
                 controls=[
-                    ft.Container(width=380, content=control_panel),
-                    ft.Container(expand=True, content=ft.Column(scroll=ft.ScrollMode.AUTO, spacing=16, controls=[seat_map_host])),
+                    ft.Container(expand=True, content=ft.Column(
+                        [control_panel, seat_passenger_load_host], spacing=GAP, scroll=ft.ScrollMode.AUTO,
+                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    )),
+                    ft.Container(width=486, content=seat_map_scroll),
+                    ft.Container(expand=True, content=baggage_view()),
                 ],
             ),
         )
+
+    def payload_page() -> ft.Control:
+        return build_tab_page("PAYLOAD", seats_view())
 
     def placeholder_page(title: str):
         return ft.Container(
@@ -16139,15 +15169,13 @@ def main(page: ft.Page):
         return str(base_dir / "assets" / "airlines" / "logos" / f"{slug}.png")
 
     def refresh_airline_option_controls(preferred_airline: Optional[str] = None):
-        for ctrl in [airline_dd, cal_airline_dd, seat_airline_dd]:
+        for ctrl in [airline_dd, seat_airline_dd]:
             ctrl.options = [ft.dropdown.Option(name) for name in AIRLINES]
             if ctrl.value not in (None, "") and ctrl.value not in AIRLINES:
                 ctrl.value = None
         if preferred_airline:
             if airline_dd.value in (None, ""):
                 airline_dd.value = preferred_airline if preferred_airline in AIRLINES else airline_dd.value
-            if cal_airline_dd.value in (None, ""):
-                cal_airline_dd.value = state.airline if state.airline in AIRLINES else None
             if seat_airline_dd.value in (None, ""):
                 seat_airline_dd.value = state.airline if state.airline in AIRLINES else None
 
@@ -16170,28 +15198,20 @@ def main(page: ft.Page):
         settings_overlay_slider.value = clamp_setting(state.airline_overlay_opacity, 0.0, 0.80, 0.50)
         settings_volume_slider.value = clamp_setting(getattr(state, "app_volume", 0.85), 0.0, 1.0, 0.85)
         settings_mute_switch.value = bool(getattr(state, "app_muted", False))
-        settings_brightness_value_text.value = f"Brightness: {settings_brightness_slider.value:.2f}x"
-        settings_contrast_value_text.value = f"Contrast: {settings_contrast_slider.value:.2f}x"
-        settings_overlay_value_text.value = f"Airline overlay opacity: {int(settings_overlay_slider.value * 100)}%"
-        settings_volume_value_text.value = "Volume: muted" if settings_mute_switch.value else f"Volume: {int(settings_volume_slider.value * 100)}%"
+        settings_brightness_value_text.value = f"{settings_brightness_slider.value:.2f}×"
+        settings_contrast_value_text.value = f"{settings_contrast_slider.value:.2f}×"
+        settings_overlay_value_text.value = f"{int(settings_overlay_slider.value * 100)}%"
+        settings_volume_value_text.value = "Muted" if settings_mute_switch.value else f"{int(settings_volume_slider.value * 100)}%"
         settings_fuel_unit_dd.value = state.default_fuel_unit if state.default_fuel_unit in ("kg", "lb") else "kg"
         settings_distance_unit_dd.value = state.default_distance_unit if state.default_distance_unit in ("NM", "km") else "NM"
         settings_temperature_unit_dd.value = state.default_temperature_unit if state.default_temperature_unit in ("°C", "°F") else "°C"
         settings_low_performance_switch.value = bool(state.low_performance_mode)
-        settings_professional_info_switch.value = bool(getattr(state, "professional_info_enabled", False))
-        settings_professional_info_status_text.value = (
-            "Professional information: runway, distance, wind/atmosphere, landing distance, and descent planning cards are visible."
-            if settings_professional_info_switch.value
-            else "Normal information: advanced planning cards are hidden."
-        )
-        settings_professional_info_status_text.color = "#FF8A80" if settings_professional_info_switch.value else tokens["muted"]
         settings_brightness_value_text.color = tokens["muted"]
         settings_contrast_value_text.color = tokens["muted"]
         settings_overlay_value_text.color = tokens["muted"]
         settings_volume_value_text.color = tokens["muted"]
         settings_airline_status_text.color = tokens["muted"]
         settings_custom_airlines_text.color = tokens["muted"]
-        settings_performance_status_text.color = tokens["muted"]
         settings_export_status_text.color = tokens["muted"]
         settings_calendar_import_status_text.color = tokens["muted"]
         settings_background_status_text.color = tokens["muted"]
@@ -16230,7 +15250,7 @@ def main(page: ft.Page):
         refresh_ui()
 
     def reset_display_settings(e=None):
-        state.display_mode = "dark"
+        state.display_mode = "daylight"
         state.display_brightness = 1.0
         state.display_contrast = 1.0
         state.airline_overlay_opacity = 0.50
@@ -16261,12 +15281,6 @@ def main(page: ft.Page):
         state.app_muted = bool(settings_mute_switch.value)
         save_settings_data()
         sync_settings_controls(update_page=True)
-
-    def apply_professional_info_settings(e=None):
-        state.professional_info_enabled = bool(settings_professional_info_switch.value)
-        save_settings_data()
-        sync_settings_controls(update_page=False)
-        refresh_ui()
 
     def timestamp_for_export() -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -16445,9 +15459,7 @@ def main(page: ft.Page):
 
     def open_reset_profile_confirmation(e=None):
         def close_dialog(evt=None):
-            if page.dialog:
-                page.dialog.open = False
-                page.update()
+            page.pop_dialog()
 
         def reset_profile_stats(evt=None):
             state.profile_total_flight_minutes = 0
@@ -16459,7 +15471,7 @@ def main(page: ft.Page):
             refresh_ui()
             show_snack("Profile statistics reset.")
 
-        page.dialog = ft.AlertDialog(
+        dialog = ft.AlertDialog(
             modal=True,
             title=ft.Text("Reset Profile Statistics", color=tokens["text"]),
             content=ft.Text(
@@ -16472,8 +15484,7 @@ def main(page: ft.Page):
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.dialog.open = True
-        page.update()
+        show_alert(dialog)
 
     def open_add_airline_dialog(e=None):
         new_airline_tf = ft.TextField(
@@ -16549,7 +15560,7 @@ def main(page: ft.Page):
             else:
                 show_snack(f"{registered_name} added. Logo path: {logo_path}")
 
-        add_button = ft.ElevatedButton("Add Airline", bgcolor=tokens["accent"], color=ft.Colors.WHITE)
+        add_button = ft.ElevatedButton("Add Airline", bgcolor=tokens["primary"], color=tokens["on_primary"])
         cancel_button = ft.TextButton("Cancel")
         add_button.on_click = add_airline_from_dialog
         cancel_button.on_click = close_modal
@@ -16562,7 +15573,7 @@ def main(page: ft.Page):
             width=460,
             padding=20,
             border_radius=22,
-            bgcolor=tokens["panel"],
+            bgcolor=surface_fill(tokens["panel"]),
             border=ft.border.all(1, tokens["card_border"]),
             shadow=ft.BoxShadow(
                 blur_radius=24,
@@ -16601,6 +15612,7 @@ def main(page: ft.Page):
             content=modal_card,
         )
         modal_holder["control"] = modal
+        prepare_controls(modal)
         page.overlay.append(modal)
         page.update()
 
@@ -16630,7 +15642,7 @@ def main(page: ft.Page):
         if state.airline == airline_name:
             state.airline = ""
             state.flight_status = derive_idle_status()
-        for ctrl in (airline_dd, cal_airline_dd, seat_airline_dd):
+        for ctrl in (airline_dd, seat_airline_dd):
             if ctrl.value == airline_name:
                 ctrl.value = None
 
@@ -16643,7 +15655,7 @@ def main(page: ft.Page):
         refresh_ui()
         show_snack(f"{airline_name} removed.")
 
-    settings_add_airline_btn = ft.ElevatedButton("Add Airline", bgcolor=tokens["accent"], color=ft.Colors.WHITE)
+    settings_add_airline_btn = ft.ElevatedButton("Add Airline", bgcolor=tokens["primary"], color=tokens["on_primary"])
     settings_remove_airline_btn = ft.OutlinedButton("Remove Airline")
     try:
         settings_remove_airline_btn.style = ft.ButtonStyle(color=tokens["text"])
@@ -16656,14 +15668,14 @@ def main(page: ft.Page):
     settings_brightness_slider.on_change = apply_display_settings
     settings_contrast_slider.on_change = apply_display_settings
     settings_overlay_slider.on_change = apply_display_settings
-    settings_fuel_unit_dd.on_change = apply_aviation_default_settings
-    settings_distance_unit_dd.on_change = apply_aviation_default_settings
-    settings_temperature_unit_dd.on_change = apply_aviation_default_settings
+    settings_fuel_unit_dd.on_select = apply_aviation_default_settings
+    settings_distance_unit_dd.on_select = apply_aviation_default_settings
+    settings_temperature_unit_dd.on_select = apply_aviation_default_settings
     settings_low_performance_switch.on_change = apply_performance_settings
-    settings_professional_info_switch.on_change = apply_professional_info_settings
     sync_settings_controls(update_page=False)
 
     IF_API_BASE_URL = "https://api.infiniteflight.com/public/v2"
+    IF_TRAFFIC_INTERVAL = 5
     IF_IDLE_TIMEOUT_SECONDS = 15 * 60
     IF_ERROR_LABELS = {
         0: "Ok",
@@ -16677,20 +15689,6 @@ def main(page: ft.Page):
         8: "Airport not found",
         9: "Exceeded maximum request size",
     }
-    IF_ATC_TYPES = {
-        0: "Ground",
-        1: "Tower",
-        2: "Unicom",
-        3: "Clearance",
-        4: "Approach",
-        5: "Departure",
-        6: "Center",
-        7: "ATIS",
-        8: "Aircraft",
-        9: "Recorded",
-        10: "Unknown",
-        11: "Unused",
-    }
     IF_WORLD_TYPES = {
         0: "Solo",
         1: "Casual",
@@ -16698,13 +15696,6 @@ def main(page: ft.Page):
         3: "Expert",
         4: "Private",
     }
-    IF_PILOT_STATES = {
-        0: "Active",
-        1: "Away in flight",
-        2: "Away parked",
-        3: "In background",
-    }
-
     def if_now() -> float:
         return time.time()
 
@@ -16718,79 +15709,35 @@ def main(page: ft.Page):
         except Exception:
             return "API error"
 
-    def if_config_data() -> dict:
-        if not infinite_flight_config_path.exists():
-            return {}
-        try:
-            data = json.loads(infinite_flight_config_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-    def if_env_api_key() -> str:
-        return os.environ.get("INFINITE_FLIGHT_API_KEY", "").strip()
-
     def if_local_api_key() -> str:
-        return str(if_config_data().get("api_key") or "").strip()
+        return read_api_key(infinite_flight_key_path)
 
-    def if_current_api_key(candidate: str = "") -> tuple[str, str]:
-        typed_key = (candidate or "").strip()
-        if typed_key:
-            return typed_key, "entered"
-        env_key = if_env_api_key()
-        if env_key:
-            return env_key, "environment"
-        local_key = if_local_api_key()
-        if local_key:
-            return local_key, "local config"
-        return "", "missing"
+    def if_clear_selection():
+        state.if_selected_flight = {}
+        state.if_selected_flight_plan = {}
+        state.if_selected_route_points = []
+        state.if_selected_route_start_label = ""
+        state.if_selected_route_end_label = ""
+        state.if_followed_flight_id = ""
 
-    def if_saved_key_hint() -> str:
-        if if_env_api_key():
-            return "Using INFINITE_FLIGHT_API_KEY from environment"
-        if if_local_api_key():
-            return "Saved local key available"
-        return "Enter API key or set INFINITE_FLIGHT_API_KEY"
-
-    def if_save_api_key_value(api_key: str) -> bool:
-        key = (api_key or "").strip()
-        if not key:
-            return False
-        payload = {
-            "api_key": key,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        infinite_flight_config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        return True
-
-    def if_clear_local_api_key():
-        try:
-            if infinite_flight_config_path.exists():
-                infinite_flight_config_path.unlink()
-        except Exception:
-            pass
-        state.if_connection_status = "Not connected"
+    def if_reset_connection():
+        nonlocal live_aircraft_catalog_checked_at
+        if_clear_selection()
         state.if_sessions = []
         state.if_selected_session_id = ""
         state.if_selected_session_name = ""
-        state.if_selected_flight = {}
-        state.if_selected_flight_plan = {}
         state.if_live_flights = []
-        state.if_selected_route_points = []
-        state.if_selected_route_label = ""
-        state.if_selected_route_start_label = ""
-        state.if_selected_route_end_label = ""
+        state.if_traffic_session = ""
         state.if_last_traffic_refresh = "Never"
-        state.if_live_refresh_enabled = False
         state.if_last_live_refresh_attempt = 0.0
-        state.if_active_atc = []
-        state.if_user_stats = {}
-        state.if_recent_activity = []
-        state.if_cache.clear()
-        state.if_cache_status = "Cleared"
-        state.if_last_request_status = "No request yet"
-        state.if_last_response_ms = "—"
+        state.if_traffic_retry_at = 0.0
+        state.if_atc_session = ""
+        state.if_atc_checked_at = 0.0
+        state.if_atc_markers = []
         state.if_last_error = ""
+        state.if_cache.clear()
+        live_aircraft_names.clear()
+        live_aircraft_catalog_checked_at = 0.0
 
     def if_cache_get(key: str, ttl_seconds: int):
         cached = state.if_cache.get(key)
@@ -16798,21 +15745,21 @@ def main(page: ft.Page):
             return None
         age = if_now() - float(cached.get("timestamp", 0.0) or 0.0)
         if age <= ttl_seconds:
-            state.if_cache_status = f"Cache hit: {key} ({age:.0f}s old)"
             return cached.get("data")
         return None
 
-    def if_cache_set(key: str, data: dict):
+    def if_cache_set(key: str, data: dict, *, requested_at: float):
+        now = if_now()
+        for expired in [name for name, entry in state.if_cache.items() if now - entry["timestamp"] > 600]:
+            state.if_cache.pop(expired, None)
         state.if_cache[key] = {
-            "timestamp": if_now(),
+            "timestamp": requested_at,
             "data": data,
         }
-        state.if_cache_status = f"Cache stored: {key}"
 
     def if_api_request(method: str, endpoint: str, body: Optional[dict] = None, cache_key: str = "", ttl_seconds: int = 0, force: bool = False):
         if state.if_last_activity_timestamp and if_now() - state.if_last_activity_timestamp > IF_IDLE_TIMEOUT_SECONDS and not force:
             state.if_polling_paused = True
-            state.if_last_request_status = "Paused by inactivity timeout"
             state.if_last_error = "No API refresh after 15 minutes idle. Press a button to resume."
             return None
 
@@ -16821,130 +15768,81 @@ def main(page: ft.Page):
             if cached is not None:
                 return cached
 
-        api_key, source = if_current_api_key()
+        api_key = if_local_api_key()
         if not api_key:
-            state.if_connection_status = "Not connected"
-            state.if_last_request_status = "Missing API key"
-            state.if_last_error = "Add an Infinite Flight API key or set INFINITE_FLIGHT_API_KEY."
+            state.if_last_error = "Save an Infinite Flight API key in Settings."
             return None
 
         url = IF_API_BASE_URL + endpoint
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "FMS-Sim-Desktop/7",
+            "User-Agent": f"FMS-Sim-Desktop/{FMS_VERSION}",
         }
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(body).encode("utf-8")
 
-        started = if_now()
         try:
+            requested_at = if_now()
             request = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+            request.add_unredirected_header("Authorization", f"Bearer {api_key}")
             with urllib.request.urlopen(request, timeout=8) as response:
                 raw = response.read().decode("utf-8")
                 payload = json.loads(raw) if raw else {}
-                elapsed_ms = int((if_now() - started) * 1000)
-                state.if_last_response_ms = f"{elapsed_ms} ms"
-                state.if_last_request_status = f"HTTP {getattr(response, 'status', 200)}"
                 state.if_last_error = ""
 
                 error_code = payload.get("errorCode") if isinstance(payload, dict) else None
                 if error_code not in (None, 0):
-                    state.if_last_request_status = if_error_label(error_code)
                     state.if_last_error = if_error_label(error_code)
-                    if int(error_code) == 4:
-                        state.if_connection_status = "Not authorized"
                     return None
 
-                state.if_connection_status = f"Connected ({source})"
                 if cache_key:
-                    if_cache_set(cache_key, payload)
+                    if_cache_set(cache_key, payload, requested_at=requested_at)
                 return payload
         except urllib.error.HTTPError as ex:
-            state.if_last_response_ms = f"{int((if_now() - started) * 1000)} ms"
             if ex.code == 401:
-                state.if_connection_status = "Not authorized"
-                state.if_last_request_status = "HTTP 401"
                 state.if_last_error = "Invalid or unauthorized API key."
             elif ex.code == 429:
-                state.if_last_request_status = "HTTP 429"
                 state.if_last_error = "Rate limit reached. Wait before refreshing again."
+                if cache_key.startswith("flights:"):
+                    retry_after = (ex.headers or {}).get("Retry-After", "")
+                    try:
+                        delay = int(retry_after)
+                    except ValueError:
+                        try:
+                            delay = parsedate_to_datetime(retry_after).timestamp() - if_now()
+                        except (ValueError, TypeError, OverflowError, OSError):
+                            delay = 60
+                    state.if_traffic_retry_at = if_now() + max(IF_TRAFFIC_INTERVAL, delay)
             else:
-                state.if_last_request_status = f"HTTP {ex.code}"
-                state.if_last_error = str(ex)
-        except urllib.error.URLError as ex:
-            state.if_last_response_ms = f"{int((if_now() - started) * 1000)} ms"
-            state.if_last_request_status = "Network error"
-            state.if_last_error = str(getattr(ex, "reason", ex))
+                state.if_last_error = f"Infinite Flight returned HTTP {ex.code}."
+        except urllib.error.URLError:
+            state.if_last_error = "Could not reach Infinite Flight."
         except TimeoutError:
-            state.if_last_response_ms = f"{int((if_now() - started) * 1000)} ms"
-            state.if_last_request_status = "Timeout"
             state.if_last_error = "Infinite Flight API request timed out."
-        except Exception as ex:
-            state.if_last_response_ms = f"{int((if_now() - started) * 1000)} ms"
-            state.if_last_request_status = "Request failed"
-            state.if_last_error = str(ex)
+        except Exception:
+            state.if_last_error = "Infinite Flight returned an unreadable response."
         return None
 
     def if_get_sessions(force: bool = False) -> List[dict]:
         payload = if_api_request("GET", "/sessions", cache_key="sessions", ttl_seconds=600, force=force)
         sessions = payload.get("result", []) if isinstance(payload, dict) else []
-        return sessions if isinstance(sessions, list) else []
-
-    def if_get_flights(session_id: str, force: bool = False) -> List[dict]:
-        if not session_id:
-            return []
-        payload = if_api_request("GET", f"/sessions/{session_id}/flights", cache_key=f"flights:{session_id}", ttl_seconds=15, force=force)
-        flights = payload.get("result", []) if isinstance(payload, dict) else []
-        return flights if isinstance(flights, list) else []
-
-    def if_get_atc(session_id: str, force: bool = False) -> List[dict]:
-        if not session_id:
-            return []
-        payload = if_api_request("GET", f"/sessions/{session_id}/atc", cache_key=f"atc:{session_id}", ttl_seconds=15, force=force)
-        atc = payload.get("result", []) if isinstance(payload, dict) else []
-        return atc if isinstance(atc, list) else []
+        return [session for session in sessions if isinstance(session, dict) and session.get("id")] if isinstance(sessions, list) else []
 
     def if_get_flight_plan(session_id: str, flight_id: str, force: bool = False) -> dict:
         if not session_id or not flight_id:
             return {}
-        payload = if_api_request("GET", f"/sessions/{session_id}/flights/{flight_id}/flightplan", cache_key=f"flightplan:{session_id}:{flight_id}", ttl_seconds=15, force=force)
+        session_path = urllib.parse.quote(session_id, safe="")
+        flight_path = urllib.parse.quote(flight_id, safe="")
+        payload = if_api_request("GET", f"/sessions/{session_path}/flights/{flight_path}/flightplan", cache_key=f"flightplan:{session_id}:{flight_id}", ttl_seconds=60, force=force)
         result = payload.get("result", {}) if isinstance(payload, dict) else {}
         return result if isinstance(result, dict) else {}
-
-    def if_get_user_stats(query: str, force: bool = False) -> dict:
-        raw = (query or "").strip()
-        if not raw:
-            return {}
-        if re.fullmatch(r"[0-9a-fA-F]{8}", raw):
-            body = {"userHashes": [raw.upper()]}
-        elif re.fullmatch(r"[0-9a-fA-F-]{32,36}", raw):
-            body = {"userIds": [raw]}
-        else:
-            body = {"discourseNames": [raw]}
-        payload = if_api_request("POST", "/users", body=body, cache_key=f"userstats:{raw.lower()}", ttl_seconds=300, force=force)
-        result = payload.get("result", []) if isinstance(payload, dict) else []
-        if isinstance(result, list) and result:
-            first = result[0]
-            return first if isinstance(first, dict) else {}
-        return {}
-
-    def if_get_user_flights(user_id: str, force: bool = False) -> List[dict]:
-        if not user_id:
-            return []
-        payload = if_api_request("GET", f"/users/{user_id}/flights?page=1", cache_key=f"userflights:{user_id}:1", ttl_seconds=300, force=force)
-        result = payload.get("result", {}) if isinstance(payload, dict) else {}
-        flights = result.get("data", []) if isinstance(result, dict) else []
-        return flights if isinstance(flights, list) else []
 
     def if_session_label(session: dict) -> str:
         world_type = IF_WORLD_TYPES.get(int(session.get("worldType", -1) or -1), "Server")
         name = str(session.get("name") or world_type or "Server").strip()
-        count = session.get("userCount", 0)
-        max_users = session.get("maxUsers", "—")
-        return f"{world_type} - {name} - {count}/{max_users}"
+        return name if name.casefold() == world_type.casefold() else f"{world_type} · {name}"
 
     def if_select_session(session_id: str) -> bool:
         selector = str(session_id or "").strip()
@@ -16990,7 +15888,7 @@ def main(page: ft.Page):
                     state.if_selected_session_id = str(session.get("id") or "")
                     state.if_selected_session_name = str(session.get("name") or "")
                     return
-        first = state.if_sessions[0]
+        first = next((session for session in state.if_sessions if session.get("worldType") == 3), state.if_sessions[0])
         state.if_selected_session_id = str(first.get("id") or "")
         state.if_selected_session_name = str(first.get("name") or "")
 
@@ -17000,19 +15898,11 @@ def main(page: ft.Page):
         except Exception:
             return fallback
 
-    def if_time_minutes(value) -> str:
-        try:
-            minutes = int(round(float(value or 0)))
-            hours, mins = divmod(minutes, 60)
-            return f"{hours}h {mins:02d}m"
-        except Exception:
-            return "—"
-
     def if_flight_matches_query(flight: dict, query: str) -> bool:
         q = (query or "").strip().lower()
         if not q:
             return False
-        for key in ("callsign", "username", "userId", "flightId"):
+        for key in ("callsign", "username", "displayName", "userId", "flightId"):
             value = str(flight.get(key) or "").strip().lower()
             if value and q in value:
                 return True
@@ -17043,7 +15933,7 @@ def main(page: ft.Page):
 
     def if_flight_display_name(flight: dict) -> str:
         callsign = str(flight.get("callsign") or "").strip()
-        username = str(flight.get("username") or "").strip()
+        username = str(flight.get("username") or flight.get("displayName") or "").strip()
         if callsign and username:
             return f"{callsign} / {username}"
         return callsign or username or str(flight.get("flightId") or "Unknown flight")[:8]
@@ -17054,7 +15944,7 @@ def main(page: ft.Page):
             heading = if_float(flight.get("track"))
         return float(heading or 0.0) % 360.0
 
-    def if_plan_points_and_label(plan: dict) -> tuple[List[tuple[float, float]], str, str, str]:
+    def if_plan_points(plan: dict) -> tuple[List[tuple[float, float]], str, str]:
         points: List[tuple[float, float]] = []
         names: List[str] = []
 
@@ -17064,7 +15954,7 @@ def main(page: ft.Page):
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                location = item.get("location") if isinstance(item.get("location"), dict) else {}
+                location = item.get("location") if isinstance(item.get("location"), dict) else item
                 lat = if_float(location.get("latitude"))
                 lon = if_float(location.get("longitude"))
                 if lat is not None and lon is not None and if_valid_lat_lon(lat, lon):
@@ -17078,24 +15968,8 @@ def main(page: ft.Page):
                 if isinstance(children, list):
                     walk(children)
 
-        walk(plan.get("flightPlanItems") if isinstance(plan, dict) else [])
-        if len(points) >= 2:
-            label = f"{names[0]} to {names[-1]}"
-        elif points:
-            label = names[0]
-        else:
-            label = "No route points available"
-        start_label = names[0] if names else ""
-        end_label = names[-1] if len(names) > 1 else ""
-        return points, label, start_label, end_label
-
-    def if_route_distance_label(points: List[tuple[float, float]]) -> str:
-        if len(points) < 2:
-            return "Route unavailable"
-        distance = 0.0
-        for start, end in zip(points[:-1], points[1:]):
-            distance += great_circle_distance_nm_points(start, end)
-        return f"{distance:.0f} NM"
+        walk(plan.get("flightPlanItems") or plan.get("waypointDetails") or [])
+        return points, names[0] if names else "", names[-1] if len(names) > 1 else ""
 
     def if_find_live_flight(flight_id: str) -> dict:
         target = str(flight_id or "")
@@ -17104,1501 +15978,424 @@ def main(page: ft.Page):
                 return flight
         return {}
 
-    def if_load_live_traffic(force: bool = True, mark_activity: bool = True) -> List[dict]:
+    live_aircraft_names = {}
+    live_aircraft_catalog_checked_at = 0.0
+    aircraft_assets = asset_abs_path_if_exists("live-aircraft/aliases.json")
+    live_airports = None
+    available_shapes = {path.stem for path in aircraft_assets.parent.glob("*.svg")} if aircraft_assets else set()
+    aliases = {}
+    if aircraft_assets:
+        for model, names in json.loads(aircraft_assets.read_text(encoding="utf-8")).items():
+            aliases.update({name: model for name in (model, *names)})
+
+    def if_aircraft_name(flight: dict) -> str:
+        return str(flight.get("aircraftName") or flight.get("aircraftType")
+                   or live_aircraft_names.get(str(flight.get("aircraftId") or "")) or "")
+
+    def live_airport_record(code):
+        nonlocal live_airports
+        if not code:
+            return None
+        known = lookup_airport_record(code)
+        if known:
+            return known
+        if live_airports is None:
+            index = asset_abs_path_if_exists("live-aircraft/airports.json")
+            live_airports = json.loads(index.read_text(encoding="utf-8")) if index else {}
+        entry = live_airports.get(code)
+        if entry:
+            return {"name": entry[0], "lat": entry[1], "lon": entry[2]}
+        return None
+
+    airline_by_prefix = {code: name for name, code in AIRLINE_CALLSIGNS.items() if name != "Generic"}
+    airline_by_prefix.update({
+        "AFR": "Air France", "AAL": "American Airlines", "ANA": "ANA", "BAW": "British Airways",
+        "CPA": "Cathay Pacific", "DAL": "Delta Air Lines", "DLH": "Lufthansa", "ETD": "Etihad Airways",
+        "IRA": "Iran Air", "ITY": "ITA Airways", "QFA": "Qantas", "QTR": "Qatar Airways",
+        "SIA": "Singapore Airlines", "SWA": "Southwest Airlines", "THY": "Turkish Airlines",
+        "UAL": "United Airlines", "VIR": "Virgin Atlantic", "UAE": "Emirates", "IRM": "Mahan Air",
+    })
+
+    def if_airline_name(flight):
+        name = flight.get("airlineName") or flight.get("airline")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        callsign = re.sub(r"\s+", "", str(flight.get("callsign") or "").upper())
+        for length in (3, 2):
+            name = airline_by_prefix.get(callsign[:length])
+            if name and callsign[length:length + 1].isdigit():
+                return name
+        return "Airline unavailable"
+
+    def if_aircraft_shape(flight: dict, *, selected=False) -> str:
+        name = re.sub(r"^(AIRBUS|BOEING|BOMBARDIER|CIRRUS|LOCKHEED MARTIN)\s+", "", if_aircraft_name(flight).upper())
+        code = re.sub(r"[^A-Z0-9]", "", name)
+        shape = aliases.get(code, code)
+        model = shape if shape in available_shapes else "Unidentified"
+        suffix = "-selected" if selected else ""
+        return f"live-aircraft/{model}{suffix}.svg"
+
+    async def refresh_live_plan(*, render=True):
+        session = state.if_selected_session_id
+        flight_id = str(state.if_selected_flight.get("flightId") or "")
+        if not session or not flight_id:
+            return
+        async with live_request_lock:
+            if not state.overview_live or session != state.if_selected_session_id or flight_id != str(state.if_selected_flight.get("flightId") or ""):
+                return
+            traffic_error = state.if_last_error
+            plan = await asyncio.to_thread(if_get_flight_plan, session, flight_id)
+            if not state.if_polling_paused:
+                state.if_last_error = traffic_error
+            if session != state.if_selected_session_id or flight_id != str(state.if_selected_flight.get("flightId") or ""):
+                return
+            if plan:
+                state.if_selected_flight_plan = plan
+                points, first, last = if_plan_points(plan)
+                state.if_selected_route_points = points
+                state.if_selected_route_start_label = first
+                state.if_selected_route_end_label = last
+        if render and state.overview_live and state.selected_tab_index == 0 and live_render_callback:
+            await live_render_callback()
+
+    async def refresh_live_traffic(*, mark_activity=False):
+        nonlocal live_aircraft_catalog_checked_at
         if mark_activity:
             if_mark_activity()
-        state.if_last_live_refresh_attempt = if_now()
-        if not state.if_sessions:
-            state.if_sessions = if_get_sessions(force=force)
-        if_ensure_selected_session()
-        if not state.if_selected_session_id:
-            state.if_live_flights = []
-            state.if_last_request_status = "No session selected"
-            state.if_last_error = "Select or load an Infinite Flight server/session first."
-            return []
-        flights = [flight for flight in if_get_flights(state.if_selected_session_id, force=force) if if_flight_position(flight)]
-        state.if_live_flights = flights
-        state.if_last_traffic_refresh = datetime.now().strftime("%H:%M:%S")
-        if state.if_selected_flight:
-            selected_id = str(state.if_selected_flight.get("flightId") or "")
-            updated = if_find_live_flight(selected_id)
-            if updated:
-                state.if_selected_flight = updated
+        async with live_request_lock:
+            if not state.overview_live or state.selected_tab_index != 0:
+                return
+            if if_now() < state.if_traffic_retry_at:
+                return
+            if if_now() - state.if_last_live_refresh_attempt < IF_TRAFFIC_INTERVAL and state.if_traffic_session == state.if_selected_session_id and not mark_activity:
+                return
+            state.if_last_live_refresh_attempt = if_now()
+            if not if_local_api_key():
+                state.if_last_error = "Save an Infinite Flight API key in Settings."
             else:
-                state.if_selected_flight = {}
-                state.if_selected_flight_plan = {}
-                state.if_selected_route_points = []
-                state.if_selected_route_label = ""
-                state.if_selected_route_start_label = ""
-                state.if_selected_route_end_label = ""
-        state.if_last_request_status = f"Traffic loaded - {len(flights)} aircraft"
-        return flights
+                sessions = await asyncio.to_thread(if_get_sessions)
+                if sessions:
+                    state.if_sessions = sessions
+                    if_ensure_selected_session()
+                session = state.if_selected_session_id
+                if session:
+                    session_path = urllib.parse.quote(session, safe="")
+                    state.if_last_live_refresh_attempt = if_now()
+                    payload = await asyncio.to_thread(
+                        if_api_request, "GET", f"/sessions/{session_path}/flights", None, f"flights:{session}", IF_TRAFFIC_INTERVAL,
+                    )
+                    if session == state.if_selected_session_id and isinstance(payload, dict) and isinstance(payload.get("result"), list):
+                        state.if_live_flights = [
+                            flight for flight in payload["result"]
+                            if isinstance(flight, dict) and flight.get("flightId")
+                            and if_flight_position(flight)
+                        ]
+                        state.if_traffic_session = session
+                        state.if_last_traffic_refresh = datetime.now().strftime("%H:%M:%S")
+                        if state.if_selected_flight:
+                            selected = if_find_live_flight(str(state.if_selected_flight.get("flightId") or ""))
+                            if selected:
+                                state.if_selected_flight = selected
+                            else:
+                                if_clear_selection()
+                                state.if_last_error = "The selected aircraft left this session."
+                        if state.overview_live and state.selected_tab_index == 0 and live_render_callback:
+                            await live_render_callback()
+                    if not state.if_last_error and if_now() - live_aircraft_catalog_checked_at >= 600:
+                        live_aircraft_catalog_checked_at = if_now()
+                        traffic_error = state.if_last_error
+                        cached = await asyncio.to_thread(if_api_request, "GET", "/aircraft", None, "aircraft", 600)
+                        if isinstance(cached, dict) and isinstance(cached.get("result"), list):
+                            live_aircraft_names.update({
+                                str(item["id"]): str(item.get("name") or "")
+                                for item in cached["result"] if isinstance(item, dict) and item.get("id")
+                            })
+                        if not state.if_polling_paused:
+                            state.if_last_error = traffic_error
+                    if not state.if_last_error and live_map_process and (
+                        state.if_atc_session != session or if_now() - state.if_atc_checked_at >= 60
+                    ):
+                        await refresh_live_atc(session, session_path)
+                elif not state.if_last_error:
+                    state.if_last_error = "Infinite Flight returned no available servers."
+        if state.overview_live and state.selected_tab_index == 0 and live_render_callback:
+            await live_render_callback()
+            if state.if_selected_flight:
+                await refresh_live_plan()
 
-    def if_select_map_flight(flight_id: str):
-        if_mark_activity()
-        flight = if_find_live_flight(flight_id)
-        if not flight:
-            state.if_last_request_status = "Flight not found"
-            state.if_last_error = "Refresh traffic and select the aircraft again."
+    async def refresh_live_clicked(e=None):
+        await refresh_live_traffic(mark_activity=True)
+
+    live_map_style = "dark"
+
+    async def refresh_live_atc(session, session_path):
+        state.if_atc_session = session
+        state.if_atc_checked_at = if_now()
+        try:
+            payload = await asyncio.to_thread(if_api_request, "GET", f"/sessions/{session_path}/atc", None, f"atc:{session}", 60)
+            facilities = payload.get("result") if isinstance(payload, dict) else None
+            if session != state.if_selected_session_id or not isinstance(facilities, list):
+                return
+            labels = {0: "Ground", 1: "Tower", 3: "Clearance", 4: "Approach", 5: "Departure", 6: "Center"}
+            markers = {}
+            for facility in facilities:
+                if not isinstance(facility, dict):
+                    continue
+                facility_type = str(facility.get("type", "")).strip()
+                label = labels.get(int(facility_type)) if facility_type.isdecimal() else None
+                if not label:
+                    continue
+                code = str(facility.get("airportName") or "").strip().upper()
+                airport = live_airport_record(code)
+                position = (airport["lat"], airport["lon"]) if airport else if_flight_position(facility)
+                if position and position != (0, 0):
+                    markers.setdefault((position, code), set()).add(label)
+            state.if_atc_markers = [
+                {"position": [lon, lat], "label": " · ".join(filter(None, [code, ", ".join(sorted(types))]))}
+                for ((lat, lon), code), types in markers.items()
+            ]
+        finally:
+            if not state.if_polling_paused:
+                state.if_last_error = ""
+
+    def live_flight_timing(flight, plan, arrival=""):
+        if not arrival:
+            _, arrival = flight_airports(flight, plan, state.if_selected_route_start_label, state.if_selected_route_end_label)
+        airport = live_airport_record(arrival)
+        position = if_flight_position(flight)
+        remaining = (
+            great_circle_distance_nm_points(position, (airport["lat"], airport["lon"]))
+            if position and airport else None
+        )
+        return flight_timing(flight, plan, format_hours_to_hm, remaining_nm=remaining)
+
+    def live_map_snapshot():
+        flight = state.if_selected_flight
+        plan = state.if_selected_flight_plan
+        departure, arrival = flight_airports(flight, plan, state.if_selected_route_start_label, state.if_selected_route_end_label)
+
+        def airport(code):
+            record = live_airport_record(code) or {}
+            return {"code": code, "name": record.get("name", ""), "position": [record["lon"], record["lat"]] if record else None}
+
+        def aircraft(item):
+            lat, lon = if_flight_position(item)
+            flight_id = str(item["flightId"])
+            return {
+                "id": flight_id, "position": [lon, lat], "heading": if_flight_heading(item),
+                "name": if_flight_display_name(item),
+                "callsign": str(item.get("callsign") or ""),
+                "shape": Path(if_aircraft_shape(item)).stem,
+            }
+
+        details = None
+        if flight:
+            airline = if_airline_name(flight)
+            model = if_aircraft_name(flight)
+            photo = aircraft_profile_path(model)
+            details = {
+                **aircraft(flight), "airline": airline, "model": model,
+                "pilot": str(flight.get("username") or flight.get("displayName") or ""),
+                "callsign": str(flight.get("callsign") or ""),
+                "altitude": if_number(flight.get("altitude")), "speed": if_number(flight.get("speed")),
+                "vertical": if_number(flight.get("verticalSpeed")), "photo": photo or "",
+                "departure": airport(departure), "arrival": airport(arrival),
+                "timing": live_flight_timing(flight, plan, arrival),
+                "route": [[lon, lat] for lat, lon in state.if_selected_route_points],
+            }
+        return {
+            "style": live_map_style, "selected": details,
+            "atc": state.if_atc_markers if state.if_atc_session == state.if_selected_session_id else [],
+            "following": bool(state.if_followed_flight_id),
+            "flights": [aircraft(item) for item in state.if_live_flights],
+            "session": state.if_selected_session_id,
+            "servers": [{"id": str(item["id"]), "name": if_session_label(item)} for item in state.if_sessions],
+            "status": state.if_last_error or (
+                f"{len(state.if_live_flights):,} aircraft · {state.if_last_traffic_refresh}"
+                if state.if_traffic_session else "Connecting to Infinite Flight…"
+            ),
+            "needsKey": not infinite_flight_key_path.is_file(),
+        }
+
+    def handle_live_map_action(action):
+        nonlocal live_map_style
+        if not isinstance(action, dict):
             return
-        state.if_selected_flight = flight
-        state.if_user_stats = {}
-        state.if_recent_activity = []
-        plan = if_get_flight_plan(state.if_selected_session_id, str(flight.get("flightId") or ""), force=True)
-        state.if_selected_flight_plan = plan or {}
-        points, label, start_label, end_label = if_plan_points_and_label(plan or {})
-        state.if_selected_route_points = points
-        state.if_selected_route_label = label
-        state.if_selected_route_start_label = start_label
-        state.if_selected_route_end_label = end_label
-        state.if_last_request_status = "Aircraft selected"
-        state.if_last_error = "" if points else "This aircraft has no retrievable filed flight plan, so only its live position is shown."
+        kind, value = action.get("type"), action.get("value")
+        if not isinstance(kind, str) or not isinstance(value, (str, int, type(None))):
+            return
+        if_mark_activity()
+        if kind == "select":
+            flight = if_find_live_flight(value)
+            if flight:
+                if_clear_selection()
+                state.if_selected_flight = flight
+                page.run_task(refresh_live_plan)
+        elif kind == "close":
+            if_clear_selection()
+        elif kind == "follow" and state.if_selected_flight:
+            state.if_followed_flight_id = "" if state.if_followed_flight_id else str(state.if_selected_flight["flightId"])
+        elif kind == "server" and if_select_session(value):
+            if_clear_selection()
+            state.if_live_flights = []
+            state.if_traffic_session = ""
+            page.run_task(refresh_live_clicked)
+        elif kind == "refresh":
+            page.run_task(refresh_live_clicked)
+        elif kind == "settings":
+            go_to_tab(10)
+        elif kind == "style" and value in ("dark", "positron", "bright"):
+            live_map_style = value
+        if live_render_callback and live_map_process:
+            page.run_task(live_render_callback)
+
+    def change_overview_mode(live: bool):
+        state.overview_live = live
+        if not live:
+            if_clear_selection()
+            state.if_live_flights = []
+            state.if_traffic_session = ""
+            state.if_last_error = ""
+        refresh_ui()
+        if live:
+            page.run_task(refresh_live_clicked)
+
+    def compact_settings_field(field):
+        field.dense = True
+        field.width = None
+        field.expand = True
+        field.content_padding = ft.Padding.symmetric(horizontal=10, vertical=7)
+        if isinstance(field, ft.TextField):
+            field.counter = ft.Container(height=0)
+        return field
+
+    def compact_settings_row(*controls):
+        return ft.Row(list(controls), spacing=7, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+    def compact_settings_card(title, *controls):
+        card = glass_card(title, ft.Column(list(controls), spacing=6,
+                                          horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
+        card.padding = 10
+        card.content.spacing = 6
+        return card
+
 
     def settings_page():
         sync_settings_controls(update_page=False)
 
-        display_controls = ft.Column(
-            spacing=14,
-            controls=[
-                ft.Text("Switch between the default night shell and an experimental softer daytime shell. Cards stay dark for readability.", size=12, color=tokens["muted"]),
-                settings_daylight_switch,
-                ft.Divider(height=8, opacity=0.10),
-                ft.Text("Brightness", size=13, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                ft.Row(wrap=True, spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[settings_brightness_slider, settings_brightness_value_text]),
-                ft.Text("Contrast", size=13, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                ft.Row(wrap=True, spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[settings_contrast_slider, settings_contrast_value_text]),
-                ft.Text("Airline color overlay", size=13, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                ft.Row(wrap=True, spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[settings_overlay_slider, settings_overlay_value_text]),
-                ft.Divider(height=8, opacity=0.10),
-                ft.Text("Global background image", size=13, weight=ft.FontWeight.W_700, color=tokens["text"]),
-                ft.Text("Night mode uses the global image. Daytime display can use its own background file.", size=12, color=tokens["muted"]),
-                ft.Row(
-                    wrap=True,
-                    spacing=10,
-                    controls=[
-                        ft.OutlinedButton("Upload Background", icon=ft.Icons.UPLOAD_FILE, on_click=upload_global_background),
-                    ],
-                ),
-                settings_background_status_text,
-                ft.Row(
-                    wrap=True,
-                    spacing=10,
-                    controls=[
-                        ft.OutlinedButton("Reset Display", on_click=reset_display_settings),
-                    ],
-                ),
-            ],
-        )
+        def slider_row(label, slider, value):
+            slider.width = None
+            slider.expand = True
+            value.size = 11
+            return ft.Container(height=35, content=compact_settings_row(
+                ft.Text(label, size=11, width=77, color=tokens["text"]), slider, value,
+            ))
 
-        airline_tools = ft.Column(
-            spacing=12,
-            controls=[
-                ft.Text("Add an airline to the app list and then place its logo in the generated logo path.", size=12, color=tokens["muted"]),
-                settings_add_airline_btn,
-                ft.Divider(height=8, opacity=0.10),
-                ft.Text("Remove an airline that was added from Settings. Built-in airlines are protected.", size=12, color=tokens["muted"]),
-                ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[settings_remove_airline_dd, settings_remove_airline_btn]),
-                settings_airline_status_text,
-                settings_custom_airlines_text,
-                ft.Container(
-                    padding=12,
-                    border_radius=14,
-                    bgcolor=tokens["subpanel"],
-                    border=ft.border.all(1, tokens["card_border"]),
-                    content=ft.Text(
-                        "Logo format: assets/airlines/logos/airline_name.png. The app will show text fallback until the logo file exists.",
-                        size=11,
-                        color=tokens["muted"],
-                    ),
-                ),
-            ],
-        )
+        def compact_status(control):
+            control.max_lines = 2
+            control.overflow = ft.TextOverflow.ELLIPSIS
+            return control
 
-        aviation_defaults = ft.Column(
-            spacing=12,
-            controls=[
-                ft.Text("Set the app's preferred planning units. These values are saved for future sessions.", size=12, color=tokens["muted"]),
-                ft.Row(wrap=True, spacing=12, run_spacing=12, controls=[settings_fuel_unit_dd, settings_distance_unit_dd, settings_temperature_unit_dd]),
-            ],
+        display_card = compact_settings_card(
+            "Display", settings_daylight_switch,
+            slider_row("Brightness", settings_brightness_slider, settings_brightness_value_text),
+            slider_row("Contrast", settings_contrast_slider, settings_contrast_value_text),
+            slider_row("Airline tint", settings_overlay_slider, settings_overlay_value_text),
+            compact_settings_row(ft.OutlinedButton("Reset Display", on_click=reset_display_settings)),
         )
-
-        data_tools = ft.Column(
-            spacing=12,
-            controls=[
-                ft.Text("Export saved data, upload a calendar JSON, or reset profile statistics without deleting calendar flights.", size=12, color=tokens["muted"]),
-                ft.Row(
-                    wrap=True,
-                    spacing=10,
-                    run_spacing=10,
-                    controls=[
-                        ft.ElevatedButton("Upload Calendar", icon=ft.Icons.UPLOAD_FILE, on_click=import_calendar_data, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ft.ElevatedButton("Export Calendar", on_click=export_calendar_data, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ft.ElevatedButton("Export Profile", on_click=export_profile_data, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ft.OutlinedButton("Reset Profile", on_click=open_reset_profile_confirmation),
-                    ],
-                ),
-                settings_calendar_import_status_text,
-                settings_export_status_text,
-            ],
+        volume_card = compact_settings_card(
+            "Volume", slider_row("Sound level", settings_volume_slider, settings_volume_value_text),
+            compact_settings_row(settings_mute_switch, ft.OutlinedButton("Apply Volume", on_click=apply_audio_settings)),
         )
-
-        professional_info_tools = ft.Column(
-            spacing=12,
-            controls=[
-                ft.Text("Choose how much operational planning detail is shown on the Takeoff and Landing pages.", size=12, color=tokens["muted"]),
-                ft.Container(
-                    padding=ft.padding.symmetric(horizontal=12, vertical=10),
-                    border_radius=16,
-                    bgcolor=tokens["subpanel"],
-                    border=ft.border.all(1, tokens["card_border"]),
-                    content=ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.Text("Normal information", size=12, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                            settings_professional_info_switch,
-                            ft.Text("Professional information", size=12, weight=ft.FontWeight.W_800, color="#FF8A80"),
-                        ],
-                    ),
-                ),
-                settings_professional_info_status_text,
-            ],
+        aviation_card = compact_settings_card(
+            "Aviation Defaults",
+            compact_settings_row(compact_settings_field(settings_fuel_unit_dd),
+                                 compact_settings_field(settings_distance_unit_dd)),
+            compact_settings_row(compact_settings_field(settings_temperature_unit_dd)),
         )
-
-        performance_tools = ft.Column(
-            spacing=12,
-            controls=[
-                ft.Text("Reduce live visual updates when you want the app to run lighter.", size=12, color=tokens["muted"]),
-                settings_low_performance_switch,
-                settings_performance_status_text,
-            ],
+        airline_card = compact_settings_card(
+            "Airline Management",
+            compact_settings_row(settings_add_airline_btn),
+            compact_settings_row(compact_settings_field(settings_remove_airline_dd), settings_remove_airline_btn),
+            compact_status(settings_airline_status_text),
         )
-
-        volume_tools = ft.Column(
-            spacing=12,
-            controls=[
-                ft.Text("Control the app sound level for login and cabin audio cues.", size=12, color=tokens["muted"]),
-                ft.Row(wrap=True, spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[settings_volume_slider, settings_volume_value_text]),
-                settings_mute_switch,
-                ft.OutlinedButton("Apply Volume", on_click=apply_audio_settings),
-            ],
+        data_card = compact_settings_card(
+            "Data Management",
+            compact_settings_row(
+                ft.OutlinedButton("Upload Calendar", expand=True, on_click=import_calendar_data),
+                ft.OutlinedButton("Export Calendar", expand=True, on_click=export_calendar_data),
+            ),
+            compact_settings_row(
+                ft.OutlinedButton("Export Profile", expand=True, on_click=export_profile_data),
+                ft.OutlinedButton("Reset Profile", expand=True, on_click=open_reset_profile_confirmation),
+            ),
+            compact_status(settings_calendar_import_status_text),
+            compact_status(settings_export_status_text),
         )
-
-        def if_settings_tile(label: str, value: str, width: int = 150) -> ft.Control:
-            return ft.Container(
-                width=width,
-                height=72,
-                padding=ft.padding.symmetric(horizontal=12, vertical=9),
-                border_radius=14,
-                bgcolor=tokens["subpanel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                content=ft.Column(
-                    tight=True,
-                    spacing=3,
-                    controls=[
-                        ft.Text(label, size=10, color=tokens["muted"], weight=ft.FontWeight.W_700),
-                        ft.Text(value or "-", size=14, weight=ft.FontWeight.W_900, color=tokens["text"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                    ],
-                ),
-            )
 
         if_api_key_tf = ft.TextField(
-            label="Infinite Flight API key",
-            hint_text=if_saved_key_hint(),
-            width=340,
-            password=True,
-            can_reveal_password=True,
-            border_radius=16,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            color=tokens["text"],
-            border_color=tokens["card_border"],
-            focused_border_color=tokens["accent"],
-            label_style=ft.TextStyle(color=tokens["muted"]),
-        )
-        if_session_dd = ft.Dropdown(
-            label="Server / session",
-            value=state.if_selected_session_id or None,
-            options=if_session_options(),
-            width=310,
-            border_radius=16,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            color=tokens["text"],
-            border_color=tokens["card_border"],
-            label_style=ft.TextStyle(color=tokens["muted"]),
-            disabled=not bool(state.if_sessions),
+            label="Infinite Flight API key", password=True, border_radius=16, filled=True,
+            bgcolor=tokens["input_bg"], color=tokens["text"],
         )
 
-        def clear_if_route_selection():
-            state.if_selected_flight = {}
-            state.if_selected_flight_plan = {}
-            state.if_selected_route_points = []
-            state.if_selected_route_label = ""
-            state.if_selected_route_start_label = ""
-            state.if_selected_route_end_label = ""
-
-        def set_if_session_from_settings(e=None):
-            if e is None or not getattr(e, "control", None):
-                return
-            selected = if_select_session(e.control.value or "")
-            if not selected:
-                state.if_last_request_status = "Server selection failed"
-                state.if_last_error = f"Could not match selected server: {e.control.value}"
-                refresh_ui()
-                return
-            clear_if_route_selection()
-            state.if_live_flights = []
-            if_load_live_traffic(force=True)
-            refresh_ui()
-
-        if_session_dd.on_change = set_if_session_from_settings
-
-        def test_if_connection(e=None):
-            if_mark_activity()
-            typed_key = (if_api_key_tf.value or "").strip()
-            if typed_key:
-                if_save_api_key_value(typed_key)
-            state.if_sessions = if_get_sessions(force=True)
-            if_ensure_selected_session()
-            if state.if_sessions:
-                state.if_connection_status = f"Connected - {len(state.if_sessions)} sessions"
-                if_load_live_traffic(force=True)
-                show_snack("Infinite Flight API connection ready.")
-            else:
-                state.if_live_flights = []
-                show_snack("Infinite Flight API connection did not return sessions.")
-            refresh_ui()
-
-        def save_if_key(e=None):
+        async def save_if_key(e):
             key = (if_api_key_tf.value or "").strip()
             if not key:
-                state.if_last_error = "Enter an API key before saving."
-                state.if_last_request_status = "No key entered"
-                refresh_ui()
+                show_snack("Enter an Infinite Flight API key before saving.")
                 return
-            try:
-                if_save_api_key_value(key)
-                state.if_last_request_status = "API key saved locally"
-                state.if_last_error = ""
-                show_snack("Infinite Flight API key saved locally.")
-            except Exception as ex:
-                state.if_last_request_status = "Could not save API key"
-                state.if_last_error = str(ex)
-            refresh_ui()
+            async with live_request_lock:
+                try:
+                    write_api_key(infinite_flight_key_path, key)
+                except (OSError, AttributeError):
+                    show_snack("Windows could not save the Infinite Flight API key.")
+                    return
+                if_reset_connection()
+            refresh_active_page()
+            show_snack("Infinite Flight API key saved.")
 
-        def clear_if_key(e=None):
-            if_clear_local_api_key()
-            show_snack("Local Infinite Flight API key cleared.")
-            refresh_ui()
+        async def clear_if_key(e):
+            async with live_request_lock:
+                try:
+                    infinite_flight_key_path.unlink(missing_ok=True)
+                except OSError:
+                    show_snack("Windows could not remove the Infinite Flight API key.")
+                    return
+                if_reset_connection()
+            refresh_active_page()
+            show_snack("Infinite Flight API key removed.")
 
-        def refresh_if_sessions(e=None):
-            if_mark_activity()
-            state.if_sessions = if_get_sessions(force=True)
-            if_ensure_selected_session()
-            refresh_ui()
-
-        def refresh_if_traffic(e=None):
-            if_load_live_traffic(force=True)
-            refresh_ui()
-
-        def select_if_server_type(world_type_name: str):
-            if not state.if_sessions:
-                state.if_sessions = if_get_sessions(force=True)
-            selected = if_select_session(world_type_name)
-            if selected:
-                clear_if_route_selection()
-                state.if_live_flights = []
-                if_load_live_traffic(force=True)
-            else:
-                state.if_last_request_status = "Server unavailable"
-                state.if_last_error = f"No active {world_type_name} server was returned by the API."
-            refresh_ui()
-
-        def toggle_if_live_refresh(e=None):
-            state.if_live_refresh_enabled = bool(getattr(getattr(e, "control", None), "value", False))
-            if state.if_live_refresh_enabled:
-                if_mark_activity()
-                if_load_live_traffic(force=True)
-                show_snack("Live traffic refresh enabled.")
-            else:
-                show_snack("Live traffic refresh paused.")
-            refresh_ui()
-
-        selected_session = next((session for session in state.if_sessions if str(session.get("id") or "") == str(state.if_selected_session_id or "")), {})
-        selected_world = IF_WORLD_TYPES.get(int(selected_session.get("worldType", -1) or -1), "")
-
-        def if_server_button(label: str) -> ft.Control:
-            active = selected_world == label
-            if active:
-                return ft.ElevatedButton(label, on_click=lambda e, value=label: select_if_server_type(value), bgcolor=tokens["accent"], color=ft.Colors.WHITE)
-            return ft.OutlinedButton(label, on_click=lambda e, value=label: select_if_server_type(value))
-
-        if_live_refresh_switch = ft.Switch(label="Live refresh (15s)", value=state.if_live_refresh_enabled)
-        if_live_refresh_switch.on_change = toggle_if_live_refresh
-        if_key_source = if_current_api_key()[1]
-        if_key_source_label = "Environment variable" if if_key_source == "environment" else "Local config" if if_key_source == "local config" else "Not saved"
-        infinite_flight_tools = ft.Column(
-            spacing=12,
-            controls=[
-                ft.Container(
-                    padding=12,
-                    border_radius=14,
-                    bgcolor=ft.Colors.with_opacity(0.12, tokens["accent"]),
-                    border=ft.border.all(1, ft.Colors.with_opacity(0.22, tokens["accent"])),
-                    content=ft.Text(
-                        "Simulator use only. Not for real-world aviation, dispatch, navigation, or flight operations.",
-                        size=12,
-                        weight=ft.FontWeight.W_800,
-                        color=tokens["text"],
-                    ),
-                ),
-                ft.Row(
-                    wrap=True,
-                    spacing=10,
-                    run_spacing=10,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        if_settings_tile("Status", state.if_connection_status, 200),
-                        if_settings_tile("API key source", if_key_source_label, 170),
-                        if_settings_tile("Aircraft loaded", str(len(state.if_live_flights)), 145),
-                        if_settings_tile("Last refresh", state.if_last_traffic_refresh, 145),
-                    ],
-                ),
-                ft.Row(
-                    wrap=True,
-                    spacing=10,
-                    run_spacing=10,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        if_api_key_tf,
-                        ft.ElevatedButton("Test Connection", on_click=test_if_connection, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ft.OutlinedButton("Save Key", on_click=save_if_key),
-                        ft.OutlinedButton("Clear API Key", on_click=clear_if_key),
-                    ],
-                ),
-                ft.Row(
-                    wrap=True,
-                    spacing=10,
-                    run_spacing=10,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        if_server_button("Casual"),
-                        if_server_button("Training"),
-                        if_server_button("Expert"),
-                        if_session_dd,
-                        ft.ElevatedButton("Refresh Traffic", on_click=refresh_if_traffic, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                        ft.OutlinedButton("Refresh Sessions", on_click=refresh_if_sessions),
-                        if_live_refresh_switch,
-                    ],
-                ),
-                ft.Text(
-                    state.if_last_error or "Live Flights uses these settings for its map and selected server.",
-                    size=12,
-                    color="#FF8080" if state.if_last_error else tokens["muted"],
-                ),
-            ],
+        key_saved = bool(if_local_api_key())
+        api_card = compact_settings_card(
+            "Infinite Flight Live API",
+            ft.Text("API key saved" if key_saved else "Add your key to enable Live Flights.",
+                    size=12, color=tokens["muted"]),
+            compact_settings_row(compact_settings_field(if_api_key_tf)),
+            compact_settings_row(
+                ft.FilledButton("Save Key", on_click=save_if_key),
+                ft.OutlinedButton("Clear API Key", on_click=clear_if_key, disabled=not key_saved),
+            ),
         )
-
+        performance_card = compact_settings_card("Performance", settings_low_performance_switch)
         return build_tab_page(
             "SETTINGS",
             ft.Container(
-                expand=True,
-                padding=18,
-                content=ft.Column(
-                    expand=True,
-                    scroll=ft.ScrollMode.AUTO,
-                    spacing=16,
-                    controls=[
-                        ft.Row(
-                            wrap=False,
-                            spacing=16,
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                            controls=[
-                                ft.Column(
-                                    width=876,
-                                    spacing=16,
-                                    controls=[
-                                        ft.Container(width=876, content=glass_card("Infinite Flight Live API", infinite_flight_tools)),
-                                        ft.Row(
-                                            spacing=16,
-                                            vertical_alignment=ft.CrossAxisAlignment.START,
-                                            controls=[
-                                                ft.Column(
-                                                    width=430,
-                                                    spacing=16,
-                                                    controls=[
-                                                        ft.Container(width=430, content=glass_card("Data Management", data_tools)),
-                                                        ft.Container(width=430, content=glass_card("Information Detail", professional_info_tools)),
-                                                    ],
-                                                ),
-                                                ft.Container(width=430, content=glass_card("Aviation Defaults", aviation_defaults)),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                                ft.Column(
-                                    width=430,
-                                    spacing=16,
-                                    controls=[
-                                        ft.Container(width=430, content=glass_card("Display", display_controls)),
-                                        ft.Container(width=430, content=glass_card("Performance", performance_tools)),
-                                    ],
-                                ),
-                                ft.Column(
-                                    width=430,
-                                    spacing=16,
-                                    controls=[
-                                        ft.Container(width=430, content=glass_card("Airline Management", airline_tools)),
-                                        ft.Container(width=430, content=glass_card("Volume", volume_tools)),
-                                    ],
-                                ),
-                            ],
-                        ),
-                    ],
-                ),
+                expand=True, padding=GAP,
+                content=ft.Row([
+                    ft.Column([performance_card], expand=True, spacing=GAP,
+                              horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                    ft.Column([display_card, volume_card, aviation_card], expand=True, spacing=GAP,
+                              horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                    ft.Column([api_card, airline_card, data_card], expand=True, spacing=GAP,
+                              horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                ], expand=True, spacing=GAP, vertical_alignment=ft.CrossAxisAlignment.START),
             ),
-            overlay_opacity=0.08,
         )
 
-
-    def infinite_flight_page():
-        def set_session_from_dropdown(e=None):
-            if e is not None and getattr(e, "control", None):
-                if_select_session(e.control.value or "")
-                state.if_selected_flight = {}
-                state.if_selected_flight_plan = {}
-                state.if_active_atc = []
-                state.if_recent_activity = []
-                state.if_user_stats = {}
-                refresh_ui()
-
-        api_key_tf = ft.TextField(
-            label="Infinite Flight API key",
-            hint_text=if_saved_key_hint(),
-            width=360,
-            password=True,
-            can_reveal_password=True,
-            border_radius=16,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            color=tokens["text"],
-            border_color=tokens["card_border"],
-            focused_border_color=tokens["accent"],
-            label_style=ft.TextStyle(color=tokens["muted"]),
-        )
-        session_dd = ft.Dropdown(
-            label="Server / session",
-            value=state.if_selected_session_id or None,
-            options=if_session_options(),
-            width=310,
-            border_radius=16,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            color=tokens["text"],
-            border_color=tokens["card_border"],
-            label_style=ft.TextStyle(color=tokens["muted"]),
-            disabled=not bool(state.if_sessions),
-        )
-        session_dd.on_change = set_session_from_dropdown
-        search_tf = ft.TextField(
-            label="Username, user ID, flight ID, or callsign",
-            hint_text="Example: DLH400 or your Infinite Flight username",
-            width=370,
-            border_radius=16,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            color=tokens["text"],
-            border_color=tokens["card_border"],
-            focused_border_color=tokens["accent"],
-            label_style=ft.TextStyle(color=tokens["muted"]),
-        )
-
-        def test_connection(e=None):
-            if_mark_activity()
-            typed_key = (api_key_tf.value or "").strip()
-            if typed_key:
-                if_save_api_key_value(typed_key)
-            sessions = if_get_sessions(force=True)
-            state.if_sessions = sessions
-            if sessions and not state.if_selected_session_id:
-                first = sessions[0]
-                state.if_selected_session_id = str(first.get("id") or "")
-                state.if_selected_session_name = str(first.get("name") or "")
-            if sessions:
-                state.if_connection_status = f"Connected - {len(sessions)} sessions"
-                show_snack("Infinite Flight API connection ready.")
-            else:
-                show_snack("Infinite Flight API connection did not return sessions.")
-            refresh_ui()
-
-        def save_key(e=None):
-            key = (api_key_tf.value or "").strip()
-            if not key:
-                state.if_last_error = "Enter an API key before saving."
-                state.if_last_request_status = "No key entered"
-                refresh_ui()
-                return
-            try:
-                if_save_api_key_value(key)
-                state.if_last_request_status = "API key saved locally"
-                state.if_last_error = ""
-                show_snack("Infinite Flight API key saved locally.")
-            except Exception as ex:
-                state.if_last_request_status = "Could not save API key"
-                state.if_last_error = str(ex)
-            refresh_ui()
-
-        def clear_key(e=None):
-            if_clear_local_api_key()
-            show_snack("Local Infinite Flight API key cleared.")
-            refresh_ui()
-
-        def refresh_sessions(e=None):
-            if_mark_activity()
-            sessions = if_get_sessions(force=True)
-            state.if_sessions = sessions
-            if sessions and not state.if_selected_session_id:
-                first = sessions[0]
-                state.if_selected_session_id = str(first.get("id") or "")
-                state.if_selected_session_name = str(first.get("name") or "")
-            refresh_ui()
-
-        def find_live_flight(e=None):
-            if_mark_activity()
-            query = (search_tf.value or "").strip()
-            if not query:
-                state.if_last_request_status = "Search required"
-                state.if_last_error = "Enter a username, user ID, flight ID, or callsign."
-                refresh_ui()
-                return
-            if not state.if_sessions:
-                state.if_sessions = if_get_sessions(force=False)
-            if not state.if_selected_session_id and state.if_sessions:
-                first = state.if_sessions[0]
-                state.if_selected_session_id = str(first.get("id") or "")
-                state.if_selected_session_name = str(first.get("name") or "")
-            flights = if_get_flights(state.if_selected_session_id, force=True)
-            match = next((flight for flight in flights if if_flight_matches_query(flight, query)), None)
-            state.if_selected_flight = match or {}
-            state.if_selected_flight_plan = {}
-            state.if_recent_activity = []
-            state.if_user_stats = {}
-            if match:
-                state.if_last_request_status = "Active flight found"
-                state.if_last_error = ""
-                show_snack("Active Infinite Flight flight found.")
-            else:
-                stats = if_get_user_stats(query, force=False)
-                state.if_user_stats = stats
-                state.if_last_request_status = "No active flight found"
-                state.if_last_error = "No active flight matched this search in the selected session."
-            refresh_ui()
-
-        def preview_flight_plan(e=None):
-            if_mark_activity()
-            flight_id = str(state.if_selected_flight.get("flightId") or "")
-            if not flight_id:
-                state.if_last_request_status = "No selected flight"
-                state.if_last_error = "Find an active flight before previewing the flight plan."
-                refresh_ui()
-                return
-            state.if_selected_flight_plan = if_get_flight_plan(state.if_selected_session_id, flight_id, force=True)
-            if state.if_selected_flight_plan:
-                state.if_last_request_status = "Flight plan loaded"
-                state.if_last_error = ""
-            else:
-                state.if_last_request_status = "No flight plan"
-                state.if_last_error = "This active flight has no filed flight plan or it could not be retrieved."
-            refresh_ui()
-
-        def refresh_atc(e=None):
-            if_mark_activity()
-            if not state.if_selected_session_id:
-                state.if_last_request_status = "No session selected"
-                state.if_last_error = "Select a server/session before loading ATC."
-                refresh_ui()
-                return
-            state.if_active_atc = if_get_atc(state.if_selected_session_id, force=True)
-            state.if_last_request_status = f"ATC loaded - {len(state.if_active_atc)} facilities"
-            state.if_last_error = ""
-            refresh_ui()
-
-        def load_recent_activity(e=None):
-            if_mark_activity()
-            user_id = str(state.if_selected_flight.get("userId") or state.if_user_stats.get("userId") or "")
-            query = (search_tf.value or "").strip()
-            if not user_id and query:
-                state.if_user_stats = if_get_user_stats(query, force=True)
-                user_id = str(state.if_user_stats.get("userId") or "")
-            if not user_id:
-                state.if_last_request_status = "No user selected"
-                state.if_last_error = "Find an active flight or search a user before loading recent activity."
-                refresh_ui()
-                return
-            state.if_recent_activity = if_get_user_flights(user_id, force=True)
-            state.if_last_request_status = f"Recent activity loaded - {len(state.if_recent_activity)} rows"
-            state.if_last_error = ""
-            refresh_ui()
-
-        search_tf.on_submit = find_live_flight
-
-        def info_tile(label: str, value: str, width: int = 150) -> ft.Control:
-            return ft.Container(
-                width=width,
-                height=76,
-                padding=ft.padding.symmetric(horizontal=12, vertical=10),
-                border_radius=14,
-                bgcolor=tokens["subpanel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                content=ft.Column(
-                    tight=True,
-                    spacing=3,
-                    controls=[
-                        ft.Text(label, size=10, color=tokens["muted"], weight=ft.FontWeight.W_700),
-                        ft.Text(value or "—", size=15, weight=ft.FontWeight.W_900, color=tokens["text"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                    ],
-                ),
-            )
-
-        def plan_item_names(items: List[dict]) -> List[str]:
-            names: List[str] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name") or item.get("identifier") or "").strip()
-                if name:
-                    names.append(name)
-                children = item.get("children")
-                if isinstance(children, list):
-                    names.extend(plan_item_names(children))
-            return names
-
-        def connection_card() -> ft.Control:
-            key_source = if_current_api_key()[1]
-            key_source_label = "Environment variable" if key_source == "environment" else "Local config" if key_source == "local config" else "Not saved"
-            return glass_card(
-                "Infinite Flight Live API",
-                ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Container(
-                            padding=12,
-                            border_radius=14,
-                            bgcolor=ft.Colors.with_opacity(0.12, tokens["accent"]),
-                            border=ft.border.all(1, ft.Colors.with_opacity(0.22, tokens["accent"])),
-                            content=ft.Text(
-                                "Simulator use only. Not for real-world aviation, dispatch, navigation, or flight operations.",
-                                size=12,
-                                weight=ft.FontWeight.W_800,
-                                color=tokens["text"],
-                            ),
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=12,
-                            run_spacing=12,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                info_tile("Status", state.if_connection_status, 210),
-                                info_tile("API key source", key_source_label, 190),
-                                info_tile("Idle timeout", "Paused" if state.if_polling_paused else "15 min", 150),
-                            ],
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
-                            run_spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                api_key_tf,
-                                ft.ElevatedButton("Test Connection", on_click=test_connection, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                ft.OutlinedButton("Save Key", on_click=save_key),
-                                ft.OutlinedButton("Clear API Key", on_click=clear_key),
-                            ],
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
-                            run_spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                session_dd,
-                                ft.OutlinedButton("Refresh Sessions", on_click=refresh_sessions),
-                            ],
-                        ),
-                    ],
-                ),
-            )
-
-        def search_card() -> ft.Control:
-            result = "Active" if state.if_selected_flight else "Not active / not searched"
-            if state.if_user_stats and not state.if_selected_flight:
-                result = "User found, no active flight"
-            return glass_card(
-                "Live Flight Search",
-                ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Text("Search the selected Infinite Flight server by callsign, username, user ID, or flight ID.", size=12, color=tokens["muted"]),
-                        search_tf,
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
-                            controls=[
-                                ft.ElevatedButton("Find Live Flight", on_click=find_live_flight, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                ft.OutlinedButton("Load Recent Activity", on_click=load_recent_activity),
-                            ],
-                        ),
-                        info_tile("Result", result, 240),
-                    ],
-                ),
-            )
-
-        def current_flight_card() -> ft.Control:
-            flight = state.if_selected_flight
-            if not flight:
-                content = ft.Text("No active simulated flight selected yet.", size=12, color=tokens["muted"])
-            else:
-                content = ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Callsign", str(flight.get("callsign") or "—")),
-                            info_tile("Username", str(flight.get("username") or flight.get("userId") or "—"), 190),
-                            info_tile("Pilot state", IF_PILOT_STATES.get(int(flight.get("pilotState", 0) or 0), "—"), 170),
-                        ]),
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Altitude", f"{if_number(flight.get('altitude'))} ft"),
-                            info_tile("Speed", f"{if_number(flight.get('speed'))} kt"),
-                            info_tile("Heading", f"{if_number(flight.get('heading'))}°"),
-                        ]),
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Latitude", if_number(flight.get("latitude"), 4)),
-                            info_tile("Longitude", if_number(flight.get("longitude"), 4)),
-                            info_tile("Last report", str(flight.get("lastReport") or "—"), 190),
-                        ]),
-                    ],
-                )
-            return glass_card("Current Simulated Flight", content)
-
-        def flight_plan_card() -> ft.Control:
-            plan = state.if_selected_flight_plan
-            if not plan:
-                content = ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Text("Preview only. This does not import anything into the existing FMS route or Map page.", size=12, color=tokens["muted"]),
-                        ft.ElevatedButton("Preview Flight Plan", on_click=preview_flight_plan, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                    ],
-                )
-            else:
-                items = plan.get("flightPlanItems") if isinstance(plan.get("flightPlanItems"), list) else []
-                names = plan_item_names(items)
-                shown = "  •  ".join(names[:18]) if names else "No waypoint names returned"
-                content = ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Flight plan ID", str(plan.get("flightPlanId") or "—"), 260),
-                            info_tile("Type", "IFR" if plan.get("flightPlanType") == 1 else "VFR" if plan.get("flightPlanType") == 0 else "—", 120),
-                            info_tile("Last update", str(plan.get("lastUpdate") or "—"), 190),
-                        ]),
-                        ft.Container(
-                            padding=12,
-                            border_radius=14,
-                            bgcolor=tokens["subpanel"],
-                            border=ft.border.all(1, tokens["card_border"]),
-                            content=ft.Text(shown, size=12, color=tokens["text"]),
-                        ),
-                        ft.Text("Preview only. Nothing is written into FMS route, Map, Log, Calendar, or Profile.", size=11, color=tokens["muted"]),
-                    ],
-                )
-            return glass_card("Flight Plan Preview", content)
-
-        def atc_card() -> ft.Control:
-            rows = []
-            for facility in state.if_active_atc[:8]:
-                facility_type = IF_ATC_TYPES.get(int(facility.get("type", 10) or 10), "Unknown")
-                airport = facility.get("airportName") or "Center"
-                rows.append(
-                    ft.Container(
-                        padding=10,
-                        border_radius=12,
-                        bgcolor=tokens["subpanel"],
-                        border=ft.border.all(1, tokens["card_border"]),
-                        content=ft.Row(
-                            spacing=10,
-                            controls=[
-                                ft.Container(width=84, content=ft.Text(str(airport), size=12, weight=ft.FontWeight.W_800, color=tokens["text"])),
-                                ft.Container(width=96, content=ft.Text(facility_type, size=12, color=tokens["muted"])),
-                                ft.Container(expand=True, content=ft.Text(str(facility.get("username") or facility.get("userId") or "—"), size=12, color=tokens["text"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)),
-                            ],
-                        ),
-                    )
-                )
-            if not rows:
-                rows = [ft.Text("No ATC data loaded for this session yet.", size=12, color=tokens["muted"])]
-            return glass_card(
-                "Active ATC Preview",
-                ft.Column(
-                    spacing=10,
-                    controls=[
-                        ft.Row(wrap=True, spacing=10, controls=[
-                            ft.ElevatedButton("Refresh ATC", on_click=refresh_atc, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                            info_tile("Facilities", str(len(state.if_active_atc)), 120),
-                        ]),
-                        *rows,
-                    ],
-                ),
-            )
-
-        def recent_activity_card() -> ft.Control:
-            rows = []
-            for entry in state.if_recent_activity[:5]:
-                route = f"{entry.get('originAirport') or '—'} → {entry.get('destinationAirport') or '—'}"
-                subtitle = f"{entry.get('server') or '—'} - {if_time_minutes(entry.get('totalTime'))} - {entry.get('landingCount', 0)} landing(s)"
-                rows.append(
-                    ft.Container(
-                        padding=10,
-                        border_radius=12,
-                        bgcolor=tokens["subpanel"],
-                        border=ft.border.all(1, tokens["card_border"]),
-                        content=ft.Column(
-                            tight=True,
-                            spacing=3,
-                            controls=[
-                                ft.Text(route, size=12, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                                ft.Text(subtitle, size=11, color=tokens["muted"]),
-                            ],
-                        ),
-                    )
-                )
-            if not rows:
-                rows = [ft.Text("Recent Infinite Flight activity preview is empty. This does not sync to the FMS Log or Profile.", size=12, color=tokens["muted"])]
-            return glass_card("Recent IF Activity Preview", ft.Column(spacing=10, controls=rows))
-
-        def diagnostics_card() -> ft.Control:
-            idle_age = "Not started"
-            if state.if_last_activity_timestamp:
-                idle_age = f"{int(max(0, if_now() - state.if_last_activity_timestamp))}s since last action"
-            return glass_card(
-                "API Diagnostics",
-                ft.Column(
-                    spacing=10,
-                    controls=[
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Last request", state.if_last_request_status, 220),
-                            info_tile("Response time", state.if_last_response_ms, 150),
-                            info_tile("Cache", state.if_cache_status, 240),
-                        ]),
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Activity", idle_age, 220),
-                            info_tile("Polling", "Paused" if state.if_polling_paused else "Manual / visible only", 200),
-                        ]),
-                        ft.Text(state.if_last_error or "No API error reported.", size=12, color="#FF8080" if state.if_last_error else tokens["muted"]),
-                    ],
-                ),
-            )
-
-        return build_tab_page(
-            "LIVE API",
-            ft.Container(
-                expand=True,
-                padding=18,
-                content=ft.Column(
-                    expand=True,
-                    scroll=ft.ScrollMode.AUTO,
-                    spacing=16,
-                    controls=[
-                        connection_card(),
-                        ft.Row(
-                            wrap=True,
-                            spacing=16,
-                            run_spacing=16,
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                            controls=[
-                                ft.Container(width=430, content=search_card()),
-                                ft.Container(width=660, content=current_flight_card()),
-                            ],
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=16,
-                            run_spacing=16,
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                            controls=[
-                                ft.Container(width=540, content=flight_plan_card()),
-                                ft.Container(width=540, content=atc_card()),
-                            ],
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=16,
-                            run_spacing=16,
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                            controls=[
-                                ft.Container(width=540, content=recent_activity_card()),
-                                ft.Container(width=540, content=diagnostics_card()),
-                            ],
-                        ),
-                    ],
-                ),
-            ),
-            overlay_opacity=0.08,
-        )
-
-    def infinite_flight_page():
-        def info_tile(label: str, value: str, width: int = 150) -> ft.Control:
-            return ft.Container(
-                width=width,
-                height=72,
-                padding=ft.padding.symmetric(horizontal=12, vertical=9),
-                border_radius=14,
-                bgcolor=tokens["subpanel"],
-                border=ft.border.all(1, tokens["card_border"]),
-                content=ft.Column(
-                    tight=True,
-                    spacing=3,
-                    controls=[
-                        ft.Text(label, size=10, color=tokens["muted"], weight=ft.FontWeight.W_700),
-                        ft.Text(value or "-", size=14, weight=ft.FontWeight.W_900, color=tokens["text"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                    ],
-                ),
-            )
-
-        def set_session_from_dropdown(e=None):
-            if e is not None and getattr(e, "control", None):
-                selected = if_select_session(e.control.value or "")
-                if not selected:
-                    state.if_last_request_status = "Server selection failed"
-                    state.if_last_error = f"Could not match selected server: {e.control.value}"
-                    refresh_ui()
-                    return
-                state.if_selected_flight = {}
-                state.if_selected_flight_plan = {}
-                state.if_selected_route_points = []
-                state.if_selected_route_label = ""
-                state.if_selected_route_start_label = ""
-                state.if_selected_route_end_label = ""
-                state.if_live_flights = []
-                if_load_live_traffic(force=True)
-                refresh_ui()
-
-        api_key_tf = ft.TextField(
-            label="Infinite Flight API key",
-            hint_text=if_saved_key_hint(),
-            width=340,
-            password=True,
-            can_reveal_password=True,
-            border_radius=16,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            color=tokens["text"],
-            border_color=tokens["card_border"],
-            focused_border_color=tokens["accent"],
-            label_style=ft.TextStyle(color=tokens["muted"]),
-        )
-        session_dd = ft.Dropdown(
-            label="Server / session",
-            value=state.if_selected_session_id or None,
-            options=if_session_options(),
-            width=310,
-            border_radius=16,
-            filled=True,
-            bgcolor=tokens["input_bg"],
-            color=tokens["text"],
-            border_color=tokens["card_border"],
-            label_style=ft.TextStyle(color=tokens["muted"]),
-            disabled=not bool(state.if_sessions),
-        )
-        session_dd.on_change = set_session_from_dropdown
-
-        def test_connection(e=None):
-            if_mark_activity()
-            typed_key = (api_key_tf.value or "").strip()
-            if typed_key:
-                if_save_api_key_value(typed_key)
-            state.if_sessions = if_get_sessions(force=True)
-            if_ensure_selected_session()
-            if state.if_sessions:
-                state.if_connection_status = f"Connected - {len(state.if_sessions)} sessions"
-                if_load_live_traffic(force=True)
-                show_snack("Infinite Flight API connection ready.")
-            else:
-                state.if_live_flights = []
-                show_snack("Infinite Flight API connection did not return sessions.")
-            refresh_ui()
-
-        def save_key(e=None):
-            key = (api_key_tf.value or "").strip()
-            if not key:
-                state.if_last_error = "Enter an API key before saving."
-                state.if_last_request_status = "No key entered"
-                refresh_ui()
-                return
-            try:
-                if_save_api_key_value(key)
-                state.if_last_request_status = "API key saved locally"
-                state.if_last_error = ""
-                show_snack("Infinite Flight API key saved locally.")
-            except Exception as ex:
-                state.if_last_request_status = "Could not save API key"
-                state.if_last_error = str(ex)
-            refresh_ui()
-
-        def clear_key(e=None):
-            if_clear_local_api_key()
-            show_snack("Local Infinite Flight API key cleared.")
-            refresh_ui()
-
-        def refresh_sessions(e=None):
-            if_mark_activity()
-            state.if_sessions = if_get_sessions(force=True)
-            if_ensure_selected_session()
-            refresh_ui()
-
-        def refresh_traffic(e=None):
-            if_load_live_traffic(force=True)
-            refresh_ui()
-
-        def select_server_type(world_type_name: str):
-            if not state.if_sessions:
-                state.if_sessions = if_get_sessions(force=True)
-            selected = if_select_session(world_type_name)
-            if selected:
-                state.if_selected_flight = {}
-                state.if_selected_flight_plan = {}
-                state.if_selected_route_points = []
-                state.if_selected_route_label = ""
-                state.if_selected_route_start_label = ""
-                state.if_selected_route_end_label = ""
-                state.if_live_flights = []
-                if_load_live_traffic(force=True)
-            else:
-                state.if_last_request_status = "Server unavailable"
-                state.if_last_error = f"No active {world_type_name} server was returned by the API."
-            refresh_ui()
-
-        def toggle_live_refresh(e=None):
-            state.if_live_refresh_enabled = bool(getattr(getattr(e, "control", None), "value", False))
-            if state.if_live_refresh_enabled:
-                if_mark_activity()
-                if_load_live_traffic(force=True)
-                show_snack("Live traffic refresh enabled.")
-            else:
-                show_snack("Live traffic refresh paused.")
-            refresh_ui()
-
-        def select_aircraft(flight_id: str):
-            if_select_map_flight(flight_id)
-            refresh_ui()
-
-        def connection_card() -> ft.Control:
-            key_source = if_current_api_key()[1]
-            key_source_label = "Environment variable" if key_source == "environment" else "Local config" if key_source == "local config" else "Not saved"
-            live_refresh_switch = ft.Switch(label="Live refresh (15s)", value=state.if_live_refresh_enabled)
-            live_refresh_switch.on_change = toggle_live_refresh
-            selected_session = next((session for session in state.if_sessions if str(session.get("id") or "") == str(state.if_selected_session_id or "")), {})
-            selected_world = IF_WORLD_TYPES.get(int(selected_session.get("worldType", -1) or -1), "")
-
-            def server_button(label: str) -> ft.Control:
-                active = selected_world == label
-                if active:
-                    return ft.ElevatedButton(label, on_click=lambda e, value=label: select_server_type(value), bgcolor=tokens["accent"], color=ft.Colors.WHITE)
-                return ft.OutlinedButton(label, on_click=lambda e, value=label: select_server_type(value))
-
-            return glass_card(
-                "Infinite Flight Live API",
-                ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Container(
-                            padding=12,
-                            border_radius=14,
-                            bgcolor=ft.Colors.with_opacity(0.12, tokens["accent"]),
-                            border=ft.border.all(1, ft.Colors.with_opacity(0.22, tokens["accent"])),
-                            content=ft.Text(
-                                "Simulator use only. Not for real-world aviation, dispatch, navigation, or flight operations.",
-                                size=12,
-                                weight=ft.FontWeight.W_800,
-                                color=tokens["text"],
-                            ),
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
-                            run_spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                info_tile("Status", state.if_connection_status, 200),
-                                info_tile("API key source", key_source_label, 170),
-                                info_tile("Aircraft loaded", str(len(state.if_live_flights)), 145),
-                                info_tile("Last refresh", state.if_last_traffic_refresh, 145),
-                            ],
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
-                            run_spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                api_key_tf,
-                                ft.ElevatedButton("Test Connection", on_click=test_connection, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                ft.OutlinedButton("Save Key", on_click=save_key),
-                                ft.OutlinedButton("Clear API Key", on_click=clear_key),
-                            ],
-                        ),
-                        ft.Row(
-                            wrap=True,
-                            spacing=10,
-                            run_spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                server_button("Casual"),
-                                server_button("Training"),
-                                server_button("Expert"),
-                                session_dd,
-                                ft.ElevatedButton("Refresh Traffic", on_click=refresh_traffic, bgcolor=tokens["accent"], color=ft.Colors.WHITE),
-                                ft.OutlinedButton("Refresh Sessions", on_click=refresh_sessions),
-                                live_refresh_switch,
-                            ],
-                        ),
-                    ],
-                ),
-            )
-
-        def aircraft_marker(flight: dict, selected: bool) -> ft.Control:
-            fill = tokens["accent"] if selected else "#50E3C2"
-            heading = if_flight_heading(flight)
-            rotation = math.radians(heading)
-            aircraft_icon_src = asset_rel_path_if_exists("icons/nav/live_aircraft_north.png")
-            icon_size = 28 if selected else 24
-            icon_left = 5 if selected else 7
-            icon_top = 5 if selected else 7
-            icon_control = (
-                ft.Image(
-                    src=aircraft_icon_src,
-                    width=icon_size,
-                    height=icon_size,
-                    fit=ft.BoxFit.CONTAIN,
-                    color=fill,
-                    color_blend_mode=ft.BlendMode.SRC_IN,
-                    rotate=rotation,
-                    left=icon_left,
-                    top=icon_top,
-                )
-                if aircraft_icon_src
-                else ft.Icon(
-                    ft.Icons.FLIGHT,
-                    size=25 if selected else 21,
-                    color=fill,
-                    rotate=math.radians(heading - 45.0),
-                    left=6 if selected else 8,
-                    top=6 if selected else 8,
-                )
-            )
-            return ft.Container(
-                width=38,
-                height=38,
-                tooltip=if_flight_display_name(flight),
-                on_click=lambda e, fid=str(flight.get("flightId") or ""): select_aircraft(fid),
-                ink=True,
-                border_radius=999,
-                content=ft.Stack(
-                    width=38,
-                    height=38,
-                    controls=[
-                        ft.Container(
-                            left=5,
-                            top=5,
-                            width=28,
-                            height=28,
-                            border_radius=999,
-                            bgcolor=ft.Colors.with_opacity(0.12 if selected else 0.04, fill),
-                            border=ft.border.all(1.5, ft.Colors.with_opacity(0.55 if selected else 0.16, fill)),
-                            shadow=ft.BoxShadow(
-                                blur_radius=12 if selected else 4,
-                                spread_radius=0,
-                                color=ft.Colors.with_opacity(0.35 if selected else 0.18, fill),
-                                offset=ft.Offset(0, 0),
-                            ),
-                        ),
-                        icon_control,
-                    ],
-                ),
-            )
-
-        def route_endpoint_marker(label: str, color: str) -> ft.Control:
-            return ft.Container(
-                width=112,
-                height=34,
-                alignment=ft.Alignment(0, 0),
-                border_radius=999,
-                bgcolor=tokens["panel"],
-                border=ft.border.all(1, color),
-                content=ft.Text(label, size=10, weight=ft.FontWeight.W_800, color=tokens["text"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-            )
-
-        def traffic_map_card() -> ft.Control:
-            if ftm is None:
-                return glass_card(
-                    "Live Traffic Map",
-                    ft.Text("flet-map is not installed, so the live traffic map cannot render in this build.", size=12, color=tokens["muted"]),
-                )
-
-            tile_url, map_attribution, active_map_label = active_maptiler_tile_url()
-            layers = [
-                ftm.TileLayer(url_template=tile_url),
-                ftm.SimpleAttribution(text=map_attribution, on_click=lambda e: e.page.launch_url("https://carto.com/")),
-            ]
-
-            selected_id = str(state.if_selected_flight.get("flightId") or "")
-            selected_position = if_flight_position(state.if_selected_flight) if state.if_selected_flight else None
-            route_points = state.if_selected_route_points or []
-
-            if len(route_points) >= 2:
-                layers.append(
-                    ftm.PolylineLayer(
-                        polylines=[
-                            ftm.PolylineMarker(
-                                coordinates=[ftm.MapLatitudeLongitude(lat, lon) for lat, lon in route_points],
-                                color=ft.Colors.with_opacity(0.28, tokens["accent"]),
-                                stroke_width=8,
-                                border_color=ft.Colors.with_opacity(0.10, ft.Colors.WHITE),
-                                border_stroke_width=1,
-                            ),
-                            ftm.PolylineMarker(
-                                coordinates=[ftm.MapLatitudeLongitude(lat, lon) for lat, lon in route_points],
-                                color=tokens["accent"],
-                                stroke_width=3.2,
-                            )
-                        ]
-                    )
-                )
-
-            marker_limit = 700
-            visible_flights = state.if_live_flights[:marker_limit]
-            markers = []
-            for flight in visible_flights:
-                position = if_flight_position(flight)
-                if not position:
-                    continue
-                fid = str(flight.get("flightId") or "")
-                markers.append(
-                    ftm.Marker(
-                        coordinates=ftm.MapLatitudeLongitude(position[0], position[1]),
-                        width=38,
-                        height=38,
-                        alignment=ft.Alignment(0, 0),
-                        content=aircraft_marker(flight, fid == selected_id),
-                    )
-                )
-
-            if len(route_points) >= 2:
-                markers.extend(
-                    [
-                        ftm.Marker(
-                            coordinates=ftm.MapLatitudeLongitude(route_points[0][0], route_points[0][1]),
-                            width=112,
-                            height=34,
-                            alignment=ft.Alignment(0, 1),
-                            content=route_endpoint_marker(state.if_selected_route_start_label or "START", tokens["accent"]),
-                        ),
-                        ftm.Marker(
-                            coordinates=ftm.MapLatitudeLongitude(route_points[-1][0], route_points[-1][1]),
-                            width=112,
-                            height=34,
-                            alignment=ft.Alignment(0, 1),
-                            content=route_endpoint_marker(state.if_selected_route_end_label or "END", "#50E3C2"),
-                        ),
-                    ]
-                )
-
-            if markers:
-                layers.append(ftm.MarkerLayer(markers=markers))
-
-            center = ftm.MapLatitudeLongitude(25.0, 10.0)
-            zoom = 2.2
-            if selected_position:
-                center = ftm.MapLatitudeLongitude(selected_position[0], selected_position[1])
-                zoom = 4.0
-
-            world_map = ftm.Map(
-                expand=True,
-                initial_center=center,
-                initial_zoom=zoom,
-                min_zoom=2.0,
-                max_zoom=10.0,
-                bgcolor="#020617",
-                keep_alive=True,
-                interaction_configuration=ftm.InteractionConfiguration(flags=ftm.InteractionFlag.ALL),
-                layers=layers,
-            )
-
-            footer_text = f"{len(state.if_live_flights)} valid aircraft loaded from {state.if_selected_session_name or 'selected session'}."
-            if len(state.if_live_flights) > marker_limit:
-                footer_text += f" Showing first {marker_limit} for performance."
-            footer_text += f" Map style: {active_map_label}."
-
-            return glass_card(
-                "Live Traffic Map",
-                ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Row(
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Text("Click an aircraft to load its filed route and flight details.", size=12, color=tokens["muted"]),
-                                ft.Text(footer_text, size=11, color=tokens["muted"], text_align=ft.TextAlign.RIGHT),
-                            ],
-                        ),
-                        ft.Container(
-                            height=820,
-                            border_radius=16,
-                            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                            border=ft.border.all(1, tokens["card_border"]),
-                            content=ft.Stack(
-                                expand=True,
-                                controls=[
-                                    world_map,
-                                    ft.Container(
-                                        right=14,
-                                        top=14,
-                                        width=382,
-                                        content=selected_flight_card(),
-                                    ),
-                                ],
-                            ),
-                        ),
-                    ],
-                ),
-                expand=True,
-            )
-
-        def selected_flight_card() -> ft.Control:
-            flight = state.if_selected_flight
-            if not flight:
-                content = ft.Column(
-                    spacing=10,
-                    controls=[
-                        ft.Text("Select an aircraft marker on the map.", size=12, color=tokens["muted"]),
-                        info_tile("Aircraft loaded", str(len(state.if_live_flights)), 170),
-                        info_tile("Selected route", "None", 170),
-                    ],
-                )
-            else:
-                position = if_flight_position(flight)
-                route_points = state.if_selected_route_points or []
-                route_label = state.if_selected_route_label or "No route available"
-                distance_label = if_route_distance_label(route_points)
-                content = ft.Column(
-                    spacing=12,
-                    controls=[
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Callsign", str(flight.get("callsign") or "-"), 150),
-                            info_tile("Username", str(flight.get("username") or flight.get("userId") or "-"), 190),
-                        ]),
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Altitude", f"{if_number(flight.get('altitude'))} ft", 150),
-                            info_tile("Speed", f"{if_number(flight.get('speed'))} kt", 150),
-                            info_tile("Heading", f"{if_number(flight.get('heading'))} deg", 150),
-                        ]),
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Latitude", if_number(position[0] if position else None, 4), 150),
-                            info_tile("Longitude", if_number(position[1] if position else None, 4), 150),
-                            info_tile("Route distance", distance_label, 170),
-                        ]),
-                        ft.Container(
-                            padding=12,
-                            border_radius=14,
-                            bgcolor=tokens["subpanel"],
-                            border=ft.border.all(1, tokens["card_border"]),
-                            content=ft.Column(
-                                tight=True,
-                                spacing=4,
-                                controls=[
-                                    ft.Text("Filed route", size=10, color=tokens["muted"], weight=ft.FontWeight.W_700),
-                                    ft.Text(route_label, size=13, weight=ft.FontWeight.W_900, color=tokens["text"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                                    ft.Text(
-                                        "Route line is drawn only from the selected aircraft's Infinite Flight flight plan.",
-                                        size=11,
-                                        color=tokens["muted"],
-                                    ),
-                                ],
-                            ),
-                        ),
-                        ft.Text(f"Last report: {flight.get('lastReport') or '-'}", size=11, color=tokens["muted"]),
-                    ],
-                )
-            return ft.Container(
-                padding=14,
-                border_radius=16,
-                bgcolor=ft.Colors.with_opacity(0.92, tokens["panel"]),
-                border=ft.border.all(1, tokens["card_border"]),
-                shadow=ft.BoxShadow(
-                    blur_radius=18,
-                    spread_radius=1,
-                    color=ft.Colors.with_opacity(0.22, ft.Colors.BLACK),
-                    offset=ft.Offset(0, 6),
-                ),
-                content=ft.Column(
-                    tight=True,
-                    spacing=10,
-                    controls=[
-                        ft.Text("Selected Aircraft", size=13, weight=ft.FontWeight.W_800, color=tokens["text"]),
-                        ft.Divider(height=8, opacity=0.12),
-                        content,
-                    ],
-                ),
-            )
-
-        def diagnostics_card() -> ft.Control:
-            idle_age = "Not started"
-            if state.if_last_activity_timestamp:
-                idle_age = f"{int(max(0, if_now() - state.if_last_activity_timestamp))}s since last action"
-            return glass_card(
-                "API Diagnostics",
-                ft.Column(
-                    spacing=10,
-                    controls=[
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Last request", state.if_last_request_status, 220),
-                            info_tile("Response time", state.if_last_response_ms, 150),
-                            info_tile("Cache", state.if_cache_status, 230),
-                        ]),
-                        ft.Row(wrap=True, spacing=10, run_spacing=10, controls=[
-                            info_tile("Activity", idle_age, 190),
-                            info_tile("Polling", "Manual refresh", 170),
-                            info_tile("Idle timeout", "Paused" if state.if_polling_paused else "15 min", 150),
-                        ]),
-                        ft.Text(state.if_last_error or "No API error reported.", size=12, color="#FF8080" if state.if_last_error else tokens["muted"]),
-                    ],
-                ),
-            )
-
-        return build_tab_page(
-            "LIVE FLIGHTS",
-            ft.Container(
-                expand=True,
-                padding=8,
-                content=ft.Column(
-                    expand=True,
-                    scroll=ft.ScrollMode.AUTO,
-                    spacing=0,
-                    controls=[
-                        traffic_map_card(),
-                    ],
-                ),
-            ),
-            overlay_opacity=0.08,
-        )
 
     def about_page():
         modules = [
-            "Overview", "Home", "Payload", "Takeoff", "Landing",
-            "Map", "Calendar", "Log", "Profile", "Settings", "About",
+            "Overview", "Dashboard", "Payload", "Checklist", "Takeoff", "Landing",
+            "Calendar", "Log", "Profile", "Settings", "About",
         ]
         features = [
             "Operational airline and aircraft selection",
@@ -18661,12 +16458,13 @@ def main(page: ft.Page):
                         color=tokens["muted"],
                     ),
                     ft.Divider(height=8, opacity=0.15),
-                    info_line("Version", "V10"),
+                    info_line("Version", FMS_VERSION),
                     info_line("Author", "Sam Samadi"),
                     info_line("Editor", "Sam Samadi"),
                     info_line("Application type", "Python Flet desktop application"),
                     info_line("Build type", "Local desktop build"),
                     info_line("Aircraft images", "Aircraft images are from Infinite Flight"),
+                    info_line("Seat maps", "Seat maps are from SeatMaps.com"),
                 ],
             ),
         )
@@ -18694,9 +16492,8 @@ def main(page: ft.Page):
             ft.Column(
                 spacing=10,
                 controls=[
-                    ft.Text("FMS stores configuration data and operational records locally as JSON files in the application folder. This includes app settings, custom airline entries, calendar flights, and profile information.", size=12, color=tokens["text"]),
-                    info_line("Primary app folder", r"C:\FCAM_FLET"),
-                    info_line("Assets folder", r"C:\FCAM_FLET\assets"),
+                    ft.Text("FMS stores settings, calendar flights, and profile information locally.", size=12, color=tokens["text"]),
+                    info_line("Data folder", str(storage_dir)),
                 ],
             ),
         )
@@ -18713,6 +16510,11 @@ def main(page: ft.Page):
                     ),
                     ft.Text(
                         "Aircraft imagery shown in the application is credited to Infinite Flight.",
+                        size=12,
+                        color=tokens["muted"],
+                    ),
+                    ft.Text(
+                        "Seat maps shown in the application are credited to SeatMaps.com.",
                         size=12,
                         color=tokens["muted"],
                     ),
@@ -18749,288 +16551,209 @@ def main(page: ft.Page):
             overlay_opacity=0.08,
         )
 
+    def build_current_page_view() -> ft.Control:
+        selected = max(0, min(13, int(state.selected_tab_index or 0)))
+        if selected == 0:
+            return overview_page()
+        if selected == 1:
+            return home_page()
+        if selected in (2, 3):
+            return payload_page()
+        if selected == 13:
+            return checklist_page()
+        if selected == 4:
+            return build_tab_page("TAKEOFF", takeoff_view(), overlay_opacity=0.08)
+        if selected == 5:
+            return build_tab_page("LANDING", landing_view(), overlay_opacity=0.08)
+        if selected == 7:
+            return calendar_view()
+        if selected == 8:
+            return log_view()
+        if selected == 9:
+            return profile_view()
+        if selected == 10:
+            return settings_page()
+        return about_page()
+
+    def refresh_active_page(update_page: bool = True):
+        active_page_host.content = build_current_page_view()
+        prepare_controls(active_page_host)
+        if getattr(active_page_host, "page", None):
+            active_page_host.update()
+        elif update_page:
+            page.update()
+
+    def navigation_accent():
+        gradient = airline_background(state.airline, AIRLINE_ACCENT) if state.aircraft else None
+        fill = gradient.colors[0] if gradient else "#D5CEC4"
+        ink = max(("#111318", "#FFFFFF"), key=lambda color: contrast_ratio(color, fill))
+        return fill, ink
+
+    def refresh_navigation_accent():
+        if active_navigation_glyph is not None:
+            fill, ink = navigation_accent()
+            active_navigation_glyph.bgcolor = fill
+            active_navigation_glyph.content.color = ink
+            safe_update_control(active_navigation_glyph)
+
     def app_shell():
         refresh_header_texts()
-
-        def current_page_view():
-            selected = max(0, min(12, int(state.selected_tab_index or 0)))
-            if selected == 0:
-                return overview_page()
-            if selected == 1:
-                return home_page()
-            if selected == 2:
-                return build_tab_page("PAYLOAD", seats_view(), overlay_opacity=0.08)
-            if selected == 3:
-                return build_tab_page("PAYLOAD", seats_view(), overlay_opacity=0.08)
-            if selected == 4:
-                return build_tab_page("TAKEOFF", takeoff_view(), overlay_opacity=0.08)
-            if selected == 5:
-                return build_tab_page("LANDING", landing_view(), overlay_opacity=0.08)
-            if selected == 6:
-                return build_tab_page("MAP", map_view(), overlay_opacity=0.08)
-            if selected == 7:
-                return calendar_view()
-            if selected == 8:
-                return log_view()
-            if selected == 9:
-                return profile_view()
-            if selected == 10:
-                return settings_page()
-            if selected == 12:
-                return infinite_flight_page()
-            return about_page()
-
-        def nav_icon_content(label: str, icon: str, icon_file: Optional[str], selected: bool) -> ft.Control:
-            icon_src = asset_rel_path_if_exists(icon_file)
-            if icon_src:
-                return ft.Image(
-                    src=icon_src,
-                    width=24,
-                    height=24,
-                    fit=ft.BoxFit.CONTAIN,
-                    opacity=1.0 if selected else 0.82,
-                    key=f"nav-icon-{label.lower().replace(' ', '-')}-{state.logo_refresh_nonce}",
-                )
-            return ft.Icon(
-                icon,
-                size=24,
-            )
-
-        def rail_button(index: int, label: str, icon: str, icon_file: Optional[str] = None):
-            selected = index == state.selected_tab_index
-            button_body = ft.Container(
-                width=56,
-                height=52,
-                border_radius=18,
-                alignment=ft.Alignment(0, 0),
-                bgcolor=ft.Colors.with_opacity(tokens["shell_nav_selected_opacity"], tokens["accent"]) if selected else ft.Colors.with_opacity(tokens["shell_nav_idle_opacity"], tokens["shell_nav_idle"]),
-                border=ft.border.all(1, ft.Colors.with_opacity(tokens["shell_nav_selected_border_opacity"], tokens["accent"])) if selected else ft.border.all(1, ft.Colors.with_opacity(tokens["shell_nav_idle_border_opacity"], ft.Colors.WHITE)),
-                tooltip=label,
-                content=nav_icon_content(label, icon, icon_file, selected),
-            )
-            return ft.GestureDetector(
-                mouse_cursor=ft.MouseCursor.CLICK,
-                on_tap_down=lambda e, idx=index: go_to_tab(idx),
-                on_tap=lambda e, idx=index: go_to_tab(idx),
-                content=button_body,
-            )
-
-        def current_tab_title() -> str:
-            titles = [
-                "Overview",
-                "Home",
-                "Payload",
-                "Payload",
-                "Takeoff",
-                "Landing",
-                "Map",
-                "Calendar",
-                "Log",
-                "Profile",
-                "Settings",
-                "About",
-                "Live Flights",
-            ]
-            idx = max(0, min(len(titles) - 1, int(state.selected_tab_index or 0)))
-            return titles[idx]
-
+        active_page_host.content = build_current_page_view()
+        active_page_host.bgcolor = surface_fill(tokens["bg"])
         refresh_header_banner_tick()
+        background = airline_background(state.airline, AIRLINE_ACCENT)
+        header_backdrop = background.colors[0] if background else tokens["bg"]
 
-        top_bar = ft.Container(
-            padding=ft.padding.only(left=18, right=16, top=12, bottom=10),
-            bgcolor=ft.Colors.with_opacity(tokens["shell_topbar_opacity"], tokens["shell_topbar"]),
-            border=ft.border.only(bottom=ft.BorderSide(1, tokens["shell_border"])),
+        def header_ink(tint, opacity):
+            glass_surface = blend_hex_colors(header_backdrop, tint, opacity)
+            return max(("#111318", "#FFFFFF"), key=lambda color: contrast_ratio(color, glass_surface))
+
+        glass = {
+            "blur": ft.Blur(12, 12, ft.BlurTileMode.CLAMP),
+            "clip_behavior": ft.ClipBehavior.ANTI_ALIAS,
+            "border": ft.Border(
+                top=ft.BorderSide(1, ft.Colors.with_opacity(0.24, ft.Colors.WHITE)),
+                bottom=ft.BorderSide(1, ft.Colors.with_opacity(0.18, ft.Colors.BLACK)),
+            ),
+        }
+        nav_tint = "#F5EFE6"
+        nav_ink = "#292620"
+        brand_ink = header_ink(nav_tint, NAV_OPACITY)
+        title_ink = header_ink(tokens["bg"], SURFACE_OPACITY)
+
+        destinations = (
+            (1, "Dashboard", ft.Icons.HOME_OUTLINED),
+            (0, "Overview", ft.Icons.DASHBOARD_OUTLINED),
+            (2, "Payload", ft.Icons.INVENTORY_2_OUTLINED),
+            (13, "Checklist", ft.Icons.CHECKLIST),
+            (4, "Takeoff", ft.Icons.FLIGHT_TAKEOFF_OUTLINED),
+            (5, "Landing", ft.Icons.FLIGHT_LAND_OUTLINED),
+            (7, "Calendar", ft.Icons.CALENDAR_MONTH_OUTLINED),
+            (8, "Log", ft.Icons.RECEIPT_LONG_OUTLINED),
+            (9, "Profile", ft.Icons.PERSON_OUTLINE),
+            (10, "Settings", ft.Icons.SETTINGS_OUTLINED),
+            (11, "About", ft.Icons.INFO_OUTLINE),
+        )
+        selected = 2 if state.selected_tab_index == 3 else state.selected_tab_index
+        title = next((label for index, label, _ in destinations if index == selected), "Overview")
+
+        active_fill, active_ink = navigation_accent()
+
+        def nav_button(index, label, icon):
+            nonlocal active_navigation_glyph
+            active = index == selected
+            glyph = ft.Container(
+                width=30, height=30, border_radius=999,
+                alignment=ft.Alignment(0, 0),
+                bgcolor=active_fill if active else None,
+                content=ft.Icon(icon, size=17, color=active_ink if active else "#4A433B"),
+            )
+            if active:
+                active_navigation_glyph = glyph
+            content = ft.Row(
+                tight=True, spacing=7,
+                controls=[glyph, *([ft.Text(label, size=13, color=nav_ink)] if active else [])],
+            )
+            return ft.TextButton(
+                content=content, width=None if active else 39, height=39, tooltip=label,
+                style=ft.ButtonStyle(
+                    color=nav_ink,
+                    bgcolor={
+                        ft.ControlState.DEFAULT: surface_fill("#E4DACD"),
+                        ft.ControlState.HOVERED: surface_fill("#D5C9BA"),
+                    },
+                    padding=ft.Padding.only(left=4, right=10 if active else 4, top=4, bottom=4),
+                    side={
+                        ft.ControlState.DEFAULT: ft.BorderSide(1, "#B7AB9C"),
+                        ft.ControlState.FOCUSED: ft.BorderSide(1, "#675D51"),
+                    },
+                    shape=ft.RoundedRectangleBorder(radius=999),
+                ),
+                on_click=lambda e, target=index: go_to_tab(target),
+            )
+
+        nav_capsule = ft.Container(
+            border_radius=999,
+            bgcolor=ft.Colors.with_opacity(NAV_OPACITY, nav_tint),
+            padding=4,
             content=ft.Row(
-                spacing=16,
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True, alignment=ft.MainAxisAlignment.CENTER, spacing=4,
+                controls=[nav_button(*destination) for destination in destinations],
+            ),
+        )
+        navigation = ft.Container(
+            height=NAV_HEIGHT,
+            padding=ft.Padding.symmetric(horizontal=16),
+            bgcolor=ft.Colors.with_opacity(NAV_OPACITY, nav_tint),
+            **glass,
+            content=ft.Row(
+                spacing=8,
                 controls=[
-                    ft.Container(
-                        width=140,
-                        alignment=ft.Alignment(-1, 0),
-                        content=ft.Text(current_tab_title(), size=18, weight=ft.FontWeight.W_800, color=tokens["shell_text"]),
-                    ),
-                    ft.Container(
-                        expand=True,
-                        height=34,
-                        alignment=ft.Alignment(-1, 0),
-                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                        bgcolor=ft.Colors.TRANSPARENT,
-                        content=header_route_line_host,
-                    ),
                     ft.Row(
-                        spacing=12,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        width=64, spacing=6,
                         controls=[
-                            ft.Container(
-                                width=180,
-                                height=44,
-                                alignment=ft.Alignment(1, 0),
-                                content=airline_logo_image(
-                                    state.airline,
-                                    width=170,
-                                    height=42,
-                                    opacity=0.98,
-                                    fit=ft.BoxFit.CONTAIN,
-                                    key_prefix="topbar-logo",
-                                ) if state.airline else ft.Text("No airline selected", size=12, color=tokens["shell_muted"]),
-                            ),
-                            ft.OutlinedButton("Logout", on_click=do_logout),
+                            ft.Icon(ft.Icons.FLIGHT, size=20, color=brand_ink),
+                            ft.Text("FMS", size=16, weight=ft.FontWeight.W_800, color=brand_ink),
                         ],
                     ),
-                ],
-            ),
-        )
-
-        navigation_rail = ft.Container(
-            width=78,
-            padding=ft.padding.only(top=14, bottom=14),
-            bgcolor=ft.Colors.with_opacity(tokens["shell_rail_opacity"], tokens["shell_rail"]),
-            border=ft.border.only(right=ft.BorderSide(1, tokens["shell_border"])),
-            content=ft.Column(
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=8,
-                scroll=ft.ScrollMode.AUTO,
-                controls=[
-                    rail_button(1, "Home", "home", "icons/nav/home.png"),
-                    rail_button(0, "Overview", "dashboard", "icons/nav/overview.png"),
-                    rail_button(2, "Payload", "event_seat", "icons/nav/seats_baggage.png"),
-                    rail_button(4, "Takeoff", "flight_takeoff", "icons/nav/takeoff.png"),
-                    rail_button(5, "Landing", "flight_land", "icons/nav/landing.png"),
-                    rail_button(6, "Map", "map", "icons/nav/map.png"),
-                    rail_button(12, "Live Flights", "public", "icons/nav/live_api.png"),
-                    rail_button(7, "Calendar", "calendar_month", "icons/nav/calendar.png"),
-                    rail_button(8, "Log", "receipt_long", "icons/nav/log.png"),
-                    ft.Container(expand=True),
-                    rail_button(9, "Profile", "person", "icons/nav/profile.png"),
-                    rail_button(10, "Settings", "settings", "icons/nav/settings.png"),
-                    rail_button(11, "About", "info_outline", "icons/nav/about.png"),
-                ],
-            ),
-        )
-
-        main_area = ft.Container(
-            expand=True,
-            bgcolor=ft.Colors.TRANSPARENT,
-            padding=ft.padding.only(top=0),
-            alignment=ft.Alignment(-1, -1),
-            content=ft.Container(
-                expand=True,
-                bgcolor=ft.Colors.TRANSPARENT,
-                alignment=ft.Alignment(-1, -1),
-                content=current_page_view(),
-            ),
-        )
-
-        shell_content = ft.Column(
-            expand=True,
-            spacing=0,
-            controls=[
-                top_bar,
-                ft.Row(
-                    expand=True,
-                    spacing=0,
-                    controls=[
-                        navigation_rail,
-                        main_area,
-                    ],
-                ),
-            ],
-        )
-
-        # Background Project rewrite. This is the only app background system.
-        # It supports PNG, JPG, JPEG, and WEBP. Put your file here:
-        # assets/backgrounds/app_background.png
-        daylight_mode = str(state.display_mode).lower() == "daylight"
-        background_image = daylight_background_src() if daylight_mode else app_background_src()
-        airline_overlay_color = AIRLINE_BACKGROUND.get(state.airline, tokens["bg"]) if state.airline else tokens["bg"]
-        brightness = clamp_setting(state.display_brightness, 0.70, 1.30, 1.0)
-        contrast = clamp_setting(state.display_contrast, 0.70, 1.35, 1.0)
-        airline_overlay_opacity = clamp_setting(state.airline_overlay_opacity, 0.0, 0.80, 0.50)
-
-        background_layers = [
-            ft.Container(expand=True, bgcolor=tokens["bg"]),
-        ]
-        if background_image:
-            background_layers.append(
-                ft.Container(
-                    expand=True,
-                    image=ft.DecorationImage(
-                        src=background_image,
-                        fit=ft.BoxFit.COVER,
-                        opacity=1.0,
+                    ft.Container(expand=True, alignment=ft.Alignment(0, 0), content=nav_capsule),
+                    ft.Container(
+                        width=64, alignment=ft.Alignment(1, 0),
                     ),
-                )
+                ],
+            ),
+        )
+
+        def route_chip(value, color, foreground):
+            return ft.Container(
+                height=26, border_radius=5, bgcolor=color,
+                padding=ft.Padding.symmetric(horizontal=8), alignment=ft.Alignment(0, 0),
+                content=ft.Text(value, size=12, weight=ft.FontWeight.W_600, color=foreground),
             )
-            # Airline tint. In daylight mode this is capped so the background
-            # image keeps its original colors instead of becoming washed out.
-            effective_airline_overlay_opacity = min(airline_overlay_opacity, 0.14) if daylight_mode else airline_overlay_opacity
-            if effective_airline_overlay_opacity > 0:
-                background_layers.append(
-                    ft.Container(
-                        expand=True,
-                        bgcolor=ft.Colors.with_opacity(effective_airline_overlay_opacity, airline_overlay_color),
-                    )
-                )
-            # Brightness and contrast overlays. Daylight mode uses a subtle dark
-            # readability layer instead of a white wash, preserving image color.
-            if daylight_mode:
-                daylight_dark_opacity = max(
-                    0.08,
-                    min(
-                        0.30,
-                        0.14 + max(0.0, 1.0 - brightness) * 0.35 - max(0.0, brightness - 1.0) * 0.05,
-                    ),
-                )
-                background_layers.append(
-                    ft.Container(
-                        expand=True,
-                        bgcolor=ft.Colors.with_opacity(daylight_dark_opacity, ft.Colors.BLACK),
-                    )
-                )
-                if brightness > 1.0:
-                    background_layers.append(
-                        ft.Container(
-                            expand=True,
-                            bgcolor=ft.Colors.with_opacity(min(0.08, (brightness - 1.0) * 0.16), ft.Colors.WHITE),
-                        )
-                    )
-            else:
-                dark_opacity = max(0.0, min(0.55, 0.16 + max(0.0, 1.0 - brightness) * 0.30 + max(0.0, contrast - 1.0) * 0.10))
-                background_layers.append(
-                    ft.Container(
-                        expand=True,
-                        bgcolor=ft.Colors.with_opacity(dark_opacity, ft.Colors.BLACK),
-                    )
-                )
-                if brightness > 1.0:
-                    background_layers.append(
-                        ft.Container(
-                            expand=True,
-                            bgcolor=ft.Colors.with_opacity(min(0.18, (brightness - 1.0) * 0.30), ft.Colors.WHITE),
-                        )
-                    )
-            if contrast < 1.0:
-                background_layers.append(
-                    ft.Container(
-                        expand=True,
-                        bgcolor=ft.Colors.with_opacity((1.0 - contrast) * 0.12, "#808080"),
-                    )
-                )
 
-        return ft.Stack(
-            expand=True,
-            controls=[
-                *background_layers,
-                shell_content,
-            ],
+        route_controls = []
+        live_context = selected == 0 and state.overview_live
+        if state.departure and not live_context:
+            route_controls.append(route_chip(state.departure, "#FFE54D", "#211D0A"))
+        if state.arrival and not live_context:
+            if route_controls:
+                route_controls.append(ft.Icon(ft.Icons.ARROW_FORWARD, size=14, color=title_ink))
+            route_controls.append(route_chip(state.arrival, "#7263E8", "#FFFFFF"))
+
+        context = ft.Container(
+            height=CONTEXT_HEIGHT,
+            padding=ft.Padding.symmetric(horizontal=16),
+            bgcolor=ft.Colors.with_opacity(SURFACE_OPACITY, tokens["bg"]),
+            **glass,
+            content=ft.Row(
+                spacing=GAP,
+                controls=[
+                    ft.Text(title, size=20, weight=ft.FontWeight.W_700, color=title_ink),
+                    *route_controls,
+                    ft.Container(
+                        expand=True, alignment=ft.Alignment(0, 0),
+                        content=header_route_line_host if state.departure and state.arrival and not live_context else None,
+                    ),
+                    *([ft.OutlinedButton(
+                        "Normal Map" if live_context else "Live Flights",
+                        icon=ft.Icons.MAP_OUTLINED if live_context else ft.Icons.PUBLIC,
+                        height=32, on_click=lambda e: change_overview_mode(not live_context),
+                    )] if selected == 0 else []),
+                    *([airline_logo_image(state.airline, width=120, height=28, key_prefix="topbar-logo")]
+                      if state.airline else []),
+                ],
+            ),
+        )
+        return ft.Container(
+            expand=True, bgcolor=tokens["bg"], gradient=background,
+            content=ft.Column([navigation, context, active_page_host], expand=True, spacing=0),
         )
 
     def on_tab_change(e):
         selected = e.control.selected_index
         if selected is None:
             return
-        selected = max(0, min(12, int(selected)))
+        selected = max(0, min(13, int(selected)))
         if state.selected_tab_index == selected:
             return
         state.selected_tab_index = selected
@@ -19053,6 +16776,9 @@ def main(page: ft.Page):
                 continue
 
             try:
+                if state.selected_tab_index == 0:
+                    queue_airport_media(state.departure)
+                    queue_airport_media(state.arrival)
                 current_second = now_local_str()
                 should_update_clock = current_second != last_header_second
                 progress_refresh_seconds = 15 if bool(getattr(state, "low_performance_mode", False)) else OVERVIEW_PROGRESS_REFRESH_SECONDS
@@ -19062,9 +16788,9 @@ def main(page: ft.Page):
                     and time.time() - last_overview_progress_update >= progress_refresh_seconds
                 )
                 should_update_if_traffic = (
-                    state.selected_tab_index == 12
-                    and bool(getattr(state, "if_live_refresh_enabled", False))
-                    and time.time() - float(getattr(state, "if_last_live_refresh_attempt", 0.0) or 0.0) >= 15.0
+                    state.selected_tab_index == 0 and state.overview_live and infinite_flight_key_path.is_file()
+                    and not state.if_polling_paused
+                    and time.time() >= max(state.if_last_live_refresh_attempt + IF_TRAFFIC_INTERVAL, state.if_traffic_retry_at)
                 )
 
                 should_update_banner = refresh_header_banner_tick()
@@ -19073,17 +16799,13 @@ def main(page: ft.Page):
                     continue
 
                 if should_update_if_traffic:
-                    await asyncio.to_thread(if_load_live_traffic, False, False)
-                    if bool(getattr(state, "if_polling_paused", False)):
-                        state.if_live_refresh_enabled = False
+                    await refresh_live_traffic()
 
                 if should_update_clock:
                     last_header_second = current_second
                     refresh_header_texts()
 
-                if should_update_if_traffic:
-                    refresh_ui()
-                elif should_update_progress:
+                if should_update_progress and not (state.selected_tab_index == 0 and state.overview_live):
                     # Live progress update without rebuilding the whole Overview page.
                     # This prevents the Route Schematic card from blinking.
                     last_overview_progress_update = time.time()
@@ -19123,20 +16845,17 @@ def main(page: ft.Page):
                         and time.time() - last_overview_progress_update >= progress_refresh_seconds
                     )
                     should_update_if_traffic = (
-                        state.selected_tab_index == 12
-                        and bool(getattr(state, "if_live_refresh_enabled", False))
-                        and time.time() - float(getattr(state, "if_last_live_refresh_attempt", 0.0) or 0.0) >= 15.0
+                        state.selected_tab_index == 0 and state.overview_live and infinite_flight_key_path.is_file()
+                        and not state.if_polling_paused
+                        and time.time() >= max(state.if_last_live_refresh_attempt + IF_TRAFFIC_INTERVAL, state.if_traffic_retry_at)
                     )
                     should_update_banner = refresh_header_banner_tick()
                     if should_update_clock:
                         last_header_second = current_second
                         refresh_header_texts()
                     if should_update_if_traffic:
-                        if_load_live_traffic(False, False)
-                        if bool(getattr(state, "if_polling_paused", False)):
-                            state.if_live_refresh_enabled = False
-                        refresh_ui()
-                    elif should_update_progress:
+                        page.run_task(refresh_live_traffic)
+                    if should_update_progress and not (state.selected_tab_index == 0 and state.overview_live):
                         # Live progress update fallback without full Overview rebuild.
                         last_overview_progress_update = time.time()
                         callback = overview_progress_refresh_callback
@@ -19156,12 +16875,22 @@ def main(page: ft.Page):
         page.run_thread(tick_thread)
 
 
-if __name__ == "__main__":
+def run_app(*, preview=False):
+    global _INTERFACE_PREVIEW
+    _INTERFACE_PREVIEW = preview
     webview_flags = [flag for flag in ("--globe-webview", "--mapcn-webview") if flag in sys.argv]
     if webview_flags:
         arg_index = sys.argv.index(webview_flags[0])
         raise SystemExit(run_globe_webview_host(sys.argv[arg_index + 1 :]))
     if not _acquire_fms_single_instance():
         raise SystemExit(0)
-    runtime_assets_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets"
+    runtime_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    bundled_client = runtime_root / "flet_desktop" / "app" / "flet"
+    if getattr(sys, "frozen", False) and (bundled_client / "flet.exe").is_file():
+        os.environ["FLET_VIEW_PATH"] = str(bundled_client)
+    runtime_assets_dir = runtime_root / "assets"
     ft.app(target=main, assets_dir=str(runtime_assets_dir))
+
+
+if __name__ == "__main__":
+    run_app()

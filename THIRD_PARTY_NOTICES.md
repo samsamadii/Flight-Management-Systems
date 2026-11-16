@@ -31,6 +31,14 @@ The existing `node_modules` directory contains transitive packages and is intent
 
 Microsoft Edge WebView2 is an external runtime used by pywebview on Windows and remains governed by Microsoft's terms.
 
+The Live Flights map bundles [Mapbox GL RTL Text 0.3.0](https://github.com/mapbox/mapbox-gl-rtl-text) for right-to-left label shaping. The bundled BSD and ICU notices are in `assets/live-map/mapbox-gl-rtl-text-LICENSE.md`.
+
+## Typeface
+
+[Jost](https://github.com/google/fonts/tree/main/ofl/jost) is distributed under the SIL Open Font License 1.1. The bundled license is in `assets/fonts/Jost-OFL.txt`.
+
+[Noto Sans Arabic](https://github.com/google/fonts/tree/main/ofl/notosansarabic) is distributed under the SIL Open Font License 1.1. The bundled license is in `assets/fonts/NotoSansArabic-OFL.txt`.
+
 ## External APIs, tiles, data, and services
 
 | Provider/service | Application use | Notes |
@@ -67,27 +75,27 @@ The files under `assets/airlines/` and `assets/manufacturers/` depict airline or
 
 ## Earth textures and globe images
 
-The public package includes Earth-map images under `globe-gl-test-web/dist/`. The private source workspace also contained additional Earth textures and a rendered cache that were deliberately excluded from this public package. Several source filenames refer to NASA Blue Marble/Next Generation material, but no source URL, exact provenance chain, or redistribution terms were included in the inspected notice files.
+The repository includes Earth textures under `assets/textures/`, a rendered cache under `assets/globe/`, and additional Earth-map images under `globe-gl-test-web/public/` and `globe-gl-test-web/dist/`. Several filenames refer to NASA Blue Marble/Next Generation material, but no source URL, exact provenance chain, or redistribution terms were included in the inspected notice files. `assets/textures/README.txt` only describes expected filenames.
 
 **Licence/redistribution permission and any required NASA or other attribution must be verified before public release.** Derived or cached images require the same review as their sources.
+
+## Login photograph
+
+The login background shows Frankfurt Airport. [Photo by Dennis Gecaj on Unsplash](https://unsplash.com/photos/empty-gray-airport-seats-during-daytime-jVvtCCycgcQ). [Unsplash License](https://unsplash.com/license).
 
 ## Backgrounds, card art, icons, audio, and application icon
 
 No conclusive source/licence records were found for the following categories:
 
-- `assets/home_bg.jpg`, `assets/login_bg.jpg`, and `assets/backgrounds/`.
+- `assets/home_bg.jpg` and other assets under `assets/backgrounds/`.
 - `assets/icons/`, including bitmap and SVG navigation assets.
-- `assets/audio/login_transition.mp3` and `assets/audio/seatbelt_sign.mp3`.
+- `assets/audio/login.mp3` and `assets/audio/seatbelt_sign.mp3`.
 - `assets/app_icon.ico`.
-- Generated image caches from the private workspace are deliberately excluded from this public package.
+- `assets/generated/`, which may contain derived images created from other assets.
 
 **Licence/redistribution permission must be verified before public release.** User-selected background files are local content and are ignored by the repository rules.
 
 The source also uses Flet's built-in icon catalog. The relevant Flet and underlying icon-set notices must be retained as required by their upstream terms.
-
-## Fonts
-
-No standalone font files were found in the inspected `assets` tree. The interface uses Flet/platform-provided text rendering. Any fonts introduced later must be added to this inventory with their source, licence, and redistribution requirements.
 
 ## Release checklist for third-party material
 
@@ -98,3 +106,18 @@ Before a public release:
 3. Retain required copyright, licence, and attribution notices.
 4. Review trademark and branding use separately from copyright permission.
 5. Re-run a dependency licence inventory for the exact Python and JavaScript versions being distributed.
+
+
+## Online aviation lookup
+
+- Airport records are retrieved from [OurAirports](https://ourairports.com/data/), which publishes its data in the public domain.
+- Airline and aircraft catalogs are retrieved from [OpenFlights](https://openflights.org/data.php) under the Open Database License.
+- Airline search can display logos from [Aviasales](https://support.travelpayouts.com/hc/en-us/articles/203956073-Airline-logos-by-Aviasales) using IATA codes. The logos belong to their respective owners.
+- City card thumbnails are provided by [Wikipedia's PageImages API](https://www.mediawiki.org/wiki/Extension:PageImages). Individual images carry their respective licenses.
+- Overview METAR observations are provided by the [Aviation Weather Center Data API](https://aviationweather.gov/data/api/).
+
+## V14 map and interface assets
+
+- Flag artwork retains the licence in `assets/flags/LICENSE`.
+- MapLibre GL JS retains its notice in `assets/live-map/maplibre-license.txt`.
+- Adapted aircraft outlines and the derived browser outline data retain the upstream GPL notice and provenance in `assets/live-aircraft/`.

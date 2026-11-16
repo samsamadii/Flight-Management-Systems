@@ -1,4 +1,4 @@
-# Flight Management Systems — Public Portfolio Version
+# Flight Management Systems — V14 Public Portfolio Edition
 
 Flight Management Systems is a Windows desktop application built with Python and Flet for aviation simulation, education, and personal workflow practice. This public portfolio version opens directly into the main application and does not display or require a login.
 
@@ -14,36 +14,31 @@ Flight Management Systems is a Windows desktop application built with Python and
 - Interactive maps and a bundled local Globe.gl route visualization.
 - Calendar planning, JSON import/export, completed-flight logs, and flight hibernation/restore.
 - A local pilot profile with activity and career statistics.
-- Optional Infinite Flight public API integration for simulator data.
+- Optional Infinite Flight live tracker with traffic, routes, and airport context.
 - Display, performance, audio, unit, custom-airline, background, and data-management settings.
 
 ## Requirements
 
 - Windows 10 or Windows 11.
-- Python 3.13 with the Windows `py` launcher.
+- Python 3.12 with the Windows `py` launcher.
 - Microsoft Edge WebView2 Runtime for the local Globe.gl view.
 - Internet access for live maps, weather, METAR, geocoding, and Infinite Flight features.
 
-## Installation
+## Windows setup
 
-Open PowerShell in the project directory:
-
-```powershell
-py -3.13 -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-If PowerShell blocks environment activation:
+Download and extract the repository ZIP. Open PowerShell in the extracted folder and run:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.venv\Scripts\Activate.ps1
+.\Start-FMS.cmd
 ```
+
+You can also double-click `Start-FMS.cmd`. It creates a local Python environment, installs the dependencies on first run, and opens FMS. Later runs reuse the environment.
+
+For the portable edition, extract the Windows ZIP attached to the GitHub release and open `FMS V14 Public.exe`. Keep the `_internal` folder beside the executable. The portable edition includes Python.
 
 ## Environment variables
 
-Set MapTiler for the current PowerShell session:
+Optionally enable MapTiler tiles for the current PowerShell session:
 
 ```powershell
 $env:MAPTILER_API_KEY="your_maptiler_api_key_here"
@@ -62,10 +57,10 @@ $env:INFINITE_FLIGHT_API_KEY="your_infinite_flight_api_key_here"
 Run the public no-login application from the project root:
 
 ```powershell
-py -3.13 flightmanagementsystems_public.py
+.\Start-FMS.cmd
 ```
 
-The application starts on the Home screen with the neutral local display name `User`. It does not provide accounts, registration, online authentication, or an authentication security boundary.
+The app opens directly with the local display name `User`. On Windows, this edition stores its data under `%LOCALAPPDATA%\Flight Management Systems Public`.
 
 ## Project structure
 
@@ -85,7 +80,7 @@ Runtime data—including `calendar_flights.json`, `profile_data.json`, `app_sett
 ## Privacy and security
 
 - Local JSON files may contain profile information, routes, flight history, settings, or API credentials.
-- Saving an Infinite Flight key inside the application stores it locally in plaintext. Prefer the environment variable.
+- Saving an Infinite Flight key inside the application stores it locally using Windows DPAPI. Prefer the environment variable.
 - Do not place real keys, credentials, personal routes, private callsigns, profile data, or diagnostic logs in issues or screenshots.
 - Revoke and replace any credential that is accidentally exposed.
 - See `SECURITY.md` before reporting a vulnerability.
