@@ -1,0 +1,3 @@
+Aircraft outlines adapted from RexKramer1 AircraftShapesSVG, revision 0743718760c42a5e91801adc053b5b828a434a5e.
+https://github.com/RexKramer1/AircraftShapesSVG
+Modifications: solid fill, outline stroke, and centered viewBox.
